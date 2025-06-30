@@ -1249,6 +1249,30 @@ def monitor_active_trades_backtest(configs):
 # Global map for current candle data per symbol, used by monitor_active_trades_backtest
 current_candle_data_map = {}
 
+def fetch_initial_backtest_data_for_symbol(symbol, client, backtest_days_config, existing_symbol_info=None):
+    """
+    Helper function to fetch symbol info and historical klines for a single symbol for backtesting.
+    """
+    thread_name = threading.current_thread().name
+    print(f"[{thread_name}] Fetching initial data for {symbol}...")
+    s_info = existing_symbol_info
+    if not s_info:
+        s_info = get_symbol_info(client, symbol) # Live call, okay for setup
+
+    if not s_info:
+        print(f"[{thread_name}] Could not get symbol info for {symbol}. Skipping.")
+        return symbol, None, None
+
+    # Fetch data for each symbol
+    # The `get_historical_klines` fetches based on "days ago UTC"
+    kl_df = get_historical_klines(client, symbol, backtest_days=backtest_days_config)
+    if kl_df.empty:
+        print(f"[{thread_name}] No kline data for {symbol} for backtest period. Skipping.")
+        return symbol, s_info, None
+    
+    print(f"[{thread_name}] Successfully fetched {len(kl_df)} klines for {symbol}.")
+    return symbol, s_info, kl_df
+
 def backtesting_loop(client, configs, monitored_symbols):
     global backtest_current_time, active_trades, backtest_simulated_balance, backtest_trade_log, current_candle_data_map
     
@@ -1256,67 +1280,137 @@ def backtesting_loop(client, configs, monitored_symbols):
     if not monitored_symbols: print("No symbols to monitor for backtest. Exiting."); return
 
     initialize_backtest_environment(client, configs) # Sets up balance, clears old state
-
-    # 1. Fetch all historical data for all symbols first
-    # We need a consistent timeline. The master timeline will be from the symbol with the most data,
-    # or we can fetch for a primary symbol (e.g., BTCUSDT) to define the simulation ticks.
-    # For simplicity, let's assume all symbols will have data for the requested `backtest_days`.
-    # The `get_historical_klines` function is now modified to fetch based on `backtest_days`.
     
-    print(f"Fetching historical data for {len(monitored_symbols)} symbols for {configs['backtest_days']} days...")
-    all_symbol_historical_data = {}
-    symbol_info_map = {} # Store symbol info to avoid repeated API calls
-
-    # Determine the overall timespan for the backtest by finding the first valid symbol
+    backtest_days_config = configs['backtest_days']
+    print(f"Fetching historical data for {len(monitored_symbols)} symbols for {backtest_days_config} days...")
+    
+    all_symbol_historical_data_raw = {} # Store raw fetched data before alignment
+    symbol_info_map = {}
     master_klines_df = pd.DataFrame()
-    reference_symbol = None
-    for sym in monitored_symbols:
-        print(f"Attempting to use {sym} to establish backtest time range...")
-        temp_df = get_historical_klines(client, sym, backtest_days=configs['backtest_days'])
-        if not temp_df.empty:
+    reference_symbol_candidates = ['BTCUSDT', 'ETHUSDT'] + [s for s in monitored_symbols if s not in ['BTCUSDT', 'ETHUSDT']] # Prioritize common symbols
+
+    # 1. Determine the overall timespan for the backtest using a reference symbol
+    print("Step 1: Establishing master timeline for backtest...")
+    reference_symbol_found = None
+    for ref_sym in reference_symbol_candidates:
+        if ref_sym not in monitored_symbols: # If BTC/ETH not in user's list, skip
+            # However, if monitored_symbols is short, it might be the first one.
+            if not monitored_symbols or ref_sym != monitored_symbols[0]: # ensure we check user's symbols
+                 continue
+            # If BTC/ETH not explicitly in monitored_symbols, but monitored_symbols is not empty,
+            # ensure we use a symbol from monitored_symbols for reference.
+            # The loop structure of reference_symbol_candidates handles this by trying BTC/ETH first if they are in monitored_symbols,
+            # then others from monitored_symbols.
+            # The condition `if ref_sym not in monitored_symbols:` might be too strict if we want to use, e.g. BTCUSDT
+            # from `reference_symbol_candidates` even if it's not in the `monitored_symbols` list from the user to establish time.
+            # For now, let's stick to symbols the user wants to monitor.
+            if ref_sym not in monitored_symbols : continue
+
+
+        print(f"Attempting to use {ref_sym} to establish backtest time range...")
+        # Fetch data for the reference symbol directly first
+        _, _, temp_df = fetch_initial_backtest_data_for_symbol(ref_sym, client, backtest_days_config)
+        if temp_df is not None and not temp_df.empty:
             master_klines_df = temp_df
-            reference_symbol = sym
-            print(f"Successfully fetched master kline data using {reference_symbol}.")
+            reference_symbol_found = ref_sym
+            print(f"Successfully fetched master kline data using {reference_symbol_found} ({len(master_klines_df)} candles).")
             break
         else:
-            print(f"Failed to fetch kline data for {sym} as reference. Trying next symbol.")
+            print(f"Failed to fetch kline data for {ref_sym} as reference. Trying next symbol.")
 
-    if master_klines_df.empty or reference_symbol is None:
-        print(f"Could not establish master kline data from any monitored symbols. Aborting backtest."); return
+    if master_klines_df.empty or reference_symbol_found is None:
+        print(f"Could not establish master kline data from any candidate reference symbols. Aborting backtest."); return
     
-    # Filter out data points older than precisely "backtest_days ago" from the last data point.
-    # This is to make the start date more consistent if get_historical_klines fetched slightly more.
+    # Filter master_klines_df to the precise "backtest_days" from its end
     end_date_of_data = master_klines_df.index[-1]
-    start_date_cutoff = end_date_of_data - pd.Timedelta(days=configs['backtest_days'])
+    start_date_cutoff = end_date_of_data - pd.Timedelta(days=backtest_days_config)
     master_klines_df = master_klines_df[master_klines_df.index >= start_date_cutoff]
-    print(f"Master timeline for backtest: {len(master_klines_df)} candles from {master_klines_df.index[0]} to {master_klines_df.index[-1]}")
+    print(f"Master timeline for backtest established: {len(master_klines_df)} candles from {master_klines_df.index[0]} to {master_klines_df.index[-1]}")
 
-    for symbol in monitored_symbols:
-        print(f"Fetching data and info for {symbol}...")
-        s_info = get_symbol_info(client, symbol) # Live call, okay for setup
-        if not s_info: print(f"Could not get symbol info for {symbol}. Skipping."); continue
-        symbol_info_map[symbol] = s_info
+    # 2. Fetch data for all other symbols concurrently
+    print(f"\nStep 2: Concurrently fetching data for {len(monitored_symbols)} symbols...")
+    all_symbol_historical_data = {} 
+    
+    # Add reference symbol's data to maps if it was successfully fetched
+    if reference_symbol_found:
+        # s_info_ref = get_symbol_info(client, reference_symbol_found) # Re-fetch or store from fetch_initial
+        # For simplicity, assume fetch_initial_backtest_data_for_symbol would give us info if we called it again
+        # Or better, store it from the initial call. Let's assume it's stored if needed.
+        # For now, symbol_info_map will be populated from the concurrent fetches.
+        # The master_klines_df is already populated with the kline data for the reference symbol.
+        # We'll add its klines to all_symbol_historical_data_raw to be processed like others.
+        all_symbol_historical_data_raw[reference_symbol_found] = master_klines_df.copy()
+        # And ensure its symbol_info is also fetched and stored
+        # This will be handled if reference_symbol_found is part of monitored_symbols in the loop below.
+        # To be safe, explicitly get its info if not already done by fetch_initial...
+        # However, fetch_initial_backtest_data_for_symbol returns symbol_info. We should use that.
+        # Let's refine the ref symbol handling slightly:
+        # We need its symbol_info. Let's call fetch_initial_backtest_data_for_symbol and store all its results.
         
-        # Fetch data for each symbol, then align and trim to master_klines_df's index
-        # This ensures all symbols are processed on the same timestamps.
-        # The `get_historical_klines` fetches based on "days ago UTC", so timestamps should align well.
-        kl_df = get_historical_klines(client, symbol, backtest_days=configs['backtest_days'])
-        if kl_df.empty: print(f"No kline data for {symbol} for backtest period. Skipping."); continue
+        # Re-evaluate: The reference symbol's data IS master_klines_df. Its info needs to be in symbol_info_map.
+        # The concurrent fetching below will include the reference symbol if it's in monitored_symbols.
+
+    symbols_to_fetch_concurrently = [s for s in monitored_symbols] # All symbols including reference if it's in the list
+
+    with ThreadPoolExecutor(max_workers=configs.get('max_scan_threads', DEFAULT_MAX_SCAN_THREADS)) as executor:
+        futures = {executor.submit(fetch_initial_backtest_data_for_symbol, sym, client, backtest_days_config): sym for sym in symbols_to_fetch_concurrently}
         
+        for future in as_completed(futures):
+            original_symbol = futures[future]
+            try:
+                res_symbol, res_s_info, res_kl_df = future.result()
+                if res_symbol != original_symbol: # Should not happen if symbol is returned correctly
+                     print(f"Warning: Mismatch in returned symbol {res_symbol} and original {original_symbol}")
+                
+                if res_s_info and res_kl_df is not None and not res_kl_df.empty:
+                    symbol_info_map[res_symbol] = res_s_info
+                    all_symbol_historical_data_raw[res_symbol] = res_kl_df
+                    print(f"Successfully processed data for {res_symbol} from concurrent fetch.")
+                else:
+                    print(f"Failed to fetch or no data for {res_symbol} during concurrent fetch.")
+            except Exception as exc:
+                print(f"Symbol {original_symbol} generated an exception during fetch: {exc}")
+                traceback.print_exc()
+
+    # 3. Align all fetched data to the master timeline
+    print("\nStep 3: Aligning all symbol data to master timeline...")
+    processed_symbols_count = 0
+    for symbol, kl_df_raw in all_symbol_historical_data_raw.items():
+        if symbol not in symbol_info_map: # Should have info if data is present
+            print(f"Warning: Symbol {symbol} has kline data but no symbol_info. Skipping alignment.")
+            continue
+
         # Trim to the exact range of master_klines_df
-        kl_df = kl_df[kl_df.index >= master_klines_df.index[0]]
-        kl_df = kl_df[kl_df.index <= master_klines_df.index[-1]]
-        # Reindex to master timeline, forward-filling missing data for a symbol if any (though ideally it shouldn't be missing much)
-        kl_df = kl_df.reindex(master_klines_df.index, method='ffill') 
-        # It's crucial that data is clean after ffill. If a symbol starts trading later, ffill might not be appropriate.
-        # A better way would be to ensure data exists or handle NaNs carefully.
-        # For now, assume data is mostly complete for the period for active symbols.
-        all_symbol_historical_data[symbol] = kl_df
-        print(f"Data for {symbol} prepared: {len(kl_df)} candles.")
+        kl_df_aligned = kl_df_raw[kl_df_raw.index >= master_klines_df.index[0]]
+        kl_df_aligned = kl_df_aligned[kl_df_aligned.index <= master_klines_df.index[-1]]
+        
+        # Reindex to master timeline, forward-filling missing data.
+        # Important: Ensure that NaNs resulting from reindexing (e.g., for symbols listed later than master's start)
+        # are handled appropriately by downstream logic (e.g., strategy conditions, EMA calculations).
+        # The strategy already checks for NaN EMAs and sufficient data length.
+        kl_df_aligned = kl_df_aligned.reindex(master_klines_df.index, method='ffill')
+        
+        # A symbol might have no data for the early part of the master timeline.
+        # `ffill` will fill these. We need to ensure that calculations like EMA
+        # are not skewed by artificially filled old data.
+        # The strategy's checks for `len(df) < period` and `df.isnull().values.any()` for EMAs should handle this.
+        # However, it's good to also check if a symbol has *any* non-NaN data after alignment.
+        if kl_df_aligned.empty or kl_df_aligned['close'].isnull().all():
+            print(f"No valid data for {symbol} after aligning to master timeline. Skipping this symbol.")
+            # Remove from symbol_info_map as well if we skip it entirely
+            if symbol in symbol_info_map: del symbol_info_map[symbol]
+            continue
 
-    if not all_symbol_historical_data: print("No historical data loaded for any symbol. Aborting."); return
+        all_symbol_historical_data[symbol] = kl_df_aligned
+        print(f"Data for {symbol} aligned and prepared: {len(kl_df_aligned)} candles.")
+        processed_symbols_count +=1
 
-    # The number of "candles" or simulation steps is determined by the length of master_klines_df
+    if not all_symbol_historical_data:
+        print("No historical data loaded and aligned for any symbol. Aborting backtest."); return
+    
+    print(f"\nSuccessfully prepared and aligned data for {processed_symbols_count} symbols out of {len(monitored_symbols)} monitored.")
+    
+    # The number of "candles" or simulation steps is determined by the length of master_klines_df (which should be non-empty)
     # We need at least 202 candles of history for EMA calculations at any point.
     # So, the actual simulation will start from the 202nd candle of the fetched data.
     simulation_start_index = 201 # Start processing from the 202nd candle (index 201)
