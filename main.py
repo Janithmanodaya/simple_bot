@@ -95,6 +95,47 @@ def get_user_configurations():
             break
         print("Invalid environment. Please enter 'testnet' or 'mainnet'.")
     configs["api_key"], configs["api_secret"] = load_api_keys(configs["environment"])
+
+    while True:
+        mode_input = input("Select mode (1:live / 2:backtest): ").strip()
+        if mode_input in ["1", "2"]:
+            configs["mode"] = "live" if mode_input == "1" else "backtest"
+            break
+        print("Invalid mode. Please enter '1' for live or '2' for backtest.")
+
+    if configs["mode"] == "backtest":
+        while True:
+            try:
+                days_input = input("Enter number of days for backtesting (e.g., 30): ")
+                days = int(days_input)
+                if days > 0:
+                    configs["backtest_days"] = days
+                    break
+                print("Number of days must be a positive integer.")
+            except ValueError:
+                print("Invalid input. Please enter an integer for the number of days.")
+        
+        while True:
+            balance_choice = input("For backtest, use current account balance or set a custom start balance? (current/custom) [current]: ").lower().strip()
+            if not balance_choice: balance_choice = "current" # Default if user presses Enter
+
+            if balance_choice in ["current", "custom"]:
+                configs["backtest_start_balance_type"] = balance_choice
+                break
+            print("Invalid choice. Please enter 'current' or 'custom'.")
+
+        if configs["backtest_start_balance_type"] == "custom":
+            while True:
+                try:
+                    custom_bal_input = input("Enter custom start balance for backtest (e.g., 10000): ")
+                    custom_bal = float(custom_bal_input)
+                    if custom_bal > 0:
+                        configs["backtest_custom_start_balance"] = custom_bal
+                        break
+                    print("Custom balance must be a positive number.")
+                except ValueError:
+                    print("Invalid input. Please enter a number for the custom balance.")
+
     while True:
         try:
             risk_input = input(f"Enter account risk % per trade (e.g., 1 for 1%, default: {DEFAULT_RISK_PERCENT}%): ")
@@ -160,12 +201,50 @@ def initialize_binance_client(configs):
     except BinanceAPIException as e: print(f"Binance API Exception (client init): {e}"); return None
     except Exception as e: print(f"Error initializing Binance client: {e}"); return None
 
-def get_historical_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=500):
-    print(f"Fetching klines for {symbol}, interval {interval}, limit {limit}...")
+def get_historical_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=500, backtest_days=None):
+    """
+    Fetches historical klines. If backtest_days is specified, it fetches data for that many days.
+    Otherwise, it fetches the most recent 'limit' klines.
+    """
     start_time = time.time()
-    try:
-        klines = client.get_klines(symbol=symbol, interval=interval, limit=limit)
-        duration = time.time() - start_time
+    if backtest_days:
+        # Calculate how many klines are needed based on the interval and days
+        # Binance API limit is 1000-1500 klines per request depending on endpoint (futures vs spot)
+        # For 15min interval: 4 klines/hour * 24 hours/day = 96 klines/day
+        # Let's use a known limit like 1000 for client.get_historical_klines
+        klines_per_day = (24 * 60) // int(interval.replace('m','').replace('h','').replace('d','')) # Approximate
+        if 'h' in interval: klines_per_day = 24 // int(interval.replace('h',''))
+        if 'd' in interval: klines_per_day = 1
+
+        total_klines_needed = klines_per_day * backtest_days
+        print(f"Fetching klines for {symbol}, interval {interval}, for {backtest_days} days (approx {total_klines_needed} klines)...")
+        
+        # get_historical_klines fetches in batches of 1000 (or its internal limit)
+        # The "days ago" string needs to be like "X days ago UTC"
+        # Ensure client.get_historical_klines exists and is the correct method for this.
+        # The standard client.get_historical_klines is what we need.
+        start_str = f"{backtest_days + 1} days ago UTC" # Fetch a bit more to ensure enough data
+        try:
+            klines = client.get_historical_klines(symbol, interval, start_str)
+        except Exception as e: # Catch if get_historical_klines fails with start_str
+             print(f"Failed to fetch historical klines with start_str: {e}. Trying with limit.")
+             # Fallback or alternative logic if the above fails or is not desired
+             # For simplicity, this example will stick to the intended method
+             # but a real implementation might need robust fetching in chunks if start_str is problematic
+             # or if total_klines_needed > API max per call (which get_historical_klines handles by pagination)
+             klines = [] # Ensure klines is defined
+
+    else: # Original behavior for live mode
+        print(f"Fetching klines for {symbol}, interval {interval}, limit {limit}...")
+        try:
+            klines = client.get_klines(symbol=symbol, interval=interval, limit=limit)
+        except BinanceAPIException as e:
+            print(f"API Error fetching klines for {symbol}: {e}"); return pd.DataFrame()
+        except Exception as e:
+            print(f"Error fetching klines for {symbol}: {e}"); return pd.DataFrame()
+
+    duration = time.time() - start_time
+    try: # Moved common processing into this try block
         if not klines:
             print(f"No kline data for {symbol} (fetch duration: {duration:.2f}s).")
             return pd.DataFrame()
@@ -241,23 +320,37 @@ def calculate_ema(df, period, column='close'):
 
 def check_ema_crossover_conditions(df, short_ema_col='EMA100', long_ema_col='EMA200', validation_candles=20):
     if not all(c in df for c in [short_ema_col, long_ema_col, 'low', 'high']) or len(df) < validation_candles + 2 \
-       or df[[short_ema_col, long_ema_col]].iloc[-(validation_candles + 2):].isnull().values.any(): return None
+       or df[[short_ema_col, long_ema_col]].iloc[-(validation_candles + 2):].isnull().values.any(): return None # Not enough data or EMAs are NaN, no signal
+
     prev_short, curr_short = df[short_ema_col].iloc[-2], df[short_ema_col].iloc[-1]
     prev_long, curr_long = df[long_ema_col].iloc[-2], df[long_ema_col].iloc[-1]
-    val_df = df.iloc[-(validation_candles + 1) : -1]
-    if len(val_df) < validation_candles: return None
     
     signal_type = None
-    if prev_short <= prev_long and curr_short > curr_long: signal_type = "LONG"
-    elif prev_short >= prev_long and curr_short < curr_long: signal_type = "SHORT"
-    else: return None
-    print(f"Potential {signal_type} signal: {short_ema_col} {curr_short:.4f} vs {long_ema_col} {curr_long:.4f}.")
+    # Basic crossover check
+    if prev_short <= prev_long and curr_short > curr_long: signal_type = "LONG_CROSS"
+    elif prev_short >= prev_long and curr_short < curr_long: signal_type = "SHORT_CROSS"
+    else: return None # No crossover event this candle
+
+    # Validation part
+    val_df = df.iloc[-(validation_candles + 1) : -1] # Look at candles *before* the current one for validation
+    if len(val_df) < validation_candles:
+        # This case implies we have a crossover, but not enough preceding candles for full validation.
+        # Depending on strictness, this could be a 'NO_SIGNAL_INSUFFICIENT_VALIDATION_HISTORY'
+        # For now, let's treat it as unable to validate, so no actionable signal.
+        # Or, we can log this specific state if desired. For now, let's return a distinct status.
+        print(f"Potential {signal_type.replace('_CROSS','')} signal, but insufficient validation history ({len(val_df)}/{validation_candles} candles).")
+        return "INSUFFICIENT_VALIDATION_HISTORY" 
+        
+    print(f"Potential {signal_type.replace('_CROSS','')} signal: {short_ema_col} {curr_short:.4f} vs {long_ema_col} {curr_long:.4f}.")
 
     for i in range(len(val_df)):
         c = val_df.iloc[i]; e100, e200 = val_df[short_ema_col].iloc[i], val_df[long_ema_col].iloc[i]
         if (c['low']<=e100<=c['high']) or (c['low']<=e200<=c['high']):
-            print(f"Validation FAILED for {signal_type} at {val_df.index[i]}: Price touched EMAs."); return None
-    print(f"{signal_type} signal VALIDATED."); return signal_type
+            print(f"Validation FAILED for {signal_type.replace('_CROSS','')} at {val_df.index[i]}: Price touched EMAs during validation period.")
+            return "VALIDATION_FAILED" # Crossover happened, but validation failed
+            
+    print(f"{signal_type.replace('_CROSS','')} signal VALIDATED.")
+    return signal_type.replace('_CROSS','') # Return "LONG" or "SHORT" if validated
 
 def calculate_swing_high_low(df, window=20, idx=-1):
     if len(df) < window + abs(idx) or idx - window < -len(df): return None, None
@@ -285,19 +378,39 @@ def calculate_sl_tp_values(entry, side, ema100, df_klines, idx=-1):
     return final_sl, tp
 
 def check_and_adjust_sl_tp_dynamic(cur_price, entry, _, __, cur_sl, cur_tp, side): # initial_sl, initial_tp unused for now
-    if entry == 0: return None, None
+    if entry == 0: return None, None, None
     profit_pct = (cur_price - entry) / entry if side == "LONG" else (entry - cur_price) / entry
-    new_sl, new_tp, adj = cur_sl, cur_tp, False
-    if profit_pct >= 0.005: # +0.5% profit -> SL to +0.2%
+    new_sl, new_tp = cur_sl, cur_tp
+    adjustment_reason = None
+
+    # Rule 1: If profit >= 0.5%, move SL to +0.2% profit (from entry)
+    if profit_pct >= 0.005:
         target_sl = entry * (1 + 0.002 if side == "LONG" else 1 - 0.002)
-        if (side=="LONG" and target_sl > new_sl) or (side=="SHORT" and target_sl < new_sl):
-            new_sl, adj = target_sl, True; print(f"Dynamic SL: {side} to {new_sl:.4f} (+0.2% lock)")
-    if profit_pct <= -0.005: # -0.5% loss -> TP to +0.2%
+        # Check if this new SL is an improvement (for LONG, higher; for SHORT, lower)
+        if (side == "LONG" and target_sl > new_sl) or \
+           (side == "SHORT" and target_sl < new_sl):
+            new_sl = target_sl
+            adjustment_reason = "SL_PROFIT_LOCK_0.2%"
+            print(f"Dynamic SL adjustment for {side} to {new_sl:.4f} ({adjustment_reason})")
+
+    # Rule 2: If loss >= 0.5% (profit_pct <= -0.005), adjust TP to +0.2% profit (from entry)
+    # This rule aims to secure a smaller profit if the trade goes into drawdown after initial profit or starts with a loss.
+    if profit_pct <= -0.005:
         target_tp = entry * (1 + 0.002 if side == "LONG" else 1 - 0.002)
-        if (side=="LONG" and target_tp < new_tp and target_tp > entry) or \
-           (side=="SHORT" and target_tp > new_tp and target_tp < entry):
-            new_tp, adj = target_tp, True; print(f"Dynamic TP: {side} to {new_tp:.4f} (+0.2% target after drawdown)")
-    return (new_sl, new_tp) if adj else (None, None)
+        # Check if this new TP is an improvement (for LONG, lower but > entry; for SHORT, higher but < entry)
+        # And also ensure it's a tighter TP than current, but still profitable
+        if (side == "LONG" and target_tp < new_tp and target_tp > entry) or \
+           (side == "SHORT" and target_tp > new_tp and target_tp < entry):
+            new_tp = target_tp
+            adjustment_reason = "TP_DRAWDOWN_REDUCE_0.2%" # Overwrites previous reason if both conditions met, SL prio based on order
+            if adjustment_reason and "SL" in adjustment_reason : adjustment_reason += ";TP_DRAWDOWN_REDUCE_0.2%" # Append if SL already adjusted
+            else: adjustment_reason = "TP_DRAWDOWN_REDUCE_0.2%"
+            print(f"Dynamic TP adjustment for {side} to {new_tp:.4f} ({adjustment_reason})")
+
+    if adjustment_reason:
+        return new_sl, new_tp, adjustment_reason
+    else:
+        return None, None, None # No adjustment made that met criteria
 
 def get_symbol_info(client, symbol):
     try:
@@ -610,28 +723,698 @@ def main():
     monitored_symbols = get_all_usdt_perpetual_symbols(client)
     if not monitored_symbols: print("Exiting: No symbols to monitor."); sys.exit(1)
     
-    confirm = input(f"Found {len(monitored_symbols)} USDT perpetuals. Monitor all? (yes/no) [yes]: ").lower().strip()
+    confirm = input(f"Found {len(monitored_symbols)} USDT perpetuals. Monitor all for {'live trading' if configs['mode'] == 'live' else 'backtesting'}? (yes/no) [yes]: ").lower().strip()
     if confirm == 'no': print("Exiting by user choice."); sys.exit(0)
 
+    if configs["mode"] == "live":
+        try:
+            trading_loop(client, configs, monitored_symbols)
+        except KeyboardInterrupt: print("\nBot stopped by user (Ctrl+C).")
+        except Exception as e: print(f"\nCRITICAL UNEXPECTED ERROR IN LIVE TRADING: {e}"); traceback.print_exc()
+        finally:
+            print("\n--- Live Trading Bot Shutting Down ---")
+            if client and active_trades:
+                print(f"Cancelling {len(active_trades)} bot-managed active SL/TP orders...")
+                with active_trades_lock:
+                    for symbol, trade_details in list(active_trades.items()):
+                        for oid_key in ['sl_order_id', 'tp_order_id']:
+                            oid = trade_details.get(oid_key)
+                            if oid:
+                                try:
+                                    print(f"Cancelling {oid_key} {oid} for {symbol}...")
+                                    client.futures_cancel_order(symbol=symbol, orderId=oid)
+                                except Exception as e_c: print(f"Failed to cancel {oid_key} {oid} for {symbol}: {e_c}")
+            print("Live Bot shutdown sequence complete.")
+    elif configs["mode"] == "backtest":
+        try:
+            backtesting_loop(client, configs, monitored_symbols)
+        except KeyboardInterrupt: print("\nBacktest stopped by user (Ctrl+C).")
+        except Exception as e: print(f"\nCRITICAL UNEXPECTED ERROR IN BACKTESTING: {e}"); traceback.print_exc()
+        finally:
+            print("\n--- Backtesting Complete ---")
+            # No orders to cancel in backtest mode unless simulating exchange interactions
+            # For now, active_trades will just be cleared or analyzed.
+        
+            active_trades.clear() # Clear trades for a clean slate if re-run or for reporting
+            print("Backtest shutdown sequence complete.")
+
+
+# --- Backtesting Specific Functions ---
+
+# Global state for backtesting simulation
+backtest_current_time = None
+backtest_simulated_balance = None # Will be initialized from actual balance or a preset
+backtest_simulated_orders = {} # symbol -> list of order dicts
+backtest_simulated_positions = {} # symbol -> position dict
+backtest_trade_log = [] # Log of all simulated trade actions
+
+def initialize_backtest_environment(client, configs):
+    global backtest_simulated_balance, active_trades, backtest_trade_log, backtest_simulated_orders, backtest_simulated_positions
+    active_trades.clear()
+    backtest_trade_log = []
+    backtest_simulated_orders = {}
+    backtest_simulated_positions = {}
+    
+    start_balance_type = configs.get("backtest_start_balance_type", "current") # Default to current if not set
+    
+    if start_balance_type == "custom":
+        backtest_simulated_balance = configs.get("backtest_custom_start_balance", 10000) # Default custom to 10k if somehow not set
+        print(f"Backtest initialized with CUSTOM starting balance: {backtest_simulated_balance:.2f} USDT")
+    else: # 'current' or default
+        live_balance = get_account_balance(client) # This hits the API
+        backtest_simulated_balance = live_balance if live_balance > 0 else 10000 # Default to 10k if no live balance
+        print(f"Backtest initialized with CURRENT account balance: {backtest_simulated_balance:.2f} USDT (or default if zero)")
+
+def get_simulated_account_balance(asset="USDT"): # Overrides live version for backtest
+    global backtest_simulated_balance
+    return backtest_simulated_balance
+
+def get_simulated_open_positions(symbol=None): # Overrides live version for backtest
+    global backtest_simulated_positions
+    if symbol:
+        return [backtest_simulated_positions[symbol]] if symbol in backtest_simulated_positions else []
+    return list(backtest_simulated_positions.values())
+
+def get_simulated_position_info(symbol):
+    global backtest_simulated_positions
+    return backtest_simulated_positions.get(symbol)
+
+
+def place_simulated_order(symbol_info, side, order_type, quantity, price=None, stop_price=None, reduce_only=None, current_candle_price=None):
+    global backtest_simulated_orders, backtest_simulated_balance, backtest_simulated_positions, backtest_trade_log, backtest_current_time
+
+    symbol = symbol_info['symbol']
+    order_id = f"sim_{symbol}_{int(time.time()*1000)}_{len(backtest_trade_log)}" # Unique enough for sim
+    
+    print(f"[SIM-{backtest_current_time}] Attempting to place {side} {order_type} for {quantity} {symbol} @ {price or 'MARKET'}")
+
+    # Basic order structure
+    sim_order = {
+        "symbol": symbol, "orderId": order_id, "side": side, "type": order_type,
+        "origQty": quantity, "executedQty": 0.0, "status": "NEW", "price": price,
+        "stopPrice": stop_price, "reduceOnly": reduce_only or False,
+        "timestamp": backtest_current_time, "avgPrice": 0.0
+    }
+
+    # For MARKET orders in simulation, we assume they fill at the current candle's close/open or a slight slippage
+    # For LIMIT/STOP orders, they will be checked each candle to see if they trigger
+    fill_price = current_candle_price # Assume market orders fill at current candle's close for simplicity
+    
+    if order_type == "MARKET":
+        if reduce_only: # Closing part or all of an existing position
+            current_pos = backtest_simulated_positions.get(symbol)
+            if not current_pos or current_pos['positionAmt'] == 0:
+                print(f"[SIM-{backtest_current_time}] ReduceOnly MARKET order for {symbol} but no position exists."); return None
+            
+            # Ensure side is opposite to current position
+            if (side == "BUY" and current_pos['side'] == "SHORT") or \
+               (side == "SELL" and current_pos['side'] == "LONG"):
+                
+                actual_reduce_qty = min(quantity, abs(current_pos['positionAmt']))
+                pnl = (fill_price - current_pos['entryPrice']) * actual_reduce_qty if current_pos['side'] == "LONG" else \
+                      (current_pos['entryPrice'] - fill_price) * actual_reduce_qty
+                
+                backtest_simulated_balance += pnl # Add PnL to balance
+                current_pos['positionAmt'] += actual_reduce_qty if side == "BUY" else -actual_reduce_qty # Reduce position
+                
+                sim_order.update({"status": "FILLED", "executedQty": actual_reduce_qty, "avgPrice": fill_price})
+                backtest_trade_log.append({
+                    "time": backtest_current_time, "symbol": symbol, "type": "MARKET_CLOSE", "side": side,
+                    "qty": actual_reduce_qty, "price": fill_price, "pnl": pnl, "balance": backtest_simulated_balance,
+                    "order_id": order_id
+                })
+                print(f"[SIM-{backtest_current_time}] {side} {actual_reduce_qty} {symbol} CLOSED @ {fill_price:.4f}. PnL: {pnl:.2f}. New Bal: {backtest_simulated_balance:.2f}")
+
+                if abs(current_pos['positionAmt']) < 1e-9: # Position fully closed
+                    del backtest_simulated_positions[symbol]
+                    print(f"[SIM-{backtest_current_time}] Position for {symbol} fully closed.")
+                else: # Position partially closed
+                    print(f"[SIM-{backtest_current_time}] Position for {symbol} partially closed. Remaining: {current_pos['positionAmt']}")
+                return sim_order
+            else:
+                print(f"[SIM-{backtest_current_time}] ReduceOnly MARKET order side mismatch for {symbol}."); return None
+
+        else: # Opening a new position or increasing existing
+            # Cost of trade (simplified, not including fees or precise margin calc for this example)
+            # For simplicity, assume sufficient balance. Real backtester needs margin checks.
+            sim_order.update({"status": "FILLED", "executedQty": quantity, "avgPrice": fill_price})
+            
+            current_pos = backtest_simulated_positions.get(symbol)
+            if current_pos: # Adding to existing position (averaging down/up)
+                # Complex logic for avg entry price, etc. - simplified here
+                print(f"[SIM-{backtest_current_time}] WARNING: Adding to existing position for {symbol} - simplified logic.")
+                # This needs proper handling of combined positions. For now, let's assume new trades are for new positions
+                # or that the strategy is designed not to add to existing ones unless explicitly handled.
+                # Let's overwrite for simplicity in this phase, or better, reject if position exists and not reduceOnly
+                print(f"[SIM-{backtest_current_time}] Market order to open {symbol}, but position already exists and not reduceOnly. Order rejected for simplicity.")
+                return None
+
+            backtest_simulated_positions[symbol] = {
+                "symbol": symbol, "entryPrice": fill_price, "positionAmt": quantity if side == "BUY" else -quantity,
+                "side": "LONG" if side == "BUY" else "SHORT", "leverage": symbol_info.get('leverage', DEFAULT_LEVERAGE), # Assuming leverage is set elsewhere
+                "marginType": symbol_info.get('marginType', DEFAULT_MARGIN_TYPE), "unRealizedProfit": 0.0,
+                "initial_margin": (quantity * fill_price) / symbol_info.get('leverage', DEFAULT_LEVERAGE) # Simplified
+            }
+            # backtest_simulated_balance -= backtest_simulated_positions[symbol]['initial_margin'] # Simplified margin deduction
+            
+            backtest_trade_log.append({
+                "time": backtest_current_time, "symbol": symbol, "type": "MARKET_OPEN", "side": side,
+                "qty": quantity, "price": fill_price, "balance": backtest_simulated_balance, # Balance before margin deduction for this log
+                "order_id": order_id
+            })
+            print(f"[SIM-{backtest_current_time}] {side} {quantity} {symbol} OPENED @ {fill_price:.4f}. New Pos: {backtest_simulated_positions[symbol]['positionAmt']}")
+            return sim_order
+            
+    elif order_type in ["STOP_MARKET", "TAKE_PROFIT_MARKET"]: # These are conditional orders
+        if not stop_price: print(f"[SIM-{backtest_current_time}] Stop price needed for {order_type}."); return None
+        # Store it to be checked each candle
+        if symbol not in backtest_simulated_orders: backtest_simulated_orders[symbol] = []
+        backtest_simulated_orders[symbol].append(sim_order)
+        print(f"[SIM-{backtest_current_time}] {order_type} for {symbol} qty {quantity} at stop {stop_price} PLACED (pending trigger).")
+        return sim_order
+    else:
+        print(f"[SIM-{backtest_current_time}] Order type {order_type} not fully supported in simplified simulation yet.")
+        return None
+
+
+def cancel_simulated_order(symbol, order_id):
+    global backtest_simulated_orders, backtest_trade_log, backtest_current_time
+    if symbol in backtest_simulated_orders:
+        orders_for_symbol = backtest_simulated_orders[symbol]
+        for i, order in enumerate(orders_for_symbol):
+            if order['orderId'] == order_id:
+                removed_order = orders_for_symbol.pop(i)
+                print(f"[SIM-{backtest_current_time}] Cancelled simulated order {order_id} for {symbol}: {removed_order['type']} {removed_order['side']} Qty {removed_order['origQty']} Stop {removed_order.get('stopPrice')}")
+                backtest_trade_log.append({
+                    "time": backtest_current_time, "symbol": symbol, "type": "CANCEL_ORDER",
+                    "order_id": order_id, "details": removed_order
+                })
+                if not backtest_simulated_orders[symbol]: # Clean up if list is empty
+                    del backtest_simulated_orders[symbol]
+                return True
+    print(f"[SIM-{backtest_current_time}] Could not find order {order_id} for {symbol} to cancel.")
+    return False
+
+def process_pending_simulated_orders(symbol, current_candle_high, current_candle_low, current_candle_close):
+    global backtest_simulated_orders, backtest_simulated_positions, backtest_trade_log, backtest_current_time
+    
+    if symbol not in backtest_simulated_orders: return
+
+    triggered_orders_indices = []
+    for i, order in enumerate(backtest_simulated_orders[symbol]):
+        if order['status'] != "NEW": continue # Already processed or cancelled
+
+        triggered = False
+        trigger_price = None
+
+        # Check STOP_MARKET / TAKE_PROFIT_MARKET
+        if order['type'] in ["STOP_MARKET", "TAKE_PROFIT_MARKET"]:
+            sp = order['stopPrice']
+            # For LONG SL (SELL STOP_MARKET) or SHORT TP (BUY TAKE_PROFIT_MARKET)
+            if (order['side'] == "SELL" and current_candle_low <= sp) or \
+               (order['side'] == "BUY" and current_candle_high >= sp):
+                triggered = True
+                # Simplification: assume trigger at stop_price. Realistically, it could be worse (slippage).
+                # For backtesting, it's common to assume it triggers at stop_price if breached.
+                trigger_price = sp 
+        
+        if triggered:
+            print(f"[SIM-{backtest_current_time}] TRIGGERED: {order['type']} {order['side']} for {symbol} Qty {order['origQty']} at Stop {order['stopPrice']} (Candle H:{current_candle_high}, L:{current_candle_low})")
+            order['status'] = "TRIGGERED_PENDING_FILL" # Mark as triggered
+            
+            # Now simulate the fill (which is like a MARKET order)
+            # This is a recursive call, essentially. Let's simplify by directly creating the market effect.
+            # Assuming it's always reduceOnly for SL/TP from the main strategy logic
+            
+            current_pos = backtest_simulated_positions.get(symbol)
+            if not current_pos:
+                print(f"[SIM-{backtest_current_time}] ERROR: Triggered SL/TP for {symbol} but no position found. Order: {order['orderId']}")
+                triggered_orders_indices.append(i) # Remove it as it can't be processed
+                continue
+
+            # Ensure the order side makes sense for closing the position
+            # e.g. if pos is LONG, SL/TP must be SELL. If pos is SHORT, SL/TP must be BUY.
+            if (current_pos['side'] == "LONG" and order['side'] == "SELL") or \
+               (current_pos['side'] == "SHORT" and order['side'] == "BUY"):
+                
+                actual_filled_qty = min(order['origQty'], abs(current_pos['positionAmt']))
+                pnl = (trigger_price - current_pos['entryPrice']) * actual_filled_qty if current_pos['side'] == "LONG" else \
+                      (current_pos['entryPrice'] - trigger_price) * actual_filled_qty
+                
+                global backtest_simulated_balance
+                backtest_simulated_balance += pnl
+                current_pos['positionAmt'] += actual_filled_qty if order['side'] == "BUY" else -actual_filled_qty
+                
+                order.update({"status": "FILLED", "executedQty": actual_filled_qty, "avgPrice": trigger_price})
+                backtest_trade_log.append({
+                    "time": backtest_current_time, "symbol": symbol, "type": f"{order['type']}_FILL", "side": order['side'],
+                    "qty": actual_filled_qty, "price": trigger_price, "pnl": pnl, "balance": backtest_simulated_balance,
+                    "triggered_order_id": order['orderId']
+                })
+                print(f"[SIM-{backtest_current_time}] {order['side']} {actual_filled_qty} {symbol} (from {order['type']}) FILLED @ {trigger_price:.4f}. PnL: {pnl:.2f}. New Bal: {backtest_simulated_balance:.2f}")
+
+                if abs(current_pos['positionAmt']) < 1e-9: # Position fully closed
+                    del backtest_simulated_positions[symbol]
+                    print(f"[SIM-{backtest_current_time}] Position for {symbol} (from {order['type']}) fully closed.")
+                else: # Position partially closed
+                    print(f"[SIM-{backtest_current_time}] Position for {symbol} (from {order['type']}) partially closed. Remaining: {current_pos['positionAmt']}")
+                
+                triggered_orders_indices.append(i) # Mark for removal from pending list
+            else:
+                print(f"[SIM-{backtest_current_time}] ERROR: Triggered SL/TP for {symbol} has mismatched side for current position. Order: {order['orderId']}, Pos Side: {current_pos['side']}")
+                triggered_orders_indices.append(i) # Remove it
+
+    # Remove orders that were filled or errored
+    for index in sorted(triggered_orders_indices, reverse=True):
+        del backtest_simulated_orders[symbol][index]
+    if symbol in backtest_simulated_orders and not backtest_simulated_orders[symbol]:
+        del backtest_simulated_orders[symbol]
+
+
+def manage_trade_entry_backtest(client_dummy, configs, symbol, klines_df_current_slice, symbol_info_map):
+    # This function is a wrapper around the core strategy logic for backtesting.
+    # It uses simulated order placement and state management.
+    global active_trades, active_trades_lock, backtest_current_time, backtest_simulated_positions
+
+    # The lock might not be strictly necessary if backtesting is single-threaded for decision making per symbol
+    # but good to keep if any part of the original manage_trade_entry expects it.
+    # For pure backtesting, we can simplify and remove the lock if threading is not used for symbol processing.
+    
+    # --- Simulate `active_trades` logic for backtesting ---
+    # In backtesting, `active_trades` would store the state of trades as if they were live.
+    # Max concurrent positions check
+    # Simplified: count entries in `backtest_simulated_positions` that are not fully closed.
+    # A more robust check would be against `active_trades` which should mirror `backtest_simulated_positions` states.
+
+    current_candle_close = klines_df_current_slice['close'].iloc[-1]
+    current_candle_high = klines_df_current_slice['high'].iloc[-1]
+    current_candle_low = klines_df_current_slice['low'].iloc[-1]
+
+    # Check if we are already in a trade for this symbol (based on backtest_simulated_positions)
+    if symbol in backtest_simulated_positions and backtest_simulated_positions[symbol]['positionAmt'] != 0:
+        # print(f"[SIM-{backtest_current_time}] Already in position for {symbol}. Skipping new entry signal check.")
+        return # Already in a position, monitoring will handle SL/TP.
+
+    # Max concurrent positions check based on `active_trades` which should be kept in sync
+    # with `backtest_simulated_positions`
+    if len(active_trades) >= configs["max_concurrent_positions"] and symbol not in active_trades:
+         print(f"[SIM-{backtest_current_time}] Max concurrent positions ({configs['max_concurrent_positions']}) reached. Cannot open for new symbol {symbol}.")
+         return
+
+    # --- Calculations (same as live) ---
+    klines_df_current_slice['EMA100'] = calculate_ema(klines_df_current_slice, 100)
+    klines_df_current_slice['EMA200'] = calculate_ema(klines_df_current_slice, 200)
+    if klines_df_current_slice['EMA100'] is None or klines_df_current_slice['EMA200'] is None or \
+       klines_df_current_slice['EMA100'].isnull().all() or klines_df_current_slice['EMA200'].isnull().all() or \
+       len(klines_df_current_slice) < 202:
+        # print(f"[SIM-{backtest_current_time}] EMA calculation failed or insufficient data for {symbol}. Length: {len(klines_df_current_slice)}")
+        return
+
+    signal_status = check_ema_crossover_conditions(klines_df_current_slice) 
+    
+    if signal_status not in ["LONG", "SHORT"]: # Not a valid, validated signal
+        if signal_status == "VALIDATION_FAILED":
+            backtest_trade_log.append({
+                "time": backtest_current_time, "symbol": symbol, "type": "SIGNAL_VALIDATION_FAILED",
+                "reason": "Price touched EMAs during validation period",
+                "details": f"EMA100: {klines_df_current_slice['EMA100'].iloc[-1]:.4f}, EMA200: {klines_df_current_slice['EMA200'].iloc[-1]:.4f}"
+            })
+        elif signal_status == "INSUFFICIENT_VALIDATION_HISTORY":
+             backtest_trade_log.append({
+                "time": backtest_current_time, "symbol": symbol, "type": "SIGNAL_VALIDATION_FAILED",
+                "reason": "Insufficient validation history",
+                "details": f"EMA100: {klines_df_current_slice['EMA100'].iloc[-1]:.4f}, EMA200: {klines_df_current_slice['EMA200'].iloc[-1]:.4f}"
+            })
+        # If signal_status is None, it means no crossover, so no log needed here, just return.
+        return
+
+    signal = signal_status # Now signal is confirmed "LONG" or "SHORT"
+    print(f"\n[SIM-{backtest_current_time}] --- New Validated Trade Signal for {symbol}: {signal} ---")
+    
+    symbol_info = symbol_info_map.get(symbol) 
+    if not symbol_info: 
+        print(f"[SIM-{backtest_current_time}] No symbol info for {symbol}. Abort signal processing."); return
+
+    entry_p_signal = klines_df_current_slice['close'].iloc[-1] 
+    ema100_val = klines_df_current_slice['EMA100'].iloc[-1]
+    sl_p, tp_p = calculate_sl_tp_values(entry_p_signal, signal, ema100_val, klines_df_current_slice)
+    
+    current_sim_balance = get_simulated_account_balance()
+    qty = calculate_position_size(current_sim_balance, configs['risk_percent'], entry_p_signal, sl_p, symbol_info)
+    
+    # Calculate Risk:Reward Ratio
+    rr_ratio = None
+    if sl_p is not None and tp_p is not None and entry_p_signal != sl_p:
+        reward_abs = abs(tp_p - entry_p_signal)
+        risk_abs = abs(entry_p_signal - sl_p)
+        if risk_abs > 1e-9 : rr_ratio = reward_abs / risk_abs
+
+    evaluated_trade_details = {
+        "time": backtest_current_time, "symbol": symbol, "type": "SIGNAL_EVALUATED",
+        "signal_side": signal, "calc_entry": entry_p_signal, "calc_sl": sl_p, "calc_tp": tp_p,
+        "calc_qty": qty if qty is not None else 0.0, "initial_rr_ratio": rr_ratio
+    }
+
+    if sl_p is None or tp_p is None:
+        print(f"[SIM-{backtest_current_time}] SL/TP calc failed for {symbol}. Abort."); 
+        evaluated_trade_details.update({"status": "REJECTED", "reason": "SL_TP_CALC_FAILED"})
+        backtest_trade_log.append(evaluated_trade_details)
+        return
+    
+    if current_sim_balance <= 0:
+        print(f"[SIM-{backtest_current_time}] Zero/unavailable simulated balance. Abort."); 
+        evaluated_trade_details.update({"status": "REJECTED", "reason": "ZERO_BALANCE"})
+        backtest_trade_log.append(evaluated_trade_details)
+        return
+
+    if qty is None or qty <= 0: 
+        print(f"[SIM-{backtest_current_time}] Invalid position size for {symbol}. Abort."); 
+        evaluated_trade_details.update({"status": "REJECTED", "reason": "INVALID_POS_SIZE", "calc_qty": qty if qty is not None else 0.0})
+        backtest_trade_log.append(evaluated_trade_details)
+        return
+        
+    if round(qty, int(symbol_info['quantityPrecision'])) == 0.0:
+        print(f"[SIM-{backtest_current_time}] Qty for {symbol} rounds to 0. Abort."); 
+        evaluated_trade_details.update({"status": "REJECTED", "reason": "QTY_ROUNDS_TO_ZERO"})
+        backtest_trade_log.append(evaluated_trade_details)
+        return
+
+    # Log evaluated signal before attempting to place
+    backtest_trade_log.append(evaluated_trade_details)
+
+    print(f"[SIM-{backtest_current_time}] Attempting {signal} {qty} {symbol} @SIM_MARKET (EP_signal:{entry_p_signal:.4f}), SL:{sl_p:.4f}, TP:{tp_p:.4f}, RR:{(f'{rr_ratio:.2f}' if isinstance(rr_ratio, float) else 'N/A')})")
+    
+    # In backtest, MARKET order fills at current_candle_close (or open of next, configurable)
+    # For this simulation, let's assume it fills at `entry_p_signal` which is current_candle_close
+    entry_order = place_simulated_order(symbol_info, "BUY" if signal=="LONG" else "SELL", "MARKET", qty, 
+                                        current_candle_price=entry_p_signal)
+
+    if entry_order and entry_order.get('status') == 'FILLED':
+        actual_ep = float(entry_order.get('avgPrice', entry_p_signal)) # Should be entry_p_signal here
+        
+        # SL/TP might need slight re-calc if actual_ep differs from entry_p_signal due to simulated slippage
+        # For now, assume actual_ep IS entry_p_signal for simplicity if no slippage model.
+        # If slippage was modeled in place_simulated_order, then recalculate:
+        if abs(actual_ep - entry_p_signal) > 1e-9 : # If there was slippage
+            sl_dist_pct = abs(entry_p_signal - sl_p) / entry_p_signal
+            tp_dist_pct = abs(entry_p_signal - tp_p) / entry_p_signal
+            sl_p = actual_ep * (1 - sl_dist_pct if signal == "LONG" else 1 + sl_dist_pct)
+            tp_p = actual_ep * (1 + tp_dist_pct if signal == "LONG" else 1 - tp_dist_pct)
+            print(f"[SIM-{backtest_current_time}] SL/TP adjusted for actual fill {actual_ep:.4f}: SL {sl_p:.4f}, TP {tp_p:.4f}")
+
+        sl_ord = place_simulated_order(symbol_info, "SELL" if signal=="LONG" else "BUY", "STOP_MARKET", qty, stop_price=sl_p, reduce_only=True)
+        if not sl_ord: print(f"[SIM-{backtest_current_time}] CRITICAL: FAILED TO PLACE SIMULATED SL FOR {symbol}!")
+        
+        tp_ord = place_simulated_order(symbol_info, "SELL" if signal=="LONG" else "BUY", "TAKE_PROFIT_MARKET", qty, stop_price=tp_p, reduce_only=True)
+        if not tp_ord: print(f"[SIM-{backtest_current_time}] Warning: Failed to place simulated TP for {symbol}.")
+
+        # Update active_trades for the backtester's internal tracking (mirroring live bot)
+        # This active_trades is the global one, ensure it's managed correctly for backtesting context
+        active_trades[symbol] = {
+            "entry_order_id": entry_order['orderId'], "sl_order_id": sl_ord.get('orderId') if sl_ord else None,
+            "tp_order_id": tp_ord.get('orderId') if tp_ord else None, "entry_price": actual_ep,
+            "current_sl_price": sl_p, "current_tp_price": tp_p, "initial_sl_price": sl_p, "initial_tp_price": tp_p,
+            "quantity": qty, "side": signal, "symbol_info": symbol_info, 
+            "open_timestamp": backtest_current_time # Use backtest_current_time
+        }
+        print(f"[SIM-{backtest_current_time}] Trade for {symbol} recorded in active_trades at {active_trades[symbol]['open_timestamp']}.")
+    else:
+        print(f"[SIM-{backtest_current_time}] Simulated Market order for {symbol} failed or not filled: {entry_order}")
+
+
+def monitor_active_trades_backtest(configs):
+    global active_trades, active_trades_lock, backtest_simulated_positions, backtest_current_time, backtest_trade_log
+    
+    if not active_trades: return
+    # print(f"\n[SIM-{backtest_current_time}] Monitoring {len(active_trades)} active bot trades...")
+    
+    symbols_to_remove_from_active_trades = []
+
+    for symbol, trade_details in list(active_trades.items()): # Iterate copy for safe modification
+        # print(f"[SIM-{backtest_current_time}] Checking {symbol} (Side: {trade_details['side']}, Entry: {trade_details['entry_price']:.4f})...")
+        
+        sim_pos = backtest_simulated_positions.get(symbol)
+        if not sim_pos or sim_pos['positionAmt'] == 0: # Position closed (likely by SL/TP trigger in process_pending_simulated_orders)
+            print(f"[SIM-{backtest_current_time}] Position for {symbol} seems closed. Removing from active_trades.")
+            symbols_to_remove_from_active_trades.append(symbol)
+            # No need to cancel SL/TP orders here, as they would have been consumed or become irrelevant
+            # if they were simulated. If `process_pending_simulated_orders` handles their removal, this is fine.
+            continue
+
+        # Dynamic SL/TP adjustment logic (same as live, but uses simulated current price)
+        # The "current price" for a candle in backtest can be Open, High, Low, or Close.
+        # Typically, for monitoring, you'd use the Close of the current candle.
+        # This requires the klines_df for the symbol up to backtest_current_time.
+        # This function is called AFTER all symbols have had their pending orders processed for the current candle.
+        # So, `sim_pos['entryPrice']` etc. are post-any-fills for this candle.
+        
+        # We need the current kline data for the symbol to get the current price.
+        # This implies monitor_active_trades_backtest needs access to the symbol's latest kline slice.
+        # This is a bit tricky design-wise. Let's assume it's passed or accessible.
+        # For now, let's assume `current_candle_data_map` is available, mapping symbol to its current candle.
+        # This will be populated in the main backtesting_loop.
+        current_candle_data = current_candle_data_map.get(symbol)
+        if not current_candle_data:
+            # print(f"[SIM-{backtest_current_time}] No current candle data for {symbol} in monitor_active_trades_backtest. Skipping dynamic SL/TP.")
+            continue
+        cur_price = current_candle_data['close'] # Use close of the current candle for adjustment checks
+
+        adj_sl, adj_tp, adj_reason = check_and_adjust_sl_tp_dynamic(
+            cur_price, trade_details['entry_price'], 
+            trade_details['initial_sl_price'], trade_details['initial_tp_price'],
+            trade_details['current_sl_price'], trade_details['current_tp_price'],
+            trade_details['side']
+        )
+        
+        s_info = trade_details['symbol_info']
+        qty = trade_details['quantity']
+        side = trade_details['side']
+        made_adjustment_in_log = False
+
+        if adj_reason: # If any adjustment was made
+            log_entry_dyn_adj = {
+                "time": backtest_current_time, "symbol": symbol, "type": "DYNAMIC_ADJUSTMENT",
+                "reason": adj_reason,
+                "old_sl": trade_details['current_sl_price'], "new_sl": adj_sl if adj_sl is not None else trade_details['current_sl_price'],
+                "old_tp": trade_details['current_tp_price'], "new_tp": adj_tp if adj_tp is not None else trade_details['current_tp_price'],
+                "current_price_at_adj": cur_price
+            }
+            # Note: adj_sl and adj_tp from check_and_adjust_sl_tp_dynamic will be the new values IF they changed,
+            # otherwise they are the same as current_sl_price/current_tp_price passed in.
+            # We only proceed to cancel/replace if the specific SL or TP value has actually changed.
+
+            if adj_sl is not None and abs(adj_sl - trade_details['current_sl_price']) > 1e-9:
+                print(f"[SIM-{backtest_current_time}] Adjusting SL for {symbol} from {trade_details['current_sl_price']:.4f} to {adj_sl:.4f} (Reason: {adj_reason})")
+                if trade_details.get('sl_order_id'): 
+                    cancel_simulated_order(symbol, trade_details['sl_order_id'])
+                
+                sl_ord_new = place_simulated_order(s_info, "SELL" if side=="LONG" else "BUY", "STOP_MARKET", qty, stop_price=adj_sl, reduce_only=True)
+                if sl_ord_new: 
+                    active_trades[symbol]['current_sl_price'] = adj_sl
+                    active_trades[symbol]['sl_order_id'] = sl_ord_new.get('orderId')
+                    made_adjustment_in_log = True
+                else: 
+                    print(f"[SIM-{backtest_current_time}] CRITICAL: FAILED TO PLACE NEW SIMULATED SL FOR {symbol}!")
+                    log_entry_dyn_adj["sl_update_status"] = "FAILED_TO_PLACE_NEW_SL"
+            
+            if adj_tp is not None and abs(adj_tp - trade_details['current_tp_price']) > 1e-9:
+                print(f"[SIM-{backtest_current_time}] Adjusting TP for {symbol} from {trade_details['current_tp_price']:.4f} to {adj_tp:.4f} (Reason: {adj_reason})")
+                if trade_details.get('tp_order_id'):
+                    cancel_simulated_order(symbol, trade_details['tp_order_id'])
+
+                tp_ord_new = place_simulated_order(s_info, "SELL" if side=="LONG" else "BUY", "TAKE_PROFIT_MARKET", qty, stop_price=adj_tp, reduce_only=True)
+                if tp_ord_new:
+                    active_trades[symbol]['current_tp_price'] = adj_tp
+                    active_trades[symbol]['tp_order_id'] = tp_ord_new.get('orderId')
+                    made_adjustment_in_log = True
+                else: 
+                    print(f"[SIM-{backtest_current_time}] Warning: Failed to place new simulated TP for {symbol}.")
+                    log_entry_dyn_adj["tp_update_status"] = "FAILED_TO_PLACE_NEW_TP"
+
+            if made_adjustment_in_log: # Only log if an actual order was changed
+                 backtest_trade_log.append(log_entry_dyn_adj)
+
+    for sym in symbols_to_remove_from_active_trades:
+        if sym in active_trades:
+            # Before deleting, ensure any associated pending orders are also cleared if not already handled
+            trade_detail_to_remove = active_trades[sym]
+            if trade_detail_to_remove.get('sl_order_id'):
+                cancel_simulated_order(sym, trade_detail_to_remove['sl_order_id'])
+            if trade_detail_to_remove.get('tp_order_id'):
+                cancel_simulated_order(sym, trade_detail_to_remove['tp_order_id'])
+            del active_trades[sym]
+            print(f"[SIM-{backtest_current_time}] Removed {sym} from bot's active_trades list.")
+
+
+# Global map for current candle data per symbol, used by monitor_active_trades_backtest
+current_candle_data_map = {}
+
+def backtesting_loop(client, configs, monitored_symbols):
+    global backtest_current_time, active_trades, backtest_simulated_balance, backtest_trade_log, current_candle_data_map
+    
+    print("\n--- Starting Backtesting Loop ---")
+    if not monitored_symbols: print("No symbols to monitor for backtest. Exiting."); return
+
+    initialize_backtest_environment(client, configs) # Sets up balance, clears old state
+
+    # 1. Fetch all historical data for all symbols first
+    # We need a consistent timeline. The master timeline will be from the symbol with the most data,
+    # or we can fetch for a primary symbol (e.g., BTCUSDT) to define the simulation ticks.
+    # For simplicity, let's assume all symbols will have data for the requested `backtest_days`.
+    # The `get_historical_klines` function is now modified to fetch based on `backtest_days`.
+    
+    print(f"Fetching historical data for {len(monitored_symbols)} symbols for {configs['backtest_days']} days...")
+    all_symbol_historical_data = {}
+    symbol_info_map = {} # Store symbol info to avoid repeated API calls
+
+    # Determine the overall timespan for the backtest by finding the first valid symbol
+    master_klines_df = pd.DataFrame()
+    reference_symbol = None
+    for sym in monitored_symbols:
+        print(f"Attempting to use {sym} to establish backtest time range...")
+        temp_df = get_historical_klines(client, sym, backtest_days=configs['backtest_days'])
+        if not temp_df.empty:
+            master_klines_df = temp_df
+            reference_symbol = sym
+            print(f"Successfully fetched master kline data using {reference_symbol}.")
+            break
+        else:
+            print(f"Failed to fetch kline data for {sym} as reference. Trying next symbol.")
+
+    if master_klines_df.empty or reference_symbol is None:
+        print(f"Could not establish master kline data from any monitored symbols. Aborting backtest."); return
+    
+    # Filter out data points older than precisely "backtest_days ago" from the last data point.
+    # This is to make the start date more consistent if get_historical_klines fetched slightly more.
+    end_date_of_data = master_klines_df.index[-1]
+    start_date_cutoff = end_date_of_data - pd.Timedelta(days=configs['backtest_days'])
+    master_klines_df = master_klines_df[master_klines_df.index >= start_date_cutoff]
+    print(f"Master timeline for backtest: {len(master_klines_df)} candles from {master_klines_df.index[0]} to {master_klines_df.index[-1]}")
+
+    for symbol in monitored_symbols:
+        print(f"Fetching data and info for {symbol}...")
+        s_info = get_symbol_info(client, symbol) # Live call, okay for setup
+        if not s_info: print(f"Could not get symbol info for {symbol}. Skipping."); continue
+        symbol_info_map[symbol] = s_info
+        
+        # Fetch data for each symbol, then align and trim to master_klines_df's index
+        # This ensures all symbols are processed on the same timestamps.
+        # The `get_historical_klines` fetches based on "days ago UTC", so timestamps should align well.
+        kl_df = get_historical_klines(client, symbol, backtest_days=configs['backtest_days'])
+        if kl_df.empty: print(f"No kline data for {symbol} for backtest period. Skipping."); continue
+        
+        # Trim to the exact range of master_klines_df
+        kl_df = kl_df[kl_df.index >= master_klines_df.index[0]]
+        kl_df = kl_df[kl_df.index <= master_klines_df.index[-1]]
+        # Reindex to master timeline, forward-filling missing data for a symbol if any (though ideally it shouldn't be missing much)
+        kl_df = kl_df.reindex(master_klines_df.index, method='ffill') 
+        # It's crucial that data is clean after ffill. If a symbol starts trading later, ffill might not be appropriate.
+        # A better way would be to ensure data exists or handle NaNs carefully.
+        # For now, assume data is mostly complete for the period for active symbols.
+        all_symbol_historical_data[symbol] = kl_df
+        print(f"Data for {symbol} prepared: {len(kl_df)} candles.")
+
+    if not all_symbol_historical_data: print("No historical data loaded for any symbol. Aborting."); return
+
+    # The number of "candles" or simulation steps is determined by the length of master_klines_df
+    # We need at least 202 candles of history for EMA calculations at any point.
+    # So, the actual simulation will start from the 202nd candle of the fetched data.
+    simulation_start_index = 201 # Start processing from the 202nd candle (index 201)
+    if len(master_klines_df) <= simulation_start_index:
+        print(f"Not enough historical data ({len(master_klines_df)} candles) to start simulation (needs > {simulation_start_index}).")
+        return
+
+    print(f"\n--- Starting Simulation ({len(master_klines_df) - simulation_start_index} steps) ---")
+    initial_balance_for_report = backtest_simulated_balance
+    
+    # 2. Iterate candle by candle through the master timeline
+    for i in range(simulation_start_index, len(master_klines_df)):
+        backtest_current_time = master_klines_df.index[i]
+        current_candle_data_map.clear() # Clear for the new candle
+
+        if i % 100 == 0 : # Log progress
+            print(f"\n[SIM] Processing Candle {i - simulation_start_index + 1} / {len(master_klines_df) - simulation_start_index} | Time: {backtest_current_time} | Balance: {backtest_simulated_balance:.2f} USDT")
+
+        # For each symbol:
+        # A. Process pending orders (SL/TP triggers) based on current candle's H/L
+        # B. Update position P&L (if any open positions)
+        # C. Check for new trade entry signals
+        # D. Perform dynamic SL/TP adjustments for active trades
+        
+        # Step A & B: Process pending orders and update P&L for existing positions
+        for symbol in list(backtest_simulated_positions.keys()): # Iterate over copy as it might be modified
+            if symbol not in all_symbol_historical_data: continue
+            
+            symbol_klines_so_far = all_symbol_historical_data[symbol].iloc[:i+1] # Data up to current candle
+            if symbol_klines_so_far.empty: continue
+
+            current_candle = symbol_klines_so_far.iloc[-1]
+            current_candle_data_map[symbol] = current_candle # Store for monitor_active_trades_backtest
+            
+            # Update P&L for open positions (can be done here or in monitor_active_trades)
+            pos = backtest_simulated_positions.get(symbol)
+            if pos:
+                pnl_unrealized = (current_candle['close'] - pos['entryPrice']) * pos['positionAmt'] if pos['side'] == "LONG" else \
+                                 (pos['entryPrice'] - current_candle['close']) * abs(pos['positionAmt'])
+                pos['unRealizedProfit'] = pnl_unrealized
+                # print(f"[SIM-{backtest_current_time}] {symbol} Pos PnL: {pnl_unrealized:.2f}")
+
+
+            process_pending_simulated_orders(symbol, current_candle['high'], current_candle['low'], current_candle['close'])
+
+        # Step C: Check for new trade entries
+        # This part needs to be careful about threading if we adapt the live `process_symbol_task`
+        # For backtesting, sequential processing per symbol is simpler and deterministic.
+        for symbol in monitored_symbols:
+            if symbol not in all_symbol_historical_data: continue
+            
+            # Prepare data slice for this symbol: needs at least 202 candles up to current time
+            # The slice should end at index `i` (current candle)
+            start_idx_for_slice = max(0, i - (201 + 50)) # Ensure enough data for EMAs + some buffer, e.g. 202 for EMAs, +50 for lookbacks if any
+                                                       # Original `get_historical_klines` live uses limit=500.
+                                                       # The strat needs 202 for EMA200 and validation candles.
+            if i < simulation_start_index: continue # Should not happen due to loop range but good check
+
+            klines_slice_for_symbol = all_symbol_historical_data[symbol].iloc[max(0, i - 500 +1) : i+1].copy() # Use a rolling window of 500 candles like live
+            if len(klines_slice_for_symbol) < 202: # Minimum needed by strategy
+                # print(f"[SIM-{backtest_current_time}] Insufficient data history for {symbol} at this point ({len(klines_slice_for_symbol)}). Skipping entry check.")
+                continue
+            
+            # Call the modified trade entry logic
+            # The `client` object passed here is a dummy or the real one but its API calls for orders/balance are mocked/redirected
+            manage_trade_entry_backtest(client, configs, symbol, klines_slice_for_symbol, symbol_info_map)
+
+        # Step D: Perform dynamic SL/TP adjustments (after all entries and SL/TP hits for the current candle)
+        monitor_active_trades_backtest(configs)
+
+
+    # 3. Print summary report
+    print("\n--- Backtest Simulation Finished ---")
+    print(f"Initial Balance: {initial_balance_for_report:.2f} USDT")
+    print(f"Final Balance: {backtest_simulated_balance:.2f} USDT")
+    profit = backtest_simulated_balance - initial_balance_for_report
+    profit_pct = (profit / initial_balance_for_report) * 100 if initial_balance_for_report > 0 else 0
+    print(f"Total Profit: {profit:.2f} USDT ({profit_pct:.2f}%)")
+    
+    print(f"\nTotal Trades Logged: {len(backtest_trade_log)}")
+    # Further analysis of backtest_trade_log can be done here (e.g., win rate, max drawdown, etc.)
+    # For example, count winning/losing trades:
+    wins = sum(1 for t in backtest_trade_log if t.get('pnl', 0) > 0 and ("CLOSE" in t.get("type","") or "FILL" in t.get("type","")))
+    losses = sum(1 for t in backtest_trade_log if t.get('pnl', 0) < 0 and ("CLOSE" in t.get("type","") or "FILL" in t.get("type","")))
+    num_closing_trades = wins + losses
+    win_rate = (wins / num_closing_trades * 100) if num_closing_trades > 0 else 0
+    print(f"Closing Trades: {num_closing_trades} (Wins: {wins}, Losses: {losses})")
+    print(f"Win Rate: {win_rate:.2f}%")
+
+    # Save trade log to a file (optional)
     try:
-        trading_loop(client, configs, monitored_symbols)
-    except KeyboardInterrupt: print("\nBot stopped by user (Ctrl+C).")
-    except Exception as e: print(f"\nCRITICAL UNEXPECTED ERROR: {e}"); traceback.print_exc()
-    finally:
-        print("\n--- Trading Bot Shutting Down ---")
-        # Cancel open SL/TP orders for trades managed by this bot
-        if client and active_trades: # Check if client was initialized
-            print(f"Cancelling {len(active_trades)} bot-managed active SL/TP orders...")
-            with active_trades_lock: # Ensure exclusive access for final cleanup
-                for symbol, trade_details in list(active_trades.items()):
-                    for oid_key in ['sl_order_id', 'tp_order_id']:
-                        oid = trade_details.get(oid_key)
-                        if oid:
-                            try:
-                                print(f"Cancelling {oid_key} {oid} for {symbol}...")
-                                client.futures_cancel_order(symbol=symbol, orderId=oid)
-                            except Exception as e_c: print(f"Failed to cancel {oid_key} {oid} for {symbol}: {e_c}")
-        print("Bot shutdown sequence complete.")
+        df_tradelog = pd.DataFrame(backtest_trade_log)
+        log_filename = f"backtest_tradelog_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        df_tradelog.to_csv(log_filename, index=False)
+        print(f"Trade log saved to {log_filename}")
+    except Exception as e_log:
+        print(f"Error saving trade log: {e_log}")
+
 
 if __name__ == "__main__":
     main()
