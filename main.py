@@ -20,7 +20,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import traceback # For more detailed error logging in threads
 import telegram # For sending Telegram messages
-import asyncio 
+import asyncio
+from telegram.ext import Application, CommandHandler, ContextTypes
+ 
 
 # --- Configuration Defaults ---
 DEFAULT_RISK_PERCENT = 1.0       # Default account risk percentage per trade (e.g., 1.0 for 1%)
@@ -106,6 +108,23 @@ def load_api_keys(env):
         print(f"An unexpected error occurred while loading keys: {e}")
         sys.exit(1)
 
+
+
+def build_startup_message(configs, balance, open_positions_text, bot_start_time_str):
+    env_name = configs.get('environment', 'N/A').title()
+    mode_name = configs.get('mode', 'N/A').title()
+    return (
+        f"*🚀 Bot Started Successfully ({configs.get('strategy_name', 'Strategy')}) 🚀*\n\n"
+        f"*Start Time:* `{bot_start_time_str}`\n"
+        f"*Environment:* `{env_name}`\n"
+        f"*Mode:* `{mode_name}`\n"
+        f"*Initial Balance:* `{balance}`\n"
+        f"*Risk Per Trade:* `{configs.get('risk_percent', 0.0) * 100:.2f}%`\n"
+        f"*Leverage:* `{configs.get('leverage', 0)}x`\n"
+        f"*Max Concurrent Positions:* `{configs.get('max_concurrent_positions', 0)}`\n"
+        f"*Monitored Symbols:* `{configs.get('monitored_symbols_count', '?')}`\n"
+        f"\n*Initial Open Positions:*\n{open_positions_text}"
+    )
 def send_telegram_message(bot_token, chat_id, message):
     """Sends a message to a specified Telegram chat using async."""
     if not bot_token or not chat_id:
@@ -130,6 +149,24 @@ def send_telegram_message(bot_token, chat_id, message):
             return False
 
     return asyncio.run(_send())
+
+def start_command_listener(bot_token, chat_id, last_message):
+    async def command3_handler(update, context: ContextTypes.DEFAULT_TYPE):
+        if str(update.effective_chat.id) == str(chat_id):
+            await context.bot.send_message(chat_id=chat_id, text=last_message, parse_mode="Markdown")
+
+    async def run_bot():
+        app = Application.builder().token(bot_token).build()
+        app.add_handler(CommandHandler("command3", command3_handler))
+        await app.run_polling()
+
+    thread = threading.Thread(target=asyncio.run, args=(run_bot(),))
+    thread.daemon = True
+    thread.start()
+
+
+
+
 
 def get_user_configurations():
     """
@@ -964,44 +1001,43 @@ def main():
     if not monitored_symbols: print("Exiting: No symbols to monitor."); sys.exit(1)
     
     # --- Initial Telegram Notification ---
+    # --- Telegram Startup Notification ---
     if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
-        env_name = configs.get('environment', 'N/A').title()
-        mode_name = configs.get('mode', 'N/A').title()
-        balance_for_msg = initial_balance if initial_balance is not None else "N/A (Error fetching)"
-        if configs['mode'] == 'backtest' and configs.get("backtest_start_balance_type") == "custom":
-            balance_for_msg = configs.get("backtest_custom_start_balance", "N/A (Error in custom balance)")
-
-        initial_open_positions_str = "Fetching..."
-        if client_obj: # Ensure client object exists before trying to get positions
+        open_pos_text = "None"
+        if client_obj:
             if configs["mode"] == "live":
                 live_positions = get_open_positions(client_obj)
-                if live_positions:
-                    initial_open_positions_str = "\n".join([f"- {p['symbol']}: Amt={p['positionAmt']}, Entry={p['entryPrice']}" for p in live_positions])
-                else:
-                    initial_open_positions_str = "None"
-            elif configs["mode"] == "backtest":
-                # In backtest, initially no positions are open by the bot itself.
-                # get_simulated_open_positions() would be empty at this stage.
-                initial_open_positions_str = "None (Backtest Mode)"
+                open_pos_text = "\n".join([f"- {p['symbol']}: Amt={p['positionAmt']}, Entry={p['entryPrice']}" for p in live_positions]) or "None"
+            else:
+                open_pos_text = "None (Backtest Mode)"
         else:
-            initial_open_positions_str = "N/A (Client not initialized)"
+            open_pos_text = "N/A (Client not initialized)"
+
+        startup_msg = build_startup_message(configs, initial_balance, open_pos_text, bot_start_time_str)
+        send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], startup_msg)
+        configs["last_startup_message"] = startup_msg
+
+        # Start /command3 listener
+        start_command_listener(configs["telegram_bot_token"], configs["telegram_chat_id"], startup_msg)
+
 
 
         startup_message = (
             f"*🚀 Bot Started Successfully ({configs.get('strategy_name', 'Strategy')}) 🚀*\n\n"
             f"*Start Time:* `{bot_start_time_str}`\n"
-            f"*Environment:* `{env_name}`\n"
-            f"*Mode:* `{mode_name}`\n"
-            f"*Initial Balance ({'USDT' if initial_balance is not None else ''}):* `{balance_for_msg}`\n"
+            f"*Environment:* `{configs.get('environment', 'Unknown').title()}`\n"
+            f"*Mode:* `{configs.get('mode', 'Unknown').title()}`\n"
+            f"*Initial Balance ({'USDT' if initial_balance is not None else ''}):* `{initial_balance}`\n"
             f"*Risk Per Trade:* `{configs.get('risk_percent', 0.0) * 100:.2f}%`\n"
             f"*Leverage:* `{configs.get('leverage', 0)}x`\n"
             f"*Max Concurrent Positions:* `{configs.get('max_concurrent_positions', 0)}`\n"
             f"*Monitored Symbols:* `{len(monitored_symbols)}`\n"
-            f"\n*Initial Open Positions (from exchange, if any for Live):*\n{initial_open_positions_str}"
+            f"- {pos['symbol']}: {pos['amount']} @ {pos['price']}" for pos in initial_open_positions
         )
         send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], startup_message)
     else:
         print("Telegram notifications disabled (token or chat_id not configured in keys.py or load failed).")
+    configs["monitored_symbols_count"] = len(monitored_symbols)
 
     confirm = input(f"Found {len(monitored_symbols)} USDT perpetuals. Monitor all for {'live trading' if configs['mode'] == 'live' else 'backtesting'}? (yes/no) [yes]: ").lower().strip()
     if confirm == 'no': print("Exiting by user choice."); sys.exit(0)
@@ -1013,6 +1049,34 @@ def main():
         except Exception as e: print(f"\nCRITICAL UNEXPECTED ERROR IN LIVE TRADING: {e}"); traceback.print_exc()
         finally:
             print("\n--- Live Trading Bot Shutting Down ---")
+
+            # Cancel orders if any
+            if client_obj and active_trades:
+                print(f"Cancelling {len(active_trades)} bot-managed active SL/TP orders...")
+                with active_trades_lock:
+                    for symbol, trade_details in list(active_trades.items()):
+                        for oid_key in ['sl_order_id', 'tp_order_id']:
+                            oid = trade_details.get(oid_key)
+                            if oid:
+                                try:
+                                    print(f"Cancelling {oid_key} {oid} for {symbol}...")
+                                    client_obj.futures_cancel_order(symbol=symbol, orderId=oid)
+                                except Exception as e_c:
+                                    print(f"Failed to cancel {oid_key} {oid} for {symbol}: {e_c}")
+
+            print("Live Bot shutdown sequence complete.")
+
+            # ✅ Send Telegram Shutdown Message
+            if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+                shutdown_time_str = pd.Timestamp.now(tz='UTC').strftime('%Y-%m-%d %H:%M:%S UTC')
+                shutdown_msg = (
+                    f"*⚠️ Bot Stopped*\n\n"
+                    f"*Stop Time:* `{shutdown_time_str}`\n"
+                    f"*Strategy:* `{configs.get('strategy_name', 'Unknown')}`\n"
+                    f"*Environment:* `{configs.get('environment', 'Unknown')}`"
+                )
+                send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], shutdown_msg)
+
             if client_obj and active_trades: # Use client_obj
                 print(f"Cancelling {len(active_trades)} bot-managed active SL/TP orders...")
                 with active_trades_lock:
