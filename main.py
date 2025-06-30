@@ -22,7 +22,8 @@ import traceback # For more detailed error logging in threads
 import telegram # For sending Telegram messages
 import asyncio
 from telegram.ext import Application, CommandHandler, ContextTypes
- 
+from telegram import Update
+from telegram.ext import CallbackContext
 
 # --- Configuration Defaults ---
 DEFAULT_RISK_PERCENT = 1.0       # Default account risk percentage per trade (e.g., 1.0 for 1%)
@@ -109,6 +110,20 @@ def load_api_keys(env):
         sys.exit(1)
 
 
+async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Hello! I’m your bot.\n"
+        "Use /help to see what I can do."
+    )
+
+async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Here are the commands you can use:\n"
+        "/start — Show welcome message\n"
+        "/help  — Show this help text\n"
+        "/command3 — Run the special Command3 routine"
+    )
+
 
 def build_startup_message(configs, balance, open_positions_text, bot_start_time_str):
     env_name = configs.get('environment', 'N/A').title()
@@ -155,12 +170,42 @@ def start_command_listener(bot_token, chat_id, last_message):
         if str(update.effective_chat.id) == str(chat_id):
             await context.bot.send_message(chat_id=chat_id, text=last_message, parse_mode="Markdown")
 
-    async def run_bot():
-        app = Application.builder().token(bot_token).build()
-        app.add_handler(CommandHandler("command3", command3_handler))
-        await app.run_polling()
+def start_command_listener(bot_token, chat_id, last_message_content): # Renamed for clarity
+    async def actual_bot_runner():
+        # Create and configure the application within the async function
+        # that will be the entry point for asyncio.run()
+        application = Application.builder().token(bot_token).build()
 
-    thread = threading.Thread(target=asyncio.run, args=(run_bot(),))
+        async def command3_handler(update, context: ContextTypes.DEFAULT_TYPE):
+            if str(update.effective_chat.id) == str(chat_id):
+                await context.bot.send_message(chat_id=chat_id, text=last_message_content, parse_mode="Markdown")
+        
+        application.add_handler(CommandHandler("command3", command3_handler))
+        application.add_handler(CommandHandler("start", start_handler))
+        application.add_handler(CommandHandler("help", help_handler))
+
+        # run_polling() will block until the application is stopped.
+        await application.run_polling()
+        application.run_polling()
+
+    def thread_starter():
+        try:
+            asyncio.run(actual_bot_runner())
+        except RuntimeError as e:
+            # This specific error can sometimes occur on Windows with ProactorEventLoop
+            # during shutdown if the loop PTB tries to close is already being managed/closed.
+            if "Cannot close a running event loop" in str(e) or "Event loop is closed" in str(e):
+                print(f"Known asyncio loop issue during Telegram thread shutdown: {e}")
+            else:
+                # Re-raise other RuntimeErrors
+                print(f"Unhandled RuntimeError in Telegram thread: {e}")
+                traceback.print_exc()
+                raise
+        except Exception as e:
+            print(f"Exception in Telegram thread_starter: {e}")
+            traceback.print_exc()
+
+    thread = threading.Thread(target=thread_starter)
     thread.daemon = True
     thread.start()
 
@@ -1020,21 +1065,6 @@ def main():
         # Start /command3 listener
         start_command_listener(configs["telegram_bot_token"], configs["telegram_chat_id"], startup_msg)
 
-
-
-        startup_message = (
-            f"*🚀 Bot Started Successfully ({configs.get('strategy_name', 'Strategy')}) 🚀*\n\n"
-            f"*Start Time:* `{bot_start_time_str}`\n"
-            f"*Environment:* `{configs.get('environment', 'Unknown').title()}`\n"
-            f"*Mode:* `{configs.get('mode', 'Unknown').title()}`\n"
-            f"*Initial Balance ({'USDT' if initial_balance is not None else ''}):* `{initial_balance}`\n"
-            f"*Risk Per Trade:* `{configs.get('risk_percent', 0.0) * 100:.2f}%`\n"
-            f"*Leverage:* `{configs.get('leverage', 0)}x`\n"
-            f"*Max Concurrent Positions:* `{configs.get('max_concurrent_positions', 0)}`\n"
-            f"*Monitored Symbols:* `{len(monitored_symbols)}`\n"
-            f"- {pos['symbol']}: {pos['amount']} @ {pos['price']}" for pos in initial_open_positions
-        )
-        send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], startup_message)
     else:
         print("Telegram notifications disabled (token or chat_id not configured in keys.py or load failed).")
     configs["monitored_symbols_count"] = len(monitored_symbols)
