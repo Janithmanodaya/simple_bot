@@ -230,7 +230,37 @@ def start_command_listener(bot_token, chat_id, last_message_content): # Renamed 
     thread.start()
 
 
+# --- Telegram Notification for Trade Rejection ---
+def send_trade_rejection_notification(symbol, signal_type, reason, entry_price, sl_price, tp_price, quantity, symbol_info, configs):
+    """
+    Sends a Telegram notification about a rejected trade signal.
+    """
+    if not configs.get("telegram_bot_token") or not configs.get("telegram_chat_id"):
+        print(f"Telegram not configured. Cannot send rejection notification for {symbol}.")
+        return
 
+    p_prec = symbol_info.get('pricePrecision', 2) if symbol_info else 2
+    q_prec = symbol_info.get('quantityPrecision', 0) if symbol_info else 0
+
+    entry_price_str = f"{entry_price:.{p_prec}f}" if entry_price is not None else "N/A"
+    sl_price_str = f"{sl_price:.{p_prec}f}" if sl_price is not None else "N/A"
+    tp_price_str = f"{tp_price:.{p_prec}f}" if tp_price is not None else "N/A"
+    quantity_str = f"{quantity:.{q_prec}f}" if quantity is not None else "N/A"
+
+    message = (
+        f"⚠️ TRADE REJECTED ⚠️\n\n"
+        f"Symbol: `{symbol}`\n"
+        f"Signal: `{signal_type}`\n"
+        f"Reason: _{reason}_\n\n"
+        f"*Attempted Parameters:*\n"
+        f"Entry: `{entry_price_str}`\n"
+        f"SL: `{sl_price_str}`\n"
+        f"TP: `{tp_price_str}`\n"
+        f"Qty: `{quantity_str}`"
+    )
+
+    print(f"Sending trade rejection notification for {symbol}: {reason}")
+    send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], message)
 
 
 def get_user_configurations():
@@ -364,6 +394,18 @@ def get_user_configurations():
     configs["strategy_name"] = "Advance EMA Cross"
     print("--- Configuration Complete ---")
     return configs
+
+# --- Helper function to build symbol_info_map from active_trades ---
+def _build_symbol_info_map_from_active_trades(active_trades_dict):
+    """
+    Constructs a map of {symbol: symbol_info} from the active_trades dictionary.
+    """
+    s_info_map = {}
+    if active_trades_dict:
+        for symbol, trade_details in active_trades_dict.items():
+            if 'symbol_info' in trade_details:
+                s_info_map[symbol] = trade_details['symbol_info']
+    return s_info_map
 
 # --- Binance API Interaction Functions (Error handling included) ---
 
@@ -504,20 +546,41 @@ def get_account_balance(client, configs, asset="USDT"): # Added configs paramete
         print(f"Unexpected error getting balance: {e}")
         return 0.0 # For non-API unexpected errors
 
-def get_open_positions(client, format_for_telegram=False): # Added format_for_telegram flag
+def get_open_positions(client, format_for_telegram=False, active_trades_data=None, symbol_info_map=None): # Added active_trades_data and symbol_info_map
     try:
-        positions = [p for p in client.futures_position_information() if float(p.get('positionAmt', 0)) != 0]
+        api_positions = client.futures_position_information()
+        positions = [p for p in api_positions if float(p.get('positionAmt', 0)) != 0]
 
         if format_for_telegram:
             if not positions: return "None"
             pos_texts = []
+            if active_trades_data is None: active_trades_data = {}
+            if symbol_info_map is None: symbol_info_map = {}
+
             for p in positions:
-                # Ensuring all parts are strings before formatting
                 symbol_str = str(p.get('symbol', 'N/A'))
                 qty_str = str(p.get('positionAmt', 'N/A'))
                 entry_price_str = str(p.get('entryPrice', 'N/A'))
                 pnl_str = str(p.get('unRealizedProfit', 'N/A'))
-                pos_texts.append(f"- {symbol_str}: Qty={qty_str}, Entry={entry_price_str}, PnL={pnl_str}")
+                
+                sl_str, tp_str = "N/A (Bot)", "N/A (Bot)"
+                price_precision = 2 # Default price precision
+
+                s_info = symbol_info_map.get(symbol_str)
+                if s_info:
+                    price_precision = int(s_info.get('pricePrecision', 2))
+
+                if symbol_str in active_trades_data:
+                    trade_detail = active_trades_data[symbol_str]
+                    sl_price = trade_detail.get('current_sl_price')
+                    tp_price = trade_detail.get('current_tp_price')
+                    
+                    if sl_price is not None:
+                        sl_str = f"{sl_price:.{price_precision}f}"
+                    if tp_price is not None:
+                        tp_str = f"{tp_price:.{price_precision}f}"
+                
+                pos_texts.append(f"- {symbol_str}: Qty={qty_str}, Entry={entry_price_str}, SL={sl_str}, TP={tp_str}, PnL={pnl_str}")
             return "\n".join(pos_texts)
 
         # Original behavior
@@ -526,10 +589,33 @@ def get_open_positions(client, format_for_telegram=False): # Added format_for_te
             return []
         print("Current Open Positions:")
         for p in positions:
-            print(f"  {p['symbol']}: Amt={p['positionAmt']}, Entry={p['entryPrice']}, PnL={p['unRealizedProfit']}")
+            # Try to supplement with SL/TP from active_trades if available for console output too
+            sl_console, tp_console = "", ""
+            if active_trades_data and p['symbol'] in active_trades_data:
+                trade_data = active_trades_data[p['symbol']]
+                # Refined logic for s_info_console
+                s_info_console = None
+                if symbol_info_map and p['symbol'] in symbol_info_map:
+                    s_info_console = symbol_info_map[p['symbol']]
+                else:
+                    # Fallback to fetching if not in provided map (e.g. for positions not in active_trades but we want console info)
+                    # This path might be less common if active_trades_data covers all relevant managed trades
+                    s_info_console = get_symbol_info(client, p['symbol'])
+                
+                price_prec_console = 2
+                if s_info_console:
+                    price_prec_console = int(s_info_console.get('pricePrecision', 2))
+
+                sl_val = trade_data.get('current_sl_price')
+                tp_val = trade_data.get('current_tp_price')
+                if sl_val is not None: sl_console = f", SL: {sl_val:.{price_prec_console}f}"
+                if tp_val is not None: tp_console = f", TP: {tp_val:.{price_prec_console}f}"
+            
+            print(f"  {p['symbol']}: Amt={p['positionAmt']}, Entry={p['entryPrice']}{sl_console}{tp_console}, PnL={p['unRealizedProfit']}")
         return positions
     except Exception as e:
         print(f"Error getting positions: {e}")
+        traceback.print_exc() # Print stack trace for better debugging
         if format_for_telegram:
             return "Error fetching positions"
         return []
@@ -887,88 +973,143 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock):
 
     print(f"\n{log_prefix} --- New Validated Trade Signal for {symbol}: {signal} ---")
     symbol_info = get_symbol_info(client, symbol)
-    if not symbol_info: print(f"{log_prefix} No symbol info for {symbol}. Abort."); return
+    entry_p = klines_df['close'].iloc[-1] # Define entry_p early for notifications
+    # Initialize other params that might not be set if rejection happens early
+    sl_p, tp_p, qty_calc = None, None, None 
+    
+    if not symbol_info:
+        reason = "Failed to retrieve symbol information."
+        print(f"{log_prefix} {reason} for {symbol}. Abort.")
+        send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p, tp_p, qty_calc, symbol_info, configs)
+        return
 
-    entry_p = klines_df['close'].iloc[-1]
     print(f"{log_prefix} Entry price (last close): {entry_p} for {symbol}")
-    ema100_val = klines_df['EMA100'].iloc[-1]
     ema100_val = klines_df['EMA100'].iloc[-1]
     
     if not (set_leverage_on_symbol(client, symbol, configs['leverage']) and \
             set_margin_type_on_symbol(client, symbol, configs['margin_type'])):
-        print(f"{log_prefix} Failed to set leverage/margin for {symbol}. Abort."); return
+        reason = "Failed to set leverage or margin type."
+        print(f"{log_prefix} {reason} for {symbol}. Abort.")
+        send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p, tp_p, qty_calc, symbol_info, configs)
+        return
 
     print(f"{log_prefix} Leverage and margin type set for {symbol}.")
     sl_p, tp_p = calculate_sl_tp_values(entry_p, signal, ema100_val, klines_df)
-    if sl_p is None or tp_p is None: print(f"{log_prefix} SL/TP calc failed for {symbol}. Abort."); return
+    if sl_p is None or tp_p is None:
+        reason = "Stop Loss / Take Profit calculation failed."
+        print(f"{log_prefix} {reason} for {symbol}. Abort.")
+        send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p, tp_p, qty_calc, symbol_info, configs)
+        return
     print(f"{log_prefix} Calculated SL: {sl_p}, TP: {tp_p} for {symbol}.")
     
     acc_bal = get_account_balance(client, configs) # Pass configs
-    if acc_bal is None: print(f"{log_prefix} Critical error fetching balance. Abort."); return # None indicates critical error
-    if acc_bal <= 0: print(f"{log_prefix} Zero balance ({acc_bal}). Abort."); return # Check for zero after None
+    if acc_bal is None:
+        reason = "Critical error fetching account balance."
+        print(f"{log_prefix} {reason} Abort.")
+        send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p, tp_p, qty_calc, symbol_info, configs)
+        return
+    if acc_bal <= 0:
+        reason = f"Zero or negative account balance ({acc_bal})."
+        print(f"{log_prefix} {reason} Abort.")
+        send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p, tp_p, qty_calc, symbol_info, configs)
+        return
     print(f"{log_prefix} Account balance: {acc_bal} for position sizing.")
 
-    qty = calculate_position_size(acc_bal, configs['risk_percent'], entry_p, sl_p, symbol_info, configs) # Pass configs
-    if qty is None or qty <= 0: print(f"{log_prefix} Invalid position size ({qty}) for {symbol}. Abort."); return
-    print(f"{log_prefix} Calculated position size: {qty} for {symbol}.")
+    qty_calc = calculate_position_size(acc_bal, configs['risk_percent'], entry_p, sl_p, symbol_info, configs) # Pass configs
+    if qty_calc is None or qty_calc <= 0:
+        # More specific reason might be logged by calculate_position_size itself.
+        # We can use a generic one here or try to capture it. For now, generic.
+        reason = f"Invalid position size calculated (Qty: {qty_calc}). Check logs for details from calculate_position_size."
+        print(f"{log_prefix} {reason} for {symbol}. Abort.")
+        send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p, tp_p, qty_calc, symbol_info, configs)
+        return
+    print(f"{log_prefix} Calculated position size: {qty_calc} for {symbol}.")
     
-    final_qty_check = round(qty, int(symbol_info['quantityPrecision']))
-    if final_qty_check == 0.0: print(f"{log_prefix} Qty for {symbol} rounds to 0 ({final_qty_check}). Abort."); return
+    final_qty_check = round(qty_calc, int(symbol_info['quantityPrecision']))
+    if final_qty_check == 0.0:
+        reason = f"Calculated quantity {qty_calc} rounds to zero."
+        print(f"{log_prefix} {reason} for {symbol}. Abort.")
+        send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p, tp_p, qty_calc, symbol_info, configs)
+        return
     print(f"{log_prefix} Final quantity check (rounded): {final_qty_check} for {symbol}.")
 
-    print(f"{log_prefix} Attempting {signal} {qty} {symbol} @MKT (EP:{entry_p:.4f}), SL:{sl_p:.4f}, TP:{tp_p:.4f}")
-    entry_order = place_new_order(client, symbol_info, "BUY" if signal=="LONG" else "SELL", "MARKET", qty)
+    # Use final_qty_check for placing order, as it's the rounded one.
+    # The notification will show qty_calc (unrounded) if rejection happened due to rounding to zero.
+    # If proceeding, qty_to_order should be final_qty_check.
+    qty_to_order = final_qty_check 
 
-    if entry_order and entry_order.get('status') == 'FILLED':
-        print(f"{log_prefix} Market entry order FILLED for {symbol}. Order details: {entry_order}")
-        actual_ep = float(entry_order.get('avgPrice', entry_p))
-        if entry_p > 0 : # Recalculate SL/TP based on actual fill if original signal price was valid
-            sl_dist_pct = abs(entry_p - sl_p) / entry_p
-            tp_dist_pct = abs(entry_p - tp_p) / entry_p
-            sl_p = actual_ep * (1 - sl_dist_pct if signal == "LONG" else 1 + sl_dist_pct)
-            tp_p = actual_ep * (1 + tp_dist_pct if signal == "LONG" else 1 - tp_dist_pct)
-            print(f"SL/TP adjusted for actual fill {actual_ep:.4f}: SL {sl_p:.4f}, TP {tp_p:.4f}")
+    print(f"{log_prefix} Attempting {signal} {qty_to_order} {symbol} @MKT (EP:{entry_p:.4f}), SL:{sl_p:.4f}, TP:{tp_p:.4f}")
+    entry_order = place_new_order(client, symbol_info, "BUY" if signal=="LONG" else "SELL", "MARKET", qty_to_order)
 
-        sl_ord = place_new_order(client, symbol_info, "SELL" if signal=="LONG" else "BUY", "STOP_MARKET", qty, stop_price=sl_p, reduce_only=True)
-        if not sl_ord: print(f"{log_prefix} CRITICAL: FAILED TO PLACE SL FOR {symbol}! Order details: {sl_ord}"); # Consider emergency close
-        else: print(f"{log_prefix} SL order placed for {symbol}. Order details: {sl_ord}")
-        tp_ord = place_new_order(client, symbol_info, "SELL" if signal=="LONG" else "BUY", "TAKE_PROFIT_MARKET", qty, stop_price=tp_p, reduce_only=True)
-        if not tp_ord: print(f"{log_prefix} Warning: Failed to place TP for {symbol}. Order details: {tp_ord}")
-        else: print(f"{log_prefix} TP order placed for {symbol}. Order details: {tp_ord}")
+    if not entry_order or entry_order.get('status') != 'FILLED':
+        reason = f"Market entry order failed or not filled. Status: {entry_order.get('status') if entry_order else 'N/A'}."
+        print(f"{log_prefix} {reason} for {symbol}: {entry_order}")
+        send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p, tp_p, qty_to_order, symbol_info, configs)
+        return
+    
+    # If successful past this point:
+    print(f"{log_prefix} Market entry order FILLED for {symbol}. Order details: {entry_order}")
+    actual_ep = float(entry_order.get('avgPrice', entry_p))
+    
+    # Correctly indented block for post-fill logic
+    if entry_p > 0 : # Recalculate SL/TP based on actual fill if original signal price was valid
+        sl_dist_pct = abs(entry_p - sl_p) / entry_p
+        tp_dist_pct = abs(entry_p - tp_p) / entry_p
+        sl_p = actual_ep * (1 - sl_dist_pct if signal == "LONG" else 1 + sl_dist_pct)
+        tp_p = actual_ep * (1 + tp_dist_pct if signal == "LONG" else 1 - tp_dist_pct)
+        # Ensure symbol_info is available for precision, it should be at this point
+        price_prec_adj = symbol_info.get('pricePrecision', 2) if symbol_info else 2
+        print(f"SL/TP adjusted for actual fill {actual_ep:.{price_prec_adj}f}: SL {sl_p:.{price_prec_adj}f}, TP {tp_p:.{price_prec_adj}f}")
 
-        with lock: # Final update to shared active_trades
-            active_trades[symbol] = {
-                "entry_order_id": entry_order['orderId'], "sl_order_id": sl_ord.get('orderId') if sl_ord else None,
-                "tp_order_id": tp_ord.get('orderId') if tp_ord else None, "entry_price": actual_ep,
-                "current_sl_price": sl_p, "current_tp_price": tp_p, "initial_sl_price": sl_p, "initial_tp_price": tp_p,
-                "quantity": qty, "side": signal, "symbol_info": symbol_info, "open_timestamp": pd.Timestamp.now(tz='UTC')
-            }
-            print(f"{log_prefix} Trade for {symbol} recorded in active_trades at {active_trades[symbol]['open_timestamp']}.")
-        
-        # Send Telegram notification for new trade
-        if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
-            current_balance_for_msg = get_account_balance(client, configs)
-            if current_balance_for_msg is None: current_balance_for_msg = "N/A (Error)"
-            else: current_balance_for_msg = f"{current_balance_for_msg:.2f}"
+    sl_ord = place_new_order(client, symbol_info, "SELL" if signal=="LONG" else "BUY", "STOP_MARKET", qty_to_order, stop_price=sl_p, reduce_only=True)
+    if not sl_ord: print(f"{log_prefix} CRITICAL: FAILED TO PLACE SL FOR {symbol}! Order details: {sl_ord}"); # Consider emergency close
+    else: print(f"{log_prefix} SL order placed for {symbol}. Order details: {sl_ord}")
+    
+    tp_ord = place_new_order(client, symbol_info, "SELL" if signal=="LONG" else "BUY", "TAKE_PROFIT_MARKET", qty_to_order, stop_price=tp_p, reduce_only=True)
+    if not tp_ord: print(f"{log_prefix} Warning: Failed to place TP for {symbol}. Order details: {tp_ord}")
+    else: print(f"{log_prefix} TP order placed for {symbol}. Order details: {tp_ord}")
 
-            open_positions_str = get_open_positions(client, format_for_telegram=True)
+    with lock: # Final update to shared active_trades
+        active_trades[symbol] = {
+            "entry_order_id": entry_order['orderId'], "sl_order_id": sl_ord.get('orderId') if sl_ord else None,
+            "tp_order_id": tp_ord.get('orderId') if tp_ord else None, "entry_price": actual_ep,
+            "current_sl_price": sl_p, "current_tp_price": tp_p, "initial_sl_price": sl_p, "initial_tp_price": tp_p,
+            "quantity": qty_to_order, "side": signal, "symbol_info": symbol_info, "open_timestamp": pd.Timestamp.now(tz='UTC')
+        }
+        print(f"{log_prefix} Trade for {symbol} recorded in active_trades at {active_trades[symbol]['open_timestamp']}.")
+    
+    # Send Telegram notification for new trade
+    if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+        current_balance_for_msg = get_account_balance(client, configs)
+        if current_balance_for_msg is None: current_balance_for_msg = "N/A (Error)"
+        else: current_balance_for_msg = f"{current_balance_for_msg:.2f}"
 
-            new_trade_message = (
-                f"🚀 NEW TRADE PLACED 🚀\n\n"
-                f"Symbol: {symbol}\n"
-                f"Side: {signal}\n"
-                f"Quantity: {qty:.{symbol_info['quantityPrecision']}f}\n"
-                f"Entry Price: {actual_ep:.{symbol_info['pricePrecision']}f}\n"
-                f"SL: {sl_p:.{symbol_info['pricePrecision']}f}\n"
-                f"TP: {tp_p:.{symbol_info['pricePrecision']}f}\n\n"
-                f"💰 Account Balance: {current_balance_for_msg} USDT\n"
-                f"📊 Current Open Positions:\n{open_positions_str}"
-            )
-            send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], new_trade_message)
-            print(f"{log_prefix} New trade Telegram notification sent for {symbol}.")
+        # Build symbol_info_map from the current state of active_trades
+        # Lock active_trades when reading it to build the map
+        with active_trades_lock:
+            s_info_map_for_new_trade_msg = _build_symbol_info_map_from_active_trades(active_trades)
+        open_positions_str = get_open_positions(client, format_for_telegram=True, active_trades_data=active_trades.copy(), symbol_info_map=s_info_map_for_new_trade_msg)
 
-        get_open_positions(client); get_open_orders(client, symbol) # Original console logging calls
-    else: print(f"{log_prefix} Market order for {symbol} failed or not filled: {entry_order}")
+        # Ensure symbol_info is available for precision in the message
+        qty_prec_msg = symbol_info.get('quantityPrecision', 0) if symbol_info else 0
+        price_prec_msg = symbol_info.get('pricePrecision', 2) if symbol_info else 2
+
+        new_trade_message = (
+            f"🚀 NEW TRADE PLACED 🚀\n\n"
+            f"Symbol: {symbol}\n"
+            f"Side: {signal}\n"
+            f"Quantity: {qty_to_order:.{qty_prec_msg}f}\n"
+            f"Entry Price: {actual_ep:.{price_prec_msg}f}\n"
+            f"SL: {sl_p:.{price_prec_msg}f}\n"
+            f"TP: {tp_p:.{price_prec_msg}f}\n\n"
+            f"💰 Account Balance: {current_balance_for_msg} USDT\n"
+            f"📊 Current Open Positions:\n{open_positions_str}"
+        )
+        send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], new_trade_message)
+        print(f"{log_prefix} New trade Telegram notification sent for {symbol}.")
+
+    get_open_positions(client); get_open_orders(client, symbol) # Original console logging calls
+# The `else` part for failed market order was removed as the rejection path now includes a `return`.
 
 def monitor_active_trades(client, configs): # Needs lock for active_trades access
     global active_trades, active_trades_lock
@@ -1071,7 +1212,9 @@ def monitor_active_trades(client, configs): # Needs lock for active_trades acces
                         # For simplicity, get_open_positions will reflect state *before* this specific sym_to_remove is visibly gone from API if check is fast.
                         # A more accurate "remaining" might require fetching positions, then filtering out sym_to_remove.
                         # Let's use current open positions, user will understand one less is about to be listed by bot internally.
-                        open_positions_str = get_open_positions(client, format_for_telegram=True)
+                        # Build symbol_info_map from the current state of active_trades (before this one is removed)
+                        s_info_map_for_closed_trade_msg = _build_symbol_info_map_from_active_trades(active_trades)
+                        open_positions_str = get_open_positions(client, format_for_telegram=True, active_trades_data=active_trades.copy(), symbol_info_map=s_info_map_for_closed_trade_msg)
                         
                         # Determine precision from symbol_info stored in closed_trade_details
                         price_precision = closed_trade_details['symbol_info']['pricePrecision']
@@ -1168,7 +1311,12 @@ def trading_loop(client, configs, monitored_symbols):
                     if client: # Check if client is valid
                         if configs["mode"] == "live": # Ensure it's live mode for position check
                             # Use the new formatting option
-                            open_pos_text_update = get_open_positions(client, format_for_telegram=True)
+                            with active_trades_lock: # Lock when reading active_trades
+                                s_info_map_for_status_update = _build_symbol_info_map_from_active_trades(active_trades)
+                                # Pass a copy of active_trades to avoid issues if it's modified elsewhere
+                                # while get_open_positions is running, though the lock helps.
+                                current_active_trades_copy = active_trades.copy()
+                            open_pos_text_update = get_open_positions(client, format_for_telegram=True, active_trades_data=current_active_trades_copy, symbol_info_map=s_info_map_for_status_update)
                         else:
                             open_pos_text_update = "None (Backtest Mode)" # Should not happen if in live trading_loop
                     else:
@@ -1266,9 +1414,14 @@ def main():
     # --- Telegram Startup Notification ---
     if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
         open_pos_text = "None"
+        # active_trades is initially empty, so s_info_map will be empty.
+        # This is fine as there are no bot-managed SL/TP to show at this very start.
+        # If there were pre-existing positions from API, they'd show "N/A (Bot)" for SL/TP.
+        s_info_map_initial = _build_symbol_info_map_from_active_trades(active_trades) # active_trades is global
+        
         if client_obj:
             if configs["mode"] == "live":
-                open_pos_text = get_open_positions(client_obj, format_for_telegram=True)
+                open_pos_text = get_open_positions(client_obj, format_for_telegram=True, active_trades_data=active_trades.copy(), symbol_info_map=s_info_map_initial)
             else:
                 open_pos_text = "None (Backtest Mode)"
         else:
