@@ -24,6 +24,7 @@ import asyncio
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram import Update
 from telegram.ext import CallbackContext
+import requests # For fetching public IP address
 
 # --- Configuration Defaults ---
 DEFAULT_RISK_PERCENT = 1.0       # Default account risk percentage per trade (e.g., 1.0 for 1%)
@@ -40,6 +41,25 @@ active_trades = {}
 active_trades_lock = threading.Lock() # Lock for synchronizing access to active_trades
 
 # --- Utility and Configuration Functions ---
+
+def get_public_ip():
+    """Fetches the current public IP address of the machine."""
+    try:
+        response = requests.get("https://api.ipify.org?format=json", timeout=10)
+        response.raise_for_status()  # Raises an HTTPError for bad responses (4XX or 5XX)
+        ip_address = response.json().get("ip")
+        if ip_address:
+            print(f"Successfully fetched public IP: {ip_address}")
+            return ip_address
+        else:
+            print("Error: Could not parse IP from ipify response.")
+            return None
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching public IP: {e}")
+        return None
+    except Exception as e:
+        print(f"An unexpected error occurred while fetching public IP: {e}")
+        return None
 
 def load_api_keys(env):
     """
@@ -442,14 +462,77 @@ def get_account_balance(client, asset="USDT"):
         print(f"Unexpected error getting balance: {e}")
         return 0.0 # For non-API unexpected errors
 
-def get_open_positions(client):
+# Modified to accept configs for Telegram alerting on specific errors
+def get_account_balance(client, configs, asset="USDT"): # Added configs parameter
     try:
-        positions = [p for p in client.futures_position_information() if float(p.get('positionAmt',0)) != 0]
-        if not positions: print("No open positions."); return []
+        balances = client.futures_account_balance()
+        for b in balances:
+            if b['asset'] == asset:
+                print(f"Account Balance ({asset}): {b['balance']}")
+                return float(b['balance'])
+        print(f"{asset} not found in futures balance.")
+        return 0.0  # Return 0.0 if asset not found but call was successful
+    except BinanceAPIException as e:
+        if e.code == -2015:
+            print(f"Critical Error getting balance: {e}. This is likely an API key permission or IP whitelist issue.")
+            print("Please check your API key settings on Binance: ensure 'Enable Futures' is checked and your IP is whitelisted if restrictive IP access is enabled.")
+            
+            # Attempt to send Telegram alert
+            public_ip = get_public_ip()
+            ip_message = f"Bot's current public IP: {public_ip}" if public_ip else "Could not determine bot's public IP."
+            
+            error_message = (
+                f"⚠️ CRITICAL BINANCE API ERROR ⚠️\n\n"
+                f"Error Code: -2015 (Likely IP Whitelist Issue)\n"
+                f"Message: {e.message}\n\n"
+                f"{ip_message}\n\n"
+                f"Please check your Binance API key permissions and IP whitelist settings immediately."
+            )
+            
+            telegram_token = configs.get("telegram_bot_token")
+            telegram_chat_id = configs.get("telegram_chat_id")
+
+            if telegram_token and telegram_chat_id:
+                send_telegram_message(telegram_token, telegram_chat_id, error_message)
+            else:
+                print("Telegram credentials not found in configs. Cannot send IP error alert via Telegram.")
+            return None # Specific indicator for critical auth/IP error
+        else:
+            print(f"API Error getting balance: {e}")
+            return 0.0 # For other API errors, return 0.0 to indicate balance couldn't be fetched but not necessarily critical auth
+    except Exception as e:
+        print(f"Unexpected error getting balance: {e}")
+        return 0.0 # For non-API unexpected errors
+
+def get_open_positions(client, format_for_telegram=False): # Added format_for_telegram flag
+    try:
+        positions = [p for p in client.futures_position_information() if float(p.get('positionAmt', 0)) != 0]
+
+        if format_for_telegram:
+            if not positions: return "None"
+            pos_texts = []
+            for p in positions:
+                # Ensuring all parts are strings before formatting
+                symbol_str = str(p.get('symbol', 'N/A'))
+                qty_str = str(p.get('positionAmt', 'N/A'))
+                entry_price_str = str(p.get('entryPrice', 'N/A'))
+                pnl_str = str(p.get('unRealizedProfit', 'N/A'))
+                pos_texts.append(f"- {symbol_str}: Qty={qty_str}, Entry={entry_price_str}, PnL={pnl_str}")
+            return "\n".join(pos_texts)
+
+        # Original behavior
+        if not positions:
+            print("No open positions.")
+            return []
         print("Current Open Positions:")
-        for p in positions: print(f"  {p['symbol']}: Amt={p['positionAmt']}, Entry={p['entryPrice']}, PnL={p['unRealizedProfit']}")
+        for p in positions:
+            print(f"  {p['symbol']}: Amt={p['positionAmt']}, Entry={p['entryPrice']}, PnL={p['unRealizedProfit']}")
         return positions
-    except Exception as e: print(f"Error getting positions: {e}"); return []
+    except Exception as e:
+        print(f"Error getting positions: {e}")
+        if format_for_telegram:
+            return "Error fetching positions"
+        return []
 
 def get_open_orders(client, symbol=None):
     try:
@@ -615,6 +698,28 @@ def get_symbol_info(client, symbol):
             if s['symbol'] == symbol: return s
         print(f"No info for {symbol}."); return None
     except Exception as e: print(f"Error getting info for {symbol}: {e}"); return None
+
+# This is the old definition, which has been replaced by the modified one below.
+# def get_account_balance(client, asset="USDT"):
+#     try:
+#         balances = client.futures_account_balance()
+#         for b in balances:
+#             if b['asset'] == asset:
+#                 print(f"Account Balance ({asset}): {b['balance']}")
+#                 return float(b['balance'])
+#         print(f"{asset} not found in futures balance.")
+#         return 0.0  # Return 0.0 if asset not found but call was successful
+#     except BinanceAPIException as e:
+#         if e.code == -2015:
+#             print(f"Critical Error getting balance: {e}. This is likely an API key permission or IP whitelist issue.")
+#             print("Please check your API key settings on Binance: ensure 'Enable Futures' is checked and your IP is whitelisted if restrictive IP access is enabled.")
+#             return None # Specific indicator for critical auth/IP error
+#         else:
+#             print(f"API Error getting balance: {e}")
+#             return 0.0 # For other API errors, return 0.0 to indicate balance couldn't be fetched but not necessarily critical auth
+#     except Exception as e:
+#         print(f"Unexpected error getting balance: {e}")
+#         return 0.0 # For non-API unexpected errors
 
 def calculate_position_size(balance, risk_pct, entry, sl, symbol_info, configs=None): # Added configs
     if not symbol_info or balance <= 0 or entry <= 0 or sl <= 0 or abs(entry-sl)<1e-9 : return None
@@ -798,8 +903,9 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock):
     if sl_p is None or tp_p is None: print(f"{log_prefix} SL/TP calc failed for {symbol}. Abort."); return
     print(f"{log_prefix} Calculated SL: {sl_p}, TP: {tp_p} for {symbol}.")
     
-    acc_bal = get_account_balance(client) # This function already prints balance
-    if acc_bal <= 0: print(f"{log_prefix} Zero/unavailable balance ({acc_bal}). Abort."); return
+    acc_bal = get_account_balance(client, configs) # Pass configs
+    if acc_bal is None: print(f"{log_prefix} Critical error fetching balance. Abort."); return # None indicates critical error
+    if acc_bal <= 0: print(f"{log_prefix} Zero balance ({acc_bal}). Abort."); return # Check for zero after None
     print(f"{log_prefix} Account balance: {acc_bal} for position sizing.")
 
     qty = calculate_position_size(acc_bal, configs['risk_percent'], entry_p, sl_p, symbol_info, configs) # Pass configs
@@ -838,7 +944,30 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock):
                 "quantity": qty, "side": signal, "symbol_info": symbol_info, "open_timestamp": pd.Timestamp.now(tz='UTC')
             }
             print(f"{log_prefix} Trade for {symbol} recorded in active_trades at {active_trades[symbol]['open_timestamp']}.")
-        get_open_positions(client); get_open_orders(client, symbol)
+        
+        # Send Telegram notification for new trade
+        if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+            current_balance_for_msg = get_account_balance(client, configs)
+            if current_balance_for_msg is None: current_balance_for_msg = "N/A (Error)"
+            else: current_balance_for_msg = f"{current_balance_for_msg:.2f}"
+
+            open_positions_str = get_open_positions(client, format_for_telegram=True)
+
+            new_trade_message = (
+                f"🚀 NEW TRADE PLACED 🚀\n\n"
+                f"Symbol: {symbol}\n"
+                f"Side: {signal}\n"
+                f"Quantity: {qty:.{symbol_info['quantityPrecision']}f}\n"
+                f"Entry Price: {actual_ep:.{symbol_info['pricePrecision']}f}\n"
+                f"SL: {sl_p:.{symbol_info['pricePrecision']}f}\n"
+                f"TP: {tp_p:.{symbol_info['pricePrecision']}f}\n\n"
+                f"💰 Account Balance: {current_balance_for_msg} USDT\n"
+                f"📊 Current Open Positions:\n{open_positions_str}"
+            )
+            send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], new_trade_message)
+            print(f"{log_prefix} New trade Telegram notification sent for {symbol}.")
+
+        get_open_positions(client); get_open_orders(client, symbol) # Original console logging calls
     else: print(f"{log_prefix} Market order for {symbol} failed or not filled: {entry_order}")
 
 def monitor_active_trades(client, configs): # Needs lock for active_trades access
@@ -927,8 +1056,42 @@ def monitor_active_trades(client, configs): # Needs lock for active_trades acces
 
     if symbols_to_remove:
         with active_trades_lock: # Lock for deleting from shared dict
-            for sym in symbols_to_remove:
-                if sym in active_trades: del active_trades[sym]; print(f"Removed {sym} from bot's active trades.")
+            for sym_to_remove in symbols_to_remove: # Iterate over the list of symbols marked for removal
+                if sym_to_remove in active_trades: # Check if it's still in active_trades (it should be)
+                    closed_trade_details = active_trades[sym_to_remove] # Get details before deleting
+
+                    # Send Telegram notification for closed trade
+                    if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+                        current_balance_for_msg = get_account_balance(client, configs)
+                        if current_balance_for_msg is None: current_balance_for_msg = "N/A (Error)"
+                        else: current_balance_for_msg = f"{current_balance_for_msg:.2f}"
+                        
+                        # Fetch open positions *after* this one is conceptually closed
+                        # For an accurate list of *remaining* positions, it's tricky here as the removal happens after this loop.
+                        # For simplicity, get_open_positions will reflect state *before* this specific sym_to_remove is visibly gone from API if check is fast.
+                        # A more accurate "remaining" might require fetching positions, then filtering out sym_to_remove.
+                        # Let's use current open positions, user will understand one less is about to be listed by bot internally.
+                        open_positions_str = get_open_positions(client, format_for_telegram=True)
+                        
+                        # Determine precision from symbol_info stored in closed_trade_details
+                        price_precision = closed_trade_details['symbol_info']['pricePrecision']
+                        qty_precision = closed_trade_details['symbol_info']['quantityPrecision']
+
+                        closed_trade_message = (
+                            f"✅ TRADE CLOSED ✅\n\n"
+                            f"Symbol: {closed_trade_details['symbol_info']['symbol']}\n"
+                            f"Side: {closed_trade_details['side']}\n"
+                            f"Quantity: {closed_trade_details['quantity']:.{qty_precision}f}\n"
+                            f"Entry Price: {closed_trade_details['entry_price']:.{price_precision}f}\n"
+                            f"(Reason: SL/TP hit or external closure detected)\n\n"
+                            f"💰 Account Balance: {current_balance_for_msg} USDT\n"
+                            f"📊 Current Open Positions:\n{open_positions_str}"
+                        )
+                        send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], closed_trade_message)
+                        print(f"Trade closure Telegram notification sent for {sym_to_remove}.")
+                    
+                    del active_trades[sym_to_remove]
+                    print(f"Removed {sym_to_remove} from bot's active trades.")
 
 def trading_loop(client, configs, monitored_symbols):
     print("\n--- Starting Trading Loop ---")
@@ -950,16 +1113,24 @@ def trading_loop(client, configs, monitored_symbols):
                 print(f"Fetching account status... {format_elapsed_time(cycle_start_time)}")
                 # Ensure client_obj is used here if that's the correct variable name passed to trading_loop
                 # Assuming 'client' is the parameter name for trading_loop, which holds client_obj from main()
-                current_cycle_balance = get_account_balance(client) 
+                current_cycle_balance = get_account_balance(client, configs) # Pass configs
 
                 if configs['mode'] == 'live' and current_cycle_balance is None:
-                    print("CRITICAL: Account balance could not be fetched due to API key/permission error during trading loop.")
-                    print("This indicates a potential issue like changed IP whitelist or revoked API key permissions.")
-                    print("Stopping live trading to prevent further issues.")
-                    break # Exit the while True loop of trading_loop
+                    # Message already sent by get_account_balance if it was -2015 (IP issue)
+                    print("WARNING: Account balance could not be fetched in this cycle due to an API error (potentially IP whitelist).")
+                    print("The bot will continue and retry in the next cycle. Check Telegram for IP alert if this was error -2015.")
+                    # No break here, allowing the loop to continue to the next cycle.
+                    # We might want to skip further processing for *this* cycle if balance is None.
+                    # For now, it will proceed to try and process symbols, which might be okay as individual
+                    # trade entries also check balance via manage_trade_entry->get_account_balance.
+                    # If manage_trade_entry's get_account_balance also returns None, it will abort that trade.
+                    # This seems like a reasonable approach: log cycle-level issue, continue, let symbol-level logic handle individual trades.
+                else: # Only get positions and print status if balance fetch was successful or not critical
+                    get_open_positions(client)
+                    print(f"Account status updated. Current Balance: {current_cycle_balance} {format_elapsed_time(cycle_start_time)}")
 
-                get_open_positions(client)
-                print(f"Account status updated. {format_elapsed_time(cycle_start_time)}")
+                # The rest of the loop (symbol processing, monitoring) will still run.
+                # manage_trade_entry has its own balance check.
 
                 futures = []
                 print(f"Submitting {len(monitored_symbols)} symbol tasks to {configs.get('max_scan_threads')} threads... {format_elapsed_time(cycle_start_time)}")
@@ -983,7 +1154,36 @@ def trading_loop(client, configs, monitored_symbols):
                 traceback.print_exc()
 
             cycle_dur_s = time.time() - cycle_start_time
-            print(f"\n--- Scan Cycle #{current_cycle_number} Completed (Runtime: {cycle_dur_s:.2f}s / {(cycle_dur_s/60):.2f}min). Waiting for {configs['loop_delay_minutes']}m... ---")
+            print(f"\n--- Scan Cycle #{current_cycle_number} Completed (Runtime: {cycle_dur_s:.2f}s / {(cycle_dur_s/60):.2f}min). ---")
+
+            # Send status update every 100 cycles
+            if current_cycle_number > 0 and current_cycle_number % 100 == 0:
+                print(f"Scan cycle {current_cycle_number} reached. Sending status update to Telegram...")
+                if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+                    current_balance_for_update = get_account_balance(client, configs)
+                    if current_balance_for_update is None: # Handle critical balance fetch error
+                        current_balance_for_update = "Error fetching" # Placeholder for message
+
+                    open_pos_text_update = "None"
+                    if client: # Check if client is valid
+                        if configs["mode"] == "live": # Ensure it's live mode for position check
+                            # Use the new formatting option
+                            open_pos_text_update = get_open_positions(client, format_for_telegram=True)
+                        else:
+                            open_pos_text_update = "None (Backtest Mode)" # Should not happen if in live trading_loop
+                    else:
+                        open_pos_text_update = "N/A (Client not initialized)" # Should not happen
+
+                    retrieved_bot_start_time_str = configs.get('bot_start_time_str', 'N/A')
+                    
+                    status_update_msg = build_startup_message(configs, current_balance_for_update, open_pos_text_update, retrieved_bot_start_time_str)
+                    send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], status_update_msg)
+                    configs["last_startup_message"] = status_update_msg # Update for /command3
+                    print("Telegram status update sent.")
+                else:
+                    print("Telegram not configured, skipping status update message.")
+
+            print(f"Waiting for {configs['loop_delay_minutes']}m...")
             time.sleep(configs['loop_delay_minutes'])
     finally:
         print("Shutting down thread pool executor...")
@@ -1017,15 +1217,32 @@ def main():
 
     # Now use client_obj for operations
     print("\nFetching initial account balance...")
-    initial_balance = get_account_balance(client_obj) # Use the actual client object
+    initial_balance = get_account_balance(client_obj, configs) # Use the actual client object, pass configs
 
     if configs['mode'] == 'live' and initial_balance is None:
-        # get_account_balance already printed a detailed error for critical issues (like -2015)
-        print("Exiting: Cannot proceed with live trading due to critical error in fetching account balance (e.g., API key permissions or IP whitelist).")
-        print("Please check the error messages above and verify your API key configuration on Binance.")
-        sys.exit(1)
+        # IP-related error or other critical issue detected by get_account_balance returning None.
+        # Telegram alert with IP details is sent from within get_account_balance for -2015.
+        print("CRITICAL: Initial API connection failed (e.g., IP whitelist issue or invalid API key).")
+        while initial_balance is None:
+            print("Retrying initial connection in 60 seconds... Check Telegram for IP details if this is a whitelist issue.")
+            time.sleep(60)
+            initial_balance = get_account_balance(client_obj, configs)
+            if initial_balance is not None:
+                print(f"Initial API connection successful! Current balance: {initial_balance:.2f} USDT")
+                # Re-send startup message now that connection is established
+                if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+                    open_pos_text_retry = get_open_positions(client_obj, format_for_telegram=True)
+                    # configs['bot_start_time_str'] should already be set
+                    startup_msg_retry = build_startup_message(configs, initial_balance, open_pos_text_retry, configs.get('bot_start_time_str', 'N/A'))
+                    send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], startup_msg_retry)
+                    configs["last_startup_message"] = startup_msg_retry 
+                    print("Startup message resent to Telegram after successful reconnection.")
+            else:
+                # This else block is within the while, meaning get_account_balance still returned None
+                print("Retry failed. Will try again after 60 seconds.")
+                # The loop will continue, and get_account_balance will send another Telegram if it's -2015.
     
-    if initial_balance == 0.0 and configs.get("environment") == "mainnet": # This check is fine, but None is more critical
+    elif initial_balance == 0.0 and configs.get("environment") == "mainnet": # Use elif to avoid this message if initial_balance is None initially
         print("Warning: Initial account balance is 0.0 USDT on Mainnet. Ensure funds are available for trading.")
         # If it was critical, the 'initial_balance is None' check above would have caught it for live mode.
         # If it's 0.0 not due to a critical error, it's just a warning.
@@ -1051,8 +1268,7 @@ def main():
         open_pos_text = "None"
         if client_obj:
             if configs["mode"] == "live":
-                live_positions = get_open_positions(client_obj)
-                open_pos_text = "\n".join([f"- {p['symbol']}: Amt={p['positionAmt']}, Entry={p['entryPrice']}" for p in live_positions]) or "None"
+                open_pos_text = get_open_positions(client_obj, format_for_telegram=True)
             else:
                 open_pos_text = "None (Backtest Mode)"
         else:
@@ -1068,9 +1284,11 @@ def main():
     else:
         print("Telegram notifications disabled (token or chat_id not configured in keys.py or load failed).")
     configs["monitored_symbols_count"] = len(monitored_symbols)
+    configs['bot_start_time_str'] = bot_start_time_str # Make bot_start_time_str available in configs
 
-    confirm = input(f"Found {len(monitored_symbols)} USDT perpetuals. Monitor all for {'live trading' if configs['mode'] == 'live' else 'backtesting'}? (yes/no) [yes]: ").lower().strip()
-    if confirm == 'no': print("Exiting by user choice."); sys.exit(0)
+    print(f"Found {len(monitored_symbols)} USDT perpetuals. Proceeding to monitor all for {'live trading' if configs['mode'] == 'live' else 'backtesting'}.")
+    # confirm = input(f"Found {len(monitored_symbols)} USDT perpetuals. Monitor all for {'live trading' if configs['mode'] == 'live' else 'backtesting'}? (yes/no) [yes]: ").lower().strip()
+    # if confirm == 'no': print("Exiting by user choice."); sys.exit(0)
 
     if configs["mode"] == "live":
         try:
@@ -1156,9 +1374,16 @@ def initialize_backtest_environment(client, configs):
         backtest_simulated_balance = configs.get("backtest_custom_start_balance", 10000) # Default custom to 10k if somehow not set
         print(f"Backtest initialized with CUSTOM starting balance: {backtest_simulated_balance:.2f} USDT")
     else: # 'current' or default
-        live_balance = get_account_balance(client) # This hits the API
-        backtest_simulated_balance = live_balance if live_balance > 0 else 10000 # Default to 10k if no live balance
-        print(f"Backtest initialized with CURRENT account balance: {backtest_simulated_balance:.2f} USDT (or default if zero)")
+        # Pass configs, though for backtesting the -2015 error is less likely / relevant for IP alert
+        live_balance = get_account_balance(client, configs) 
+        # Handle if live_balance is None (critical error)
+        if live_balance is None:
+            print("Warning: Could not fetch live balance for backtest initialization due to an API error. Defaulting to 10000 USDT.")
+            backtest_simulated_balance = 10000
+        else:
+            backtest_simulated_balance = live_balance if live_balance > 0 else 10000 # Default to 10k if no live balance
+        print(f"Backtest initialized with starting balance: {backtest_simulated_balance:.2f} USDT")
+
 
 def get_simulated_account_balance(asset="USDT"): # Overrides live version for backtest
     global backtest_simulated_balance
