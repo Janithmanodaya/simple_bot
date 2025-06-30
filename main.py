@@ -89,11 +89,14 @@ def get_user_configurations():
     print("\n--- Strategy Configuration ---")
     configs = {}
     while True:
-        env_input = input("Select environment (testnet/mainnet): ").lower().strip()
-        if env_input in ["testnet", "mainnet"]:
-            configs["environment"] = env_input
+        env_input = input("Select environment (1:testnet / 2:mainnet): ").strip()
+        if env_input == "1":
+            configs["environment"] = "testnet"
             break
-        print("Invalid environment. Please enter 'testnet' or 'mainnet'.")
+        elif env_input == "2":
+            configs["environment"] = "mainnet"
+            break
+        print("Invalid environment. Please enter '1' for testnet or '2' for mainnet.")
     configs["api_key"], configs["api_secret"] = load_api_keys(configs["environment"])
 
     while True:
@@ -116,13 +119,16 @@ def get_user_configurations():
                 print("Invalid input. Please enter an integer for the number of days.")
         
         while True:
-            balance_choice = input("For backtest, use current account balance or set a custom start balance? (current/custom) [current]: ").lower().strip()
-            if not balance_choice: balance_choice = "current" # Default if user presses Enter
+            balance_choice_input = input("For backtest, use (1:current account balance) or (2:set a custom start balance)? [1]: ").strip()
+            if not balance_choice_input: balance_choice_input = "1" # Default if user presses Enter
 
-            if balance_choice in ["current", "custom"]:
-                configs["backtest_start_balance_type"] = balance_choice
+            if balance_choice_input == "1":
+                configs["backtest_start_balance_type"] = "current"
                 break
-            print("Invalid choice. Please enter 'current' or 'custom'.")
+            elif balance_choice_input == "2":
+                configs["backtest_start_balance_type"] = "custom"
+                break
+            print("Invalid choice. Please enter '1' for current or '2' for custom.")
 
         if configs["backtest_start_balance_type"] == "custom":
             while True:
