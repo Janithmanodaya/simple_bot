@@ -19,6 +19,8 @@ import math # For rounding, floor, ceil operations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import traceback # For more detailed error logging in threads
+import telegram # For sending Telegram messages
+import asyncio 
 
 # --- Configuration Defaults ---
 DEFAULT_RISK_PERCENT = 1.0       # Default account risk percentage per trade (e.g., 1.0 for 1%)
@@ -68,19 +70,66 @@ def load_api_keys(env):
         else:
             raise ValueError("Invalid environment specified for loading API keys.")
 
-        placeholders = ["<your-testnet-api-key>", "<your-testnet-secret>",
-                        "<your-mainnet-api-key>", "<your-mainnet-secret>"]
-        if not api_key or not api_secret or api_key in placeholders or api_secret in placeholders:
-            print(f"Error: API key/secret for {env} not found or not configured in keys.py.")
-            print("Please open keys.py and replace placeholder values.")
+        placeholders_binance = ["<your-testnet-api-key>", "<your-testnet-secret>",
+                                "<your-mainnet-api-key>", "<your-mainnet-secret>"]
+        if not api_key or not api_secret or api_key in placeholders_binance or api_secret in placeholders_binance:
+            print(f"Error: Binance API key/secret for {env} not found or not configured in keys.py.")
+            print("Please open keys.py and replace placeholder values for Binance.")
             sys.exit(1)
-        return api_key, api_secret
+        
+        # Load Telegram keys
+        telegram_token = getattr(keys_module, "telegram_bot_token", None)
+        telegram_chat = getattr(keys_module, "telegram_chat_id", None)
+        
+        placeholders_telegram = ["<your-telegram-bot-token>", "<your-telegram-chat-id>"] # General placeholders
+        # Specific token from user request is "8184556638:AAE4cJMUf0z7yPoXd5si12SrqV_n_2k4eeQ"
+        # Specific chat_id from user request is "7144191785"
+        # We check if the token/chat_id in keys.py IS STILL a placeholder or the one provided.
+        # The values in keys.py were already updated to the user's actual values.
+        # So, this check is more about ensuring they are not generic placeholders if the user hadn't provided them.
+        # Since they ARE provided and keys.py is updated, this check might seem redundant for *this specific run*,
+        # but it's good practice for the function.
+
+        if not telegram_token or not telegram_chat or \
+           telegram_token in placeholders_telegram or telegram_chat in placeholders_telegram or \
+           telegram_token == "YOUR_TELEGRAM_BOT_TOKEN" or telegram_chat == "YOUR_TELEGRAM_CHAT_ID": # Common placeholders
+            print(f"Warning: Telegram bot token or chat ID not found or not configured in keys.py.")
+            print("Telegram notifications will be disabled. Please update keys.py with your Telegram details.")
+            # Allow bot to run without Telegram if not configured
+            telegram_token, telegram_chat = None, None # Disable if not configured
+
+        return api_key, api_secret, telegram_token, telegram_chat
     except FileNotFoundError:
-        print("Error: keys.py not found. Please create it and add your API credentials.")
+        print("Error: keys.py not found. Please create it and add your API and Telegram credentials.")
         sys.exit(1)
     except Exception as e:
-        print(f"An unexpected error occurred while loading API keys: {e}")
+        print(f"An unexpected error occurred while loading keys: {e}")
         sys.exit(1)
+
+def send_telegram_message(bot_token, chat_id, message):
+    """Sends a message to a specified Telegram chat using async."""
+    if not bot_token or not chat_id:
+        print("Telegram bot token or chat ID not configured. Cannot send message.")
+        return False
+
+    async def _send():
+        try:
+            bot = telegram.Bot(token=bot_token)
+            await bot.send_message(chat_id=chat_id, text=message, parse_mode="Markdown")
+            print(f"Telegram message sent successfully to chat ID {chat_id}.")
+            return True
+        except telegram.error.TelegramError as e:
+            print(f"Error sending Telegram message: {e}")
+            if "chat not found" in str(e).lower():
+                print(f"Ensure the chat ID {chat_id} is correct and the bot has access to it.")
+            elif "bot token is invalid" in str(e).lower():
+                print("The Telegram Bot Token in keys.py seems to be invalid.")
+            return False
+        except Exception as e:
+            print(f"An unexpected error occurred while sending Telegram message: {e}")
+            return False
+
+    return asyncio.run(_send())
 
 def get_user_configurations():
     """
@@ -98,7 +147,12 @@ def get_user_configurations():
             configs["environment"] = "mainnet"
             break
         print("Invalid environment. Please enter '1' for testnet or '2' for mainnet.")
-    configs["api_key"], configs["api_secret"] = load_api_keys(configs["environment"])
+    # Load all keys including Telegram
+    api_key, api_secret, telegram_token, telegram_chat_id = load_api_keys(configs["environment"])
+    configs["api_key"] = api_key
+    configs["api_secret"] = api_secret
+    configs["telegram_bot_token"] = telegram_token
+    configs["telegram_chat_id"] = telegram_chat_id
 
     while True:
         mode_input = input("Select mode (1:live / 2:backtest): ").strip()
@@ -858,10 +912,14 @@ def trading_loop(client, configs, monitored_symbols):
 # --- Main Execution ---
 def main():
     print("Initializing Binance Trading Bot - Advance EMA Cross Strategy (ID: 8)")
+    bot_start_time_utc = pd.Timestamp.now(tz='UTC')
+    bot_start_time_str = bot_start_time_utc.strftime('%Y-%m-%d %H:%M:%S %Z')
+    
     configs = get_user_configurations()
     print("\nLoaded Configurations:")
     for k, v in configs.items(): 
-        if k not in ["api_key", "api_secret"]: print(f"  {k.replace('_',' ').title()}: {v}")
+        if k not in ["api_key", "api_secret", "telegram_bot_token", "telegram_chat_id"]: # Hide sensitive keys
+             print(f"  {k.replace('_',' ').title()}: {v}")
 
     # Call initialize_binance_client once and unpack its results
     # The first item in the returned tuple is the actual client object.
@@ -905,6 +963,46 @@ def main():
     monitored_symbols = get_all_usdt_perpetual_symbols(client_obj) # Use client_obj
     if not monitored_symbols: print("Exiting: No symbols to monitor."); sys.exit(1)
     
+    # --- Initial Telegram Notification ---
+    if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+        env_name = configs.get('environment', 'N/A').title()
+        mode_name = configs.get('mode', 'N/A').title()
+        balance_for_msg = initial_balance if initial_balance is not None else "N/A (Error fetching)"
+        if configs['mode'] == 'backtest' and configs.get("backtest_start_balance_type") == "custom":
+            balance_for_msg = configs.get("backtest_custom_start_balance", "N/A (Error in custom balance)")
+
+        initial_open_positions_str = "Fetching..."
+        if client_obj: # Ensure client object exists before trying to get positions
+            if configs["mode"] == "live":
+                live_positions = get_open_positions(client_obj)
+                if live_positions:
+                    initial_open_positions_str = "\n".join([f"- {p['symbol']}: Amt={p['positionAmt']}, Entry={p['entryPrice']}" for p in live_positions])
+                else:
+                    initial_open_positions_str = "None"
+            elif configs["mode"] == "backtest":
+                # In backtest, initially no positions are open by the bot itself.
+                # get_simulated_open_positions() would be empty at this stage.
+                initial_open_positions_str = "None (Backtest Mode)"
+        else:
+            initial_open_positions_str = "N/A (Client not initialized)"
+
+
+        startup_message = (
+            f"*🚀 Bot Started Successfully ({configs.get('strategy_name', 'Strategy')}) 🚀*\n\n"
+            f"*Start Time:* `{bot_start_time_str}`\n"
+            f"*Environment:* `{env_name}`\n"
+            f"*Mode:* `{mode_name}`\n"
+            f"*Initial Balance ({'USDT' if initial_balance is not None else ''}):* `{balance_for_msg}`\n"
+            f"*Risk Per Trade:* `{configs.get('risk_percent', 0.0) * 100:.2f}%`\n"
+            f"*Leverage:* `{configs.get('leverage', 0)}x`\n"
+            f"*Max Concurrent Positions:* `{configs.get('max_concurrent_positions', 0)}`\n"
+            f"*Monitored Symbols:* `{len(monitored_symbols)}`\n"
+            f"\n*Initial Open Positions (from exchange, if any for Live):*\n{initial_open_positions_str}"
+        )
+        send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], startup_message)
+    else:
+        print("Telegram notifications disabled (token or chat_id not configured in keys.py or load failed).")
+
     confirm = input(f"Found {len(monitored_symbols)} USDT perpetuals. Monitor all for {'live trading' if configs['mode'] == 'live' else 'backtesting'}? (yes/no) [yes]: ").lower().strip()
     if confirm == 'no': print("Exiting by user choice."); sys.exit(0)
 
