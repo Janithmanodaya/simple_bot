@@ -26,6 +26,7 @@ DEFAULT_LEVERAGE = 20            # Default leverage (e.g., 20x)
 DEFAULT_MAX_CONCURRENT_POSITIONS = 5 # Default maximum number of concurrent open positions
 DEFAULT_MARGIN_TYPE = "ISOLATED" # Default margin type: "ISOLATED" or "CROSS"
 DEFAULT_MAX_SCAN_THREADS = 10    # Default threads for scanning symbols
+DEFAULT_ALLOW_EXCEED_RISK_FOR_MIN_NOTIONAL = False # Default for allowing higher risk to meet min notional
 
 # --- Global State Variables ---
 # Stores details of active trades. Key: symbol (e.g., "BTCUSDT")
@@ -189,6 +190,20 @@ def get_user_configurations():
             print("Max scan threads must be an integer between 1 and 50.")
         except ValueError:
             print("Invalid input for scan threads. Please enter an integer.")
+    
+    while True:
+        exceed_risk_input = input(f"Allow exceeding risk % to meet MIN_NOTIONAL? (yes/no, default: {'yes' if DEFAULT_ALLOW_EXCEED_RISK_FOR_MIN_NOTIONAL else 'no'}): ").lower().strip()
+        if not exceed_risk_input: # User pressed Enter, use default
+            configs["allow_exceed_risk_for_min_notional"] = DEFAULT_ALLOW_EXCEED_RISK_FOR_MIN_NOTIONAL
+            break
+        if exceed_risk_input in ["yes", "y"]:
+            configs["allow_exceed_risk_for_min_notional"] = True
+            break
+        elif exceed_risk_input in ["no", "n"]:
+            configs["allow_exceed_risk_for_min_notional"] = False
+            break
+        print("Invalid input. Please enter 'yes' or 'no'.")
+
     configs["strategy_id"] = 8
     configs["strategy_name"] = "Advance EMA Cross"
     print("--- Configuration Complete ---")
@@ -200,12 +215,17 @@ def initialize_binance_client(configs):
     api_key, api_secret, env = configs["api_key"], configs["api_secret"], configs["environment"]
     try:
         client = Client(api_key, api_secret, testnet=(env == "testnet"))
-        client.ping()
-        server_time = client.get_server_time()
-        print(f"\nSuccessfully connected to Binance {env.title()} API. Server Time: {pd.to_datetime(server_time['serverTime'], unit='ms')} UTC")
-        return client
-    except BinanceAPIException as e: print(f"Binance API Exception (client init): {e}"); return None
-    except Exception as e: print(f"Error initializing Binance client: {e}"); return None
+        client.ping() # Verify connection
+        server_time = client.get_server_time() # Get server time for the success message
+        # print(f"\nSuccessfully connected to Binance {env.title()} API. Server Time: {pd.to_datetime(server_time['serverTime'], unit='ms')} UTC")
+        # Return client, environment title, and server time for main() to construct the message
+        return client, env, server_time # Modified return
+    except BinanceAPIException as e:
+        print(f"Binance API Exception (client init): {e}")
+        return None, None, None # Modified return
+    except Exception as e:
+        print(f"Error initializing Binance client: {e}")
+        return None, None, None # Modified return
 
 def get_historical_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=500, backtest_days=None):
     """
@@ -269,9 +289,22 @@ def get_account_balance(client, asset="USDT"):
     try:
         balances = client.futures_account_balance()
         for b in balances:
-            if b['asset'] == asset: print(f"Account Balance ({asset}): {b['balance']}"); return float(b['balance'])
-        print(f"{asset} not found in futures balance."); return 0.0
-    except Exception as e: print(f"Error getting balance: {e}"); return 0.0
+            if b['asset'] == asset:
+                print(f"Account Balance ({asset}): {b['balance']}")
+                return float(b['balance'])
+        print(f"{asset} not found in futures balance.")
+        return 0.0  # Return 0.0 if asset not found but call was successful
+    except BinanceAPIException as e:
+        if e.code == -2015:
+            print(f"Critical Error getting balance: {e}. This is likely an API key permission or IP whitelist issue.")
+            print("Please check your API key settings on Binance: ensure 'Enable Futures' is checked and your IP is whitelisted if restrictive IP access is enabled.")
+            return None # Specific indicator for critical auth/IP error
+        else:
+            print(f"API Error getting balance: {e}")
+            return 0.0 # For other API errors, return 0.0 to indicate balance couldn't be fetched but not necessarily critical auth
+    except Exception as e:
+        print(f"Unexpected error getting balance: {e}")
+        return 0.0 # For non-API unexpected errors
 
 def get_open_positions(client):
     try:
@@ -447,31 +480,81 @@ def get_symbol_info(client, symbol):
         print(f"No info for {symbol}."); return None
     except Exception as e: print(f"Error getting info for {symbol}: {e}"); return None
 
-def calculate_position_size(balance, risk_pct, entry, sl, symbol_info):
+def calculate_position_size(balance, risk_pct, entry, sl, symbol_info, configs=None): # Added configs
     if not symbol_info or balance <= 0 or entry <= 0 or sl <= 0 or abs(entry-sl)<1e-9 : return None
     q_prec = int(symbol_info['quantityPrecision'])
     lot_f = next((f for f in symbol_info['filters'] if f['filterType']=='LOT_SIZE'),None)
     if not lot_f or float(lot_f['stepSize'])==0: print(f"No LOT_SIZE/stepSize for {symbol_info['symbol']}"); return None
     min_qty, step = float(lot_f['minQty']), float(lot_f['stepSize'])
     
-    pos_size = (balance * risk_pct) / abs(entry - sl)
+    pos_size = (balance * risk_pct) / abs(entry - sl) # Ideal size based on risk_pct
     adj_size = math.floor(pos_size / step) * step
     adj_size = round(adj_size, q_prec)
 
-    if adj_size < min_qty: print(f"Risk calc size {adj_size} < min_qty {min_qty}. No trade."); return None
-    
+    if adj_size < min_qty:
+        print(f"Initial calculated size {adj_size} based on risk {risk_pct*100:.2f}% is less than min_qty {min_qty}.")
+        # If initial size is already too small (even before min_notional check), it implies high risk for min_qty.
+        # We can directly check if min_qty itself is too risky.
+        risk_for_min_qty = (min_qty * abs(entry - sl)) / balance
+        if risk_for_min_qty > risk_pct:
+            allow_exceed = configs.get('allow_exceed_risk_for_min_notional', DEFAULT_ALLOW_EXCEED_RISK_FOR_MIN_NOTIONAL) if configs else DEFAULT_ALLOW_EXCEED_RISK_FOR_MIN_NOTIONAL
+            if allow_exceed:
+                print(f"Warning: Using min_qty {min_qty} for {symbol_info['symbol']} results in risk of {risk_for_min_qty*100:.2f}%, exceeding target {risk_pct*100:.2f}%. Allowed by config.")
+                adj_size = min_qty
+            else:
+                # Stricter check: if risk_for_min_qty > risk_pct * 1.5 (original implicit behavior for min_notional adjustment)
+                # Or simply, if risk_for_min_qty > risk_pct and not allowed to exceed.
+                if risk_for_min_qty > (risk_pct * 1.5): # Maintain a hard cap if not explicitly allowed to exceed any risk
+                     print(f"Risk for min_qty {min_qty} ({risk_for_min_qty*100:.2f}%) is too high (>{risk_pct*1.5*100:.2f}%). No trade.")
+                     return None
+                else: # Risk is > risk_pct but <= risk_pct * 1.5
+                     print(f"Warning: Using min_qty {min_qty} for {symbol_info['symbol']} results in risk of {risk_for_min_qty*100:.2f}%. This is > target {risk_pct*100:.2f}% but within 1.5x limit. Proceeding.")
+                     adj_size = min_qty
+
+        else: # min_qty is within risk target
+            adj_size = min_qty
+        
+        if adj_size < min_qty: # If after all logic, it's still less (e.g. returned None then somehow adj_size not updated)
+            print(f"Final size {adj_size} after min_qty check is still < min_qty {min_qty}. No trade."); return None
+
+
     min_not_f = next((f for f in symbol_info['filters'] if f['filterType']=='MIN_NOTIONAL'),None)
     if min_not_f and (adj_size * entry) < float(min_not_f['notional']):
-        print(f"Notional for {adj_size} too low. Trying min notional qty.")
-        qty_min_not = math.ceil((float(min_not_f['notional']) / entry) / step) * step
-        qty_min_not = round(max(qty_min_not, min_qty), q_prec) # Ensure meets min_qty too
-        if (qty_min_not * abs(entry-sl) / balance) > (risk_pct * 1.5): # Risk check
-            print(f"Risk for min_notional_qty too high. No trade."); return None
-        adj_size = qty_min_not
-        print(f"Adjusted size to {adj_size} for min_notional. New risk: {(adj_size*abs(entry-sl)/balance)*100:.2f}%")
-    
-    if adj_size <=0: print(f"Final size {adj_size} is zero. No trade."); return None
-    print(f"Calc Pos Size: {adj_size} for {symbol_info['symbol']} (Risk: ${ (adj_size*abs(entry-sl)):.2f})")
+        required_notional_val = float(min_not_f['notional'])
+        print(f"Calculated notional for size {adj_size} ({adj_size * entry:.2f}) is below MIN_NOTIONAL ({required_notional_val:.2f}) for {symbol_info['symbol']}.")
+        
+        # Calculate quantity needed to meet MIN_NOTIONAL
+        qty_min_not = math.ceil((required_notional_val / entry) / step) * step
+        qty_min_not = round(max(qty_min_not, min_qty), q_prec) # Also ensure it meets min_qty
+
+        risk_for_min_notional_qty = (qty_min_not * abs(entry-sl) / balance)
+        
+        print(f"Quantity to meet MIN_NOTIONAL: {qty_min_not}. This quantity implies a risk of {risk_for_min_notional_qty*100:.2f}%. Target risk: {risk_pct*100:.2f}%.")
+
+        if risk_for_min_notional_qty > risk_pct:
+            allow_exceed = configs.get('allow_exceed_risk_for_min_notional', DEFAULT_ALLOW_EXCEED_RISK_FOR_MIN_NOTIONAL) if configs else DEFAULT_ALLOW_EXCEED_RISK_FOR_MIN_NOTIONAL
+            if allow_exceed:
+                print(f"Warning: Risk for {symbol_info['symbol']} increased to {risk_for_min_notional_qty*100:.2f}% to meet MIN_NOTIONAL (target risk: {risk_pct*100:.2f}%). Allowed by config.")
+                adj_size = qty_min_not
+            else: # Not allowed to exceed target risk freely
+                # Maintain the original stricter check (1.5x risk_pct) if not allowing override
+                if risk_for_min_notional_qty > (risk_pct * 1.5):
+                    print(f"Risk to meet MIN_NOTIONAL ({risk_for_min_notional_qty*100:.2f}%) is too high (>{risk_pct*1.5*100:.2f}% of target {risk_pct*100:.2f}%). No trade.")
+                    return None
+                else: # Risk is > risk_pct but <= risk_pct * 1.5
+                    print(f"Warning: Risk for {symbol_info['symbol']} increased to {risk_for_min_notional_qty*100:.2f}% to meet MIN_NOTIONAL. This is > target {risk_pct*100:.2f}% but within 1.5x limit. Proceeding.")
+                    adj_size = qty_min_not
+        else: # Risk for qty_min_not is within target risk_pct
+            print(f"Adjusted size to {qty_min_not} to meet MIN_NOTIONAL. Risk ({risk_for_min_notional_qty*100:.2f}%) is within target ({risk_pct*100:.2f}%).")
+            adj_size = qty_min_not
+            
+    if adj_size <= 0: print(f"Final calculated size {adj_size} is zero or negative. No trade."); return None
+    # Final check: ensure the chosen adj_size still respects min_qty, as logic for min_notional might overlook it if qty_min_not was small.
+    if adj_size < min_qty:
+        print(f"Post MIN_NOTIONAL logic, size {adj_size} is < min_qty {min_qty}. This shouldn't happen if max(qty_min_not, min_qty) was used correctly. No trade.")
+        return None # Should be captured by max(qty_min_not, min_qty) earlier but as a safeguard.
+
+    print(f"Calculated Position Size: {adj_size} for {symbol_info['symbol']} (Risk: ${(adj_size*abs(entry-sl)):.2f}, Notional: ${(adj_size*entry):.2f})")
     return adj_size
 
 # --- Main Trading Logic ---
@@ -583,7 +666,7 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock):
     if acc_bal <= 0: print(f"{log_prefix} Zero/unavailable balance ({acc_bal}). Abort."); return
     print(f"{log_prefix} Account balance: {acc_bal} for position sizing.")
 
-    qty = calculate_position_size(acc_bal, configs['risk_percent'], entry_p, sl_p, symbol_info)
+    qty = calculate_position_size(acc_bal, configs['risk_percent'], entry_p, sl_p, symbol_info, configs) # Pass configs
     if qty is None or qty <= 0: print(f"{log_prefix} Invalid position size ({qty}) for {symbol}. Abort."); return
     print(f"{log_prefix} Calculated position size: {qty} for {symbol}.")
     
@@ -729,7 +812,16 @@ def trading_loop(client, configs, monitored_symbols):
 
             try:
                 print(f"Fetching account status... {format_elapsed_time(cycle_start_time)}")
-                get_account_balance(client)
+                # Ensure client_obj is used here if that's the correct variable name passed to trading_loop
+                # Assuming 'client' is the parameter name for trading_loop, which holds client_obj from main()
+                current_cycle_balance = get_account_balance(client) 
+
+                if configs['mode'] == 'live' and current_cycle_balance is None:
+                    print("CRITICAL: Account balance could not be fetched due to API key/permission error during trading loop.")
+                    print("This indicates a potential issue like changed IP whitelist or revoked API key permissions.")
+                    print("Stopping live trading to prevent further issues.")
+                    break # Exit the while True loop of trading_loop
+
                 get_open_positions(client)
                 print(f"Account status updated. {format_elapsed_time(cycle_start_time)}")
 
@@ -771,14 +863,46 @@ def main():
     for k, v in configs.items(): 
         if k not in ["api_key", "api_secret"]: print(f"  {k.replace('_',' ').title()}: {v}")
 
-    client = initialize_binance_client(configs)
-    if not client: print("Exiting: Binance client init failed."); sys.exit(1)
+    # Call initialize_binance_client once and unpack its results
+    # The first item in the returned tuple is the actual client object.
+    client_connection_details = initialize_binance_client(configs)
+    client_obj = client_connection_details[0]
+    env_for_msg = client_connection_details[1]
+    server_time_obj = client_connection_details[2]
+    
+    if not client_obj: # Check if the actual client object is None
+        # Error messages are printed by initialize_binance_client already
+        print("Exiting: Binance client init failed.") 
+        sys.exit(1)
+
+    # Now use client_obj for operations
+    print("\nFetching initial account balance...")
+    initial_balance = get_account_balance(client_obj) # Use the actual client object
+
+    if configs['mode'] == 'live' and initial_balance is None:
+        # get_account_balance already printed a detailed error for critical issues (like -2015)
+        print("Exiting: Cannot proceed with live trading due to critical error in fetching account balance (e.g., API key permissions or IP whitelist).")
+        print("Please check the error messages above and verify your API key configuration on Binance.")
+        sys.exit(1)
+    
+    if initial_balance == 0.0 and configs.get("environment") == "mainnet": # This check is fine, but None is more critical
+        print("Warning: Initial account balance is 0.0 USDT on Mainnet. Ensure funds are available for trading.")
+        # If it was critical, the 'initial_balance is None' check above would have caught it for live mode.
+        # If it's 0.0 not due to a critical error, it's just a warning.
+        
+    # Print the success message using the unpacked env and server_time
+    if server_time_obj and isinstance(server_time_obj, dict) and 'serverTime' in server_time_obj and env_for_msg:
+        print(f"\nSuccessfully connected to Binance {env_for_msg.title()} API. Server Time: {pd.to_datetime(server_time_obj['serverTime'], unit='ms')} UTC")
+    elif env_for_msg: # If client initialized but server time fetch failed or env_for_msg is None (should be rare)
+        print(f"\nSuccessfully connected to Binance {env_for_msg.title()} API. (Server time not fully available)")
+    else: # Fallback if client_obj is somehow valid but other details are not
+        print(f"\nSuccessfully connected to Binance API. (Connection details partially unavailable)")
 
     configs.setdefault("api_delay_short", 1) 
     configs.setdefault("api_delay_symbol_processing", 0.1) # Can be very short with threads
     configs.setdefault("loop_delay_minutes", 5)
 
-    monitored_symbols = get_all_usdt_perpetual_symbols(client)
+    monitored_symbols = get_all_usdt_perpetual_symbols(client_obj) # Use client_obj
     if not monitored_symbols: print("Exiting: No symbols to monitor."); sys.exit(1)
     
     confirm = input(f"Found {len(monitored_symbols)} USDT perpetuals. Monitor all for {'live trading' if configs['mode'] == 'live' else 'backtesting'}? (yes/no) [yes]: ").lower().strip()
@@ -786,12 +910,12 @@ def main():
 
     if configs["mode"] == "live":
         try:
-            trading_loop(client, configs, monitored_symbols)
+            trading_loop(client_obj, configs, monitored_symbols) # Use client_obj
         except KeyboardInterrupt: print("\nBot stopped by user (Ctrl+C).")
         except Exception as e: print(f"\nCRITICAL UNEXPECTED ERROR IN LIVE TRADING: {e}"); traceback.print_exc()
         finally:
             print("\n--- Live Trading Bot Shutting Down ---")
-            if client and active_trades:
+            if client_obj and active_trades: # Use client_obj
                 print(f"Cancelling {len(active_trades)} bot-managed active SL/TP orders...")
                 with active_trades_lock:
                     for symbol, trade_details in list(active_trades.items()):
@@ -800,12 +924,13 @@ def main():
                             if oid:
                                 try:
                                     print(f"Cancelling {oid_key} {oid} for {symbol}...")
-                                    client.futures_cancel_order(symbol=symbol, orderId=oid)
+                                    client_obj.futures_cancel_order(symbol=symbol, orderId=oid) # Use client_obj
                                 except Exception as e_c: print(f"Failed to cancel {oid_key} {oid} for {symbol}: {e_c}")
             print("Live Bot shutdown sequence complete.")
     elif configs["mode"] == "backtest":
         try:
-            backtesting_loop(client, configs, monitored_symbols)
+            # Pass client_obj to backtesting_loop; it might also be used for initializing backtest env
+            backtesting_loop(client_obj, configs, monitored_symbols) # Use client_obj
         except KeyboardInterrupt: print("\nBacktest stopped by user (Ctrl+C).")
         except Exception as e: print(f"\nCRITICAL UNEXPECTED ERROR IN BACKTESTING: {e}"); traceback.print_exc()
         finally:
@@ -1118,7 +1243,8 @@ def manage_trade_entry_backtest(client_dummy, configs, symbol, klines_df_current
     sl_p, tp_p = calculate_sl_tp_values(entry_p_signal, signal, ema100_val, klines_df_current_slice)
     
     current_sim_balance = get_simulated_account_balance()
-    qty = calculate_position_size(current_sim_balance, configs['risk_percent'], entry_p_signal, sl_p, symbol_info)
+    # Pass configs to calculate_position_size for backtesting as well
+    qty = calculate_position_size(current_sim_balance, configs['risk_percent'], entry_p_signal, sl_p, symbol_info, configs) 
     
     # Calculate Risk:Reward Ratio
     rr_ratio = None
