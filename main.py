@@ -324,39 +324,61 @@ def calculate_ema(df, period, column='close'):
     if column not in df or len(df) < period: return None # Basic checks
     return df[column].ewm(span=period, adjust=False).mean()
 
-def check_ema_crossover_conditions(df, short_ema_col='EMA100', long_ema_col='EMA200', validation_candles=20):
-    if not all(c in df for c in [short_ema_col, long_ema_col, 'low', 'high']) or len(df) < validation_candles + 2 \
-       or df[[short_ema_col, long_ema_col]].iloc[-(validation_candles + 2):].isnull().values.any(): return None # Not enough data or EMAs are NaN, no signal
+def check_ema_crossover_conditions(df, short_ema_col='EMA100', long_ema_col='EMA200', validation_candles=20, symbol_for_logging=""):
+    log_prefix = f"[{threading.current_thread().name}] {symbol_for_logging} check_ema_crossover_conditions:"
+    
+    required_cols = [short_ema_col, long_ema_col, 'low', 'high']
+    if not all(c in df for c in required_cols):
+        print(f"{log_prefix} Missing one or more required columns: {required_cols}. Aborting.")
+        return None
+    if len(df) < validation_candles + 2:
+        print(f"{log_prefix} Insufficient data length ({len(df)}) for validation (need {validation_candles + 2}). Aborting.")
+        return None
+    if df[[short_ema_col, long_ema_col]].iloc[-(validation_candles + 2):].isnull().values.any():
+        print(f"{log_prefix} NaN values found in EMAs within the validation lookback period. Aborting.")
+        return None
 
     prev_short, curr_short = df[short_ema_col].iloc[-2], df[short_ema_col].iloc[-1]
     prev_long, curr_long = df[long_ema_col].iloc[-2], df[long_ema_col].iloc[-1]
     
-    signal_type = None
-    # Basic crossover check
-    if prev_short <= prev_long and curr_short > curr_long: signal_type = "LONG_CROSS"
-    elif prev_short >= prev_long and curr_short < curr_long: signal_type = "SHORT_CROSS"
-    else: return None # No crossover event this candle
+    print(f"{log_prefix} Current Candle ({df.index[-1]}): {short_ema_col}={curr_short:.4f}, {long_ema_col}={curr_long:.4f}")
+    print(f"{log_prefix} Previous Candle ({df.index[-2]}): {short_ema_col}={prev_short:.4f}, {long_ema_col}={prev_long:.4f}")
 
-    # Validation part
-    val_df = df.iloc[-(validation_candles + 1) : -1] # Look at candles *before* the current one for validation
+    signal_type = None
+    if prev_short <= prev_long and curr_short > curr_long:
+        signal_type = "LONG_CROSS"
+        print(f"{log_prefix} LONG_CROSS detected.")
+    elif prev_short >= prev_long and curr_short < curr_long:
+        signal_type = "SHORT_CROSS"
+        print(f"{log_prefix} SHORT_CROSS detected.")
+    else:
+        # print(f"{log_prefix} No crossover event this candle.") # Can be too verbose, enable if needed
+        return None
+
+    val_df = df.iloc[-(validation_candles + 1) : -1]
     if len(val_df) < validation_candles:
-        # This case implies we have a crossover, but not enough preceding candles for full validation.
-        # Depending on strictness, this could be a 'NO_SIGNAL_INSUFFICIENT_VALIDATION_HISTORY'
-        # For now, let's treat it as unable to validate, so no actionable signal.
-        # Or, we can log this specific state if desired. For now, let's return a distinct status.
-        print(f"Potential {signal_type.replace('_CROSS','')} signal, but insufficient validation history ({len(val_df)}/{validation_candles} candles).")
+        print(f"{log_prefix} Potential {signal_type.replace('_CROSS','')} signal, but insufficient validation history ({len(val_df)}/{validation_candles} candles).")
         return "INSUFFICIENT_VALIDATION_HISTORY" 
         
-    print(f"Potential {signal_type.replace('_CROSS','')} signal: {short_ema_col} {curr_short:.4f} vs {long_ema_col} {curr_long:.4f}.")
+    print(f"{log_prefix} Validating {signal_type.replace('_CROSS','')} signal over {len(val_df)} candles (from {val_df.index[0]} to {val_df.index[-1]}).")
 
     for i in range(len(val_df)):
-        c = val_df.iloc[i]; e100, e200 = val_df[short_ema_col].iloc[i], val_df[long_ema_col].iloc[i]
-        if (c['low']<=e100<=c['high']) or (c['low']<=e200<=c['high']):
-            print(f"Validation FAILED for {signal_type.replace('_CROSS','')} at {val_df.index[i]}: Price touched EMAs during validation period.")
-            return "VALIDATION_FAILED" # Crossover happened, but validation failed
+        candle_data = val_df.iloc[i]
+        ema_short_val = val_df[short_ema_col].iloc[i]
+        ema_long_val = val_df[long_ema_col].iloc[i]
+        
+        touched_short_ema = (candle_data['low'] <= ema_short_val <= candle_data['high'])
+        touched_long_ema = (candle_data['low'] <= ema_long_val <= candle_data['high'])
+
+        if touched_short_ema or touched_long_ema:
+            reason = ""
+            if touched_short_ema: reason += f"Price touched {short_ema_col} ({ema_short_val:.4f}) "
+            if touched_long_ema: reason += f"Price touched {long_ema_col} ({ema_long_val:.4f})"
+            print(f"{log_prefix} Validation FAILED for {signal_type.replace('_CROSS','')} at {val_df.index[i]} (L:{candle_data['low']}, H:{candle_data['high']}): {reason.strip()}.")
+            return "VALIDATION_FAILED"
             
-    print(f"{signal_type.replace('_CROSS','')} signal VALIDATED.")
-    return signal_type.replace('_CROSS','') # Return "LONG" or "SHORT" if validated
+    print(f"{log_prefix} {signal_type.replace('_CROSS','')} signal VALIDATED for {symbol_for_logging}.")
+    return signal_type.replace('_CROSS','')
 
 def calculate_swing_high_low(df, window=20, idx=-1):
     if len(df) < window + abs(idx) or idx - window < -len(df): return None, None
@@ -474,7 +496,10 @@ def process_symbol_task(symbol, client, configs, lock):
     try:
         klines_df = get_historical_klines(client, symbol) # Uses default limit 500
         if klines_df.empty or len(klines_df) < 202:
+            print(f"[{thread_name}] {symbol}: Skipped calling manage_trade_entry - Insufficient klines ({len(klines_df)}) {format_elapsed_time(cycle_start_ref)}")
             return f"{symbol}: Skipped - Insufficient klines ({len(klines_df)})"
+        
+        print(f"[{thread_name}] {symbol}: Sufficient klines ({len(klines_df)}). Calling manage_trade_entry {format_elapsed_time(cycle_start_ref)}")
         manage_trade_entry(client, configs, symbol, klines_df.copy(), lock)
         return f"{symbol}: Processed"
     except Exception as e:
@@ -513,39 +538,64 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock):
     # --- Calculations and non-critical API calls (outside initial lock) ---
     klines_df['EMA100'] = calculate_ema(klines_df, 100)
     klines_df['EMA200'] = calculate_ema(klines_df, 200)
+
+    log_prefix = f"[{threading.current_thread().name}] {symbol} manage_trade_entry:"
+
+    if klines_df['EMA100'] is not None and not klines_df['EMA100'].empty:
+        print(f"{log_prefix} Last EMA100 values: {klines_df['EMA100'].iloc[-3:].values}")
+    else:
+        print(f"{log_prefix} EMA100 calculation resulted in None or empty series.")
+    if klines_df['EMA200'] is not None and not klines_df['EMA200'].empty:
+        print(f"{log_prefix} Last EMA200 values: {klines_df['EMA200'].iloc[-3:].values}")
+    else:
+        print(f"{log_prefix} EMA200 calculation resulted in None or empty series.")
+
     if klines_df['EMA100'] is None or klines_df['EMA200'] is None or \
        klines_df['EMA100'].isnull().all() or klines_df['EMA200'].isnull().all() or \
        len(klines_df) < 202: # Check for valid EMAs and sufficient length
-        print(f"EMA calculation failed or insufficient data for {symbol}."); return
+        print(f"{log_prefix} EMA calculation failed, EMAs are NaN, or insufficient data length ({len(klines_df)}). Aborting for {symbol}."); return
 
-    signal = check_ema_crossover_conditions(klines_df)
-    if not signal: return
+    signal = check_ema_crossover_conditions(klines_df, symbol_for_logging=symbol) # Pass symbol for logging
+    print(f"{log_prefix} Signal from check_ema_crossover_conditions for {symbol}: {signal}")
+    if signal not in ["LONG", "SHORT"]: # Covers None, "VALIDATION_FAILED", "INSUFFICIENT_VALIDATION_HISTORY"
+        print(f"{log_prefix} No actionable signal ('{signal}') for {symbol}. Aborting trade entry.")
+        return
 
-    print(f"\n--- New Trade Signal for {symbol}: {signal} ---")
+    print(f"\n{log_prefix} --- New Validated Trade Signal for {symbol}: {signal} ---")
     symbol_info = get_symbol_info(client, symbol)
-    if not symbol_info: print(f"No symbol info for {symbol}. Abort."); return
+    if not symbol_info: print(f"{log_prefix} No symbol info for {symbol}. Abort."); return
 
     entry_p = klines_df['close'].iloc[-1]
+    print(f"{log_prefix} Entry price (last close): {entry_p} for {symbol}")
+    ema100_val = klines_df['EMA100'].iloc[-1]
     ema100_val = klines_df['EMA100'].iloc[-1]
     
     if not (set_leverage_on_symbol(client, symbol, configs['leverage']) and \
             set_margin_type_on_symbol(client, symbol, configs['margin_type'])):
-        print(f"Failed to set leverage/margin for {symbol}. Abort."); return
+        print(f"{log_prefix} Failed to set leverage/margin for {symbol}. Abort."); return
 
+    print(f"{log_prefix} Leverage and margin type set for {symbol}.")
     sl_p, tp_p = calculate_sl_tp_values(entry_p, signal, ema100_val, klines_df)
-    if sl_p is None or tp_p is None: print(f"SL/TP calc failed for {symbol}. Abort."); return
+    if sl_p is None or tp_p is None: print(f"{log_prefix} SL/TP calc failed for {symbol}. Abort."); return
+    print(f"{log_prefix} Calculated SL: {sl_p}, TP: {tp_p} for {symbol}.")
     
-    acc_bal = get_account_balance(client)
-    if acc_bal <= 0: print("Zero/unavailable balance. Abort."); return
+    acc_bal = get_account_balance(client) # This function already prints balance
+    if acc_bal <= 0: print(f"{log_prefix} Zero/unavailable balance ({acc_bal}). Abort."); return
+    print(f"{log_prefix} Account balance: {acc_bal} for position sizing.")
 
     qty = calculate_position_size(acc_bal, configs['risk_percent'], entry_p, sl_p, symbol_info)
-    if qty is None or qty <= 0: print(f"Invalid position size for {symbol}. Abort."); return
-    if round(qty, int(symbol_info['quantityPrecision'])) == 0.0: print(f"Qty for {symbol} rounds to 0. Abort."); return
+    if qty is None or qty <= 0: print(f"{log_prefix} Invalid position size ({qty}) for {symbol}. Abort."); return
+    print(f"{log_prefix} Calculated position size: {qty} for {symbol}.")
+    
+    final_qty_check = round(qty, int(symbol_info['quantityPrecision']))
+    if final_qty_check == 0.0: print(f"{log_prefix} Qty for {symbol} rounds to 0 ({final_qty_check}). Abort."); return
+    print(f"{log_prefix} Final quantity check (rounded): {final_qty_check} for {symbol}.")
 
-    print(f"Attempting {signal} {qty} {symbol} @MKT (EP:{entry_p:.4f}), SL:{sl_p:.4f}, TP:{tp_p:.4f}")
+    print(f"{log_prefix} Attempting {signal} {qty} {symbol} @MKT (EP:{entry_p:.4f}), SL:{sl_p:.4f}, TP:{tp_p:.4f}")
     entry_order = place_new_order(client, symbol_info, "BUY" if signal=="LONG" else "SELL", "MARKET", qty)
 
     if entry_order and entry_order.get('status') == 'FILLED':
+        print(f"{log_prefix} Market entry order FILLED for {symbol}. Order details: {entry_order}")
         actual_ep = float(entry_order.get('avgPrice', entry_p))
         if entry_p > 0 : # Recalculate SL/TP based on actual fill if original signal price was valid
             sl_dist_pct = abs(entry_p - sl_p) / entry_p
@@ -555,9 +605,11 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock):
             print(f"SL/TP adjusted for actual fill {actual_ep:.4f}: SL {sl_p:.4f}, TP {tp_p:.4f}")
 
         sl_ord = place_new_order(client, symbol_info, "SELL" if signal=="LONG" else "BUY", "STOP_MARKET", qty, stop_price=sl_p, reduce_only=True)
-        if not sl_ord: print(f"CRITICAL: FAILED TO PLACE SL FOR {symbol}!"); # Consider emergency close
+        if not sl_ord: print(f"{log_prefix} CRITICAL: FAILED TO PLACE SL FOR {symbol}! Order details: {sl_ord}"); # Consider emergency close
+        else: print(f"{log_prefix} SL order placed for {symbol}. Order details: {sl_ord}")
         tp_ord = place_new_order(client, symbol_info, "SELL" if signal=="LONG" else "BUY", "TAKE_PROFIT_MARKET", qty, stop_price=tp_p, reduce_only=True)
-        if not tp_ord: print(f"Warning: Failed to place TP for {symbol}.")
+        if not tp_ord: print(f"{log_prefix} Warning: Failed to place TP for {symbol}. Order details: {tp_ord}")
+        else: print(f"{log_prefix} TP order placed for {symbol}. Order details: {tp_ord}")
 
         with lock: # Final update to shared active_trades
             active_trades[symbol] = {
@@ -566,9 +618,9 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock):
                 "current_sl_price": sl_p, "current_tp_price": tp_p, "initial_sl_price": sl_p, "initial_tp_price": tp_p,
                 "quantity": qty, "side": signal, "symbol_info": symbol_info, "open_timestamp": pd.Timestamp.now(tz='UTC')
             }
-            print(f"Trade for {symbol} recorded at {active_trades[symbol]['open_timestamp']}.")
+            print(f"{log_prefix} Trade for {symbol} recorded in active_trades at {active_trades[symbol]['open_timestamp']}.")
         get_open_positions(client); get_open_orders(client, symbol)
-    else: print(f"Market order for {symbol} failed or not filled: {entry_order}")
+    else: print(f"{log_prefix} Market order for {symbol} failed or not filled: {entry_order}")
 
 def monitor_active_trades(client, configs): # Needs lock for active_trades access
     global active_trades, active_trades_lock
@@ -704,7 +756,7 @@ def trading_loop(client, configs, monitored_symbols):
 
             cycle_dur_s = time.time() - cycle_start_time
             print(f"\n--- Scan Cycle #{current_cycle_number} Completed (Runtime: {cycle_dur_s:.2f}s / {(cycle_dur_s/60):.2f}min). Waiting for {configs['loop_delay_minutes']}m... ---")
-            time.sleep(configs['loop_delay_minutes'] * 60)
+            time.sleep(configs['loop_delay_minutes'])
     finally:
         print("Shutting down thread pool executor...")
         executor.shutdown(wait=True) # Ensure all threads finish before exiting loop/program
