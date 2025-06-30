@@ -19,6 +19,11 @@ import math # For rounding, floor, ceil operations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import traceback # For more detailed error logging in threads
+import telegram # For Telegram notifications
+
+# --- Telegram Configuration ---
+TELEGRAM_BOT_TOKEN = "8184556638:AAE4cJMUf0z7yPoXd5si12SrqV_n_2k4eeQ" # As provided by user
+TELEGRAM_CHAT_ID = "7144191785" # Hardcoded as per user request
 
 # --- Configuration Defaults ---
 DEFAULT_RISK_PERCENT = 1.0       # Default account risk percentage per trade (e.g., 1.0 for 1%)
@@ -206,8 +211,69 @@ def get_user_configurations():
 
     configs["strategy_id"] = 8
     configs["strategy_name"] = "Advance EMA Cross"
+    configs["telegram_chat_id"] = TELEGRAM_CHAT_ID # Store the hardcoded chat_id in configs for consistency if needed elsewhere
+
+    # global TELEGRAM_CHAT_ID # Allow modification of global variable # No longer needed
+    # while True: # No longer needed
+    #     tg_chat_id_input = input("Enter your Telegram Chat ID (numeric, e.g., 123456789): ").strip()
+    #     if tg_chat_id_input.isdigit() or (tg_chat_id_input.startswith('-') and tg_chat_id_input[1:].isdigit()):
+    #         TELEGRAM_CHAT_ID = tg_chat_id_input
+    #         configs["telegram_chat_id"] = TELEGRAM_CHAT_ID # Store in configs as well
+    #         break
+    #     print("Invalid Telegram Chat ID. Please enter a numeric ID (can be negative for groups/channels).")
+
+    print("--- Sending Test Telegram Message ---")
+    send_test_telegram_message() # Send a test message after configuration
+
     print("--- Configuration Complete ---")
     return configs
+
+# --- Telegram Notification Functions ---
+def send_test_telegram_message():
+    """Sends a predefined test message to Telegram to verify connectivity."""
+    test_msg = "👋 *Telegram Test Message*\nConnection to bot successful! Notifications should work."
+    print("Attempting to send a test Telegram message...")
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Test Telegram message NOT sent: Bot Token or Chat ID not configured.")
+        return
+
+    try:
+        bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
+        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=test_msg, parse_mode=telegram.ParseMode.MARKDOWN)
+        print("✅ Test Telegram message sent successfully!")
+        # No need to send a success message to Telegram itself about the test, console is enough.
+    except telegram.error.TelegramError as e:
+        print(f"❌ Test Telegram message FAILED. Telegram API Error: {e}")
+    except Exception as e:
+        print(f"❌ Test Telegram message FAILED. Unexpected error: {e}")
+
+def send_telegram_message(message):
+    """
+    Sends a message to the configured Telegram chat ID using the global bot token.
+    Includes error handling for Telegram API issues.
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram Bot Token or Chat ID not configured. Skipping message.")
+        return
+
+    try:
+        bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
+        # Split message if it's too long for Telegram (4096 chars limit)
+        max_length = 4096
+        if len(message) > max_length:
+            print(f"Original message length {len(message)} exceeds Telegram limit. Splitting.")
+            parts = [message[i:i+max_length] for i in range(0, len(message), max_length)]
+            for i, part in enumerate(parts):
+                print(f"Sending part {i+1}/{len(parts)} to Telegram...")
+                bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=part, parse_mode=telegram.ParseMode.MARKDOWN)
+                time.sleep(0.5) # Small delay between parts
+        else:
+            bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode=telegram.ParseMode.MARKDOWN)
+        print(f"Telegram message sent to {TELEGRAM_CHAT_ID}: Success")
+    except telegram.error.TelegramError as e:
+        print(f"Telegram API Error: {e}")
+    except Exception as e:
+        print(f"Failed to send Telegram message: {e}")
 
 # --- Binance API Interaction Functions (Error handling included) ---
 
@@ -296,24 +362,44 @@ def get_account_balance(client, asset="USDT"):
         return 0.0  # Return 0.0 if asset not found but call was successful
     except BinanceAPIException as e:
         if e.code == -2015:
-            print(f"Critical Error getting balance: {e}. This is likely an API key permission or IP whitelist issue.")
-            print("Please check your API key settings on Binance: ensure 'Enable Futures' is checked and your IP is whitelisted if restrictive IP access is enabled.")
+            err_msg = f"CRITICAL Binance API Error (-2015) getting balance: {e}. This is likely an API key permission or IP whitelist issue. Please check your API key settings on Binance: ensure 'Enable Futures' is checked and your IP is whitelisted if restrictive IP access is enabled."
+            print(err_msg)
+            send_telegram_message(f"🚨 *CRITICAL Binance API Error (-2015)* 🚨\n{err_msg}")
             return None # Specific indicator for critical auth/IP error
         else:
-            print(f"API Error getting balance: {e}")
+            err_msg = f"API Error getting balance: {e}"
+            print(err_msg)
+            send_telegram_message(f"⚠️ *API Error getting balance*\n{err_msg}")
             return 0.0 # For other API errors, return 0.0 to indicate balance couldn't be fetched but not necessarily critical auth
     except Exception as e:
-        print(f"Unexpected error getting balance: {e}")
+        err_msg = f"Unexpected error getting balance: {e}"
+        print(err_msg)
+        send_telegram_message(f"⚠️ *Unexpected error getting balance*\n{err_msg}")
         return 0.0 # For non-API unexpected errors
 
-def get_open_positions(client):
+def get_open_positions(client, return_formatted_string=False):
+    """
+    Fetches open positions.
+    If return_formatted_string is True, returns a string summary, else list of position dicts.
+    """
     try:
         positions = [p for p in client.futures_position_information() if float(p.get('positionAmt',0)) != 0]
-        if not positions: print("No open positions."); return []
-        print("Current Open Positions:")
-        for p in positions: print(f"  {p['symbol']}: Amt={p['positionAmt']}, Entry={p['entryPrice']}, PnL={p['unRealizedProfit']}")
-        return positions
-    except Exception as e: print(f"Error getting positions: {e}"); return []
+        if not positions:
+            print("No open positions.")
+            return "No open positions." if return_formatted_string else []
+        
+        if return_formatted_string:
+            pos_strings = [f"  - `{p['symbol']}`: Qty `{p['positionAmt']}`, Entry `{float(p['entryPrice']):.4f}`, PnL `{float(p['unRealizedProfit']):.2f}` USDT" for p in positions]
+            return "📊 *Current Open Positions:*\n" + "\n".join(pos_strings)
+        else:
+            print("Current Open Positions:")
+            for p in positions: print(f"  {p['symbol']}: Amt={p['positionAmt']}, Entry={p['entryPrice']}, PnL={p['unRealizedProfit']}")
+            return positions
+    except Exception as e:
+        err_msg = f"Error getting positions: {e}"
+        print(err_msg)
+        send_telegram_message(f"⚠️ *Error getting open positions*\n{err_msg}")
+        return "Error fetching positions." if return_formatted_string else []
 
 def get_open_orders(client, symbol=None):
     try:
@@ -350,7 +436,21 @@ def place_new_order(client, symbol_info, side, order_type, quantity, price=None,
         order = client.futures_create_order(**params)
         print(f"Order PLACED: {order['symbol']} ID {order['orderId']} {order['side']} {order['type']} {order['origQty']} @ {order.get('price','MARKET')} SP:{order.get('stopPrice','N/A')} AvgP:{order.get('avgPrice','N/A')} Status:{order['status']}")
         return order
-    except Exception as e: print(f"ORDER FAILED for {symbol} {side} {quantity} {order_type}: {e}"); return None
+    except BinanceOrderException as boe:
+        err_msg = f"ORDER FAILED (BinanceOrderException) for {symbol} {side} {quantity} {order_type}: {boe}"
+        print(err_msg)
+        send_telegram_message(f"🛑 *Order Placement Failed (BinanceOrderException)* 🛑\nSymbol: `{symbol}`\nSide: `{side}`\nType: `{order_type}`\nQty: `{quantity}`\nReason: _{boe}_")
+        return None
+    except BinanceAPIException as bae:
+        err_msg = f"ORDER FAILED (BinanceAPIException) for {symbol} {side} {quantity} {order_type}: {bae}"
+        print(err_msg)
+        send_telegram_message(f"🛑 *Order Placement Failed (BinanceAPIException)* 🛑\nSymbol: `{symbol}`\nSide: `{side}`\nType: `{order_type}`\nQty: `{quantity}`\nReason: _{bae}_")
+        return None
+    except Exception as e:
+        err_msg = f"ORDER FAILED (Exception) for {symbol} {side} {quantity} {order_type}: {e}"
+        print(err_msg)
+        send_telegram_message(f"🛑 *Order Placement Failed (Exception)* 🛑\nSymbol: `{symbol}`\nSide: `{side}`\nType: `{order_type}`\nQty: `{quantity}`\nReason: _{e}_")
+        return None
 
 # --- Indicator, Strategy, SL/TP, Sizing ---
 def calculate_ema(df, period, column='close'):
@@ -588,6 +688,7 @@ def process_symbol_task(symbol, client, configs, lock):
     except Exception as e:
         print(f"[{thread_name}] ERROR processing {symbol}: {e} {format_elapsed_time(cycle_start_ref)}")
         traceback.print_exc() # Print full traceback for thread errors
+        send_telegram_message(f"🧵 *Error in thread processing {symbol}* 🔩\n_{e}_")
         return f"{symbol}: Error - {e}"
 
 def manage_trade_entry(client, configs, symbol, klines_df, lock):
@@ -702,8 +803,27 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock):
                 "quantity": qty, "side": signal, "symbol_info": symbol_info, "open_timestamp": pd.Timestamp.now(tz='UTC')
             }
             print(f"{log_prefix} Trade for {symbol} recorded in active_trades at {active_trades[symbol]['open_timestamp']}.")
-        get_open_positions(client); get_open_orders(client, symbol)
-    else: print(f"{log_prefix} Market order for {symbol} failed or not filled: {entry_order}")
+        
+        # Telegram Notification for New Trade
+        current_bal_for_msg = get_account_balance(client) # Fetch current balance
+        open_positions_str = get_open_positions(client, return_formatted_string=True) # Fetch formatted open positions
+        trade_msg = (
+            f"🚀 *New Trade Opened: {signal} {symbol}*\n\n"
+            f"Quantity: `{qty}`\n"
+            f"Entry Price: `{actual_ep:.{symbol_info['pricePrecision']}f}`\n"
+            f"Stop Loss: `{sl_p:.{symbol_info['pricePrecision']}f}`\n"
+            f"Take Profit: `{tp_p:.{symbol_info['pricePrecision']}f}`\n\n"
+            f"💰 Current Account Balance: `{current_bal_for_msg:.2f}` USDT\n\n"
+            f"{open_positions_str}"
+        )
+        send_telegram_message(trade_msg)
+        # End Telegram Notification
+
+        get_open_positions(client); get_open_orders(client, symbol) # Original logging
+    else:
+        err_msg_order_fail = f"{log_prefix} Market order for {symbol} failed or not filled: {entry_order}"
+        print(err_msg_order_fail)
+        send_telegram_message(f"⚠️ *Market Order Not Filled or Failed*\n{err_msg_order_fail}")
 
 def monitor_active_trades(client, configs): # Needs lock for active_trades access
     global active_trades, active_trades_lock
@@ -796,62 +916,79 @@ def monitor_active_trades(client, configs): # Needs lock for active_trades acces
 
 def trading_loop(client, configs, monitored_symbols):
     print("\n--- Starting Trading Loop ---")
-    if not monitored_symbols: print("No symbols to monitor. Exiting."); return
+    if not monitored_symbols:
+        print("No symbols to monitor. Exiting.")
+        send_telegram_message("ℹ️ Trading loop not started: No symbols to monitor.")
+        return
     print(f"Monitoring {len(monitored_symbols)} symbols. Examples: {monitored_symbols[:5]}")
 
-    current_cycle_number = 0
+    scan_cycle_counter = 0 # Renamed from current_cycle_number for clarity with Telegram feature
     executor = ThreadPoolExecutor(max_workers=configs.get('max_scan_threads', DEFAULT_MAX_SCAN_THREADS))
     
     try:
         while True:
-            current_cycle_number += 1
+            scan_cycle_counter += 1
             cycle_start_time = time.time()
             configs['cycle_start_time_ref'] = cycle_start_time # For threads to use consistent base
             iter_ts = pd.Timestamp.now(tz='UTC').strftime('%Y-%m-%d %H:%M:%S UTC')
-            print(f"\n--- Starting Scan Cycle #{current_cycle_number}: {iter_ts} {format_elapsed_time(cycle_start_time)} ---")
+            print(f"\n--- Starting Scan Cycle #{scan_cycle_counter}: {iter_ts} {format_elapsed_time(cycle_start_time)} ---")
 
             try:
-                print(f"Fetching account status... {format_elapsed_time(cycle_start_time)}")
-                # Ensure client_obj is used here if that's the correct variable name passed to trading_loop
-                # Assuming 'client' is the parameter name for trading_loop, which holds client_obj from main()
-                current_cycle_balance = get_account_balance(client) 
-
+                current_cycle_balance = get_account_balance(client)
                 if configs['mode'] == 'live' and current_cycle_balance is None:
-                    print("CRITICAL: Account balance could not be fetched due to API key/permission error during trading loop.")
-                    print("This indicates a potential issue like changed IP whitelist or revoked API key permissions.")
-                    print("Stopping live trading to prevent further issues.")
-                    break # Exit the while True loop of trading_loop
+                    # Error already sent by get_account_balance if critical
+                    print("CRITICAL: Account balance fetch failed (API key/permission issue likely). Stopping live trading.")
+                    send_telegram_message("🛑 *CRITICAL: Bot stopping due to balance fetch failure (API key/permission issue likely)*")
+                    break 
 
-                get_open_positions(client)
-                print(f"Account status updated. {format_elapsed_time(cycle_start_time)}")
+                open_positions_summary = get_open_positions(client, return_formatted_string=False) # Get list for local print
+                # For Telegram, it will be fetched again if needed or use a formatted string from get_open_positions
+
+                print(f"Account status updated. Balance: {current_cycle_balance} {format_elapsed_time(cycle_start_time)}")
+
+                # Periodic Telegram Update (every 30 scan loops)
+                if scan_cycle_counter % 30 == 0:
+                    balance_for_tg = get_account_balance(client) # Re-fetch for freshness
+                    positions_str_for_tg = get_open_positions(client, return_formatted_string=True)
+                    periodic_update_msg = (
+                        f"🔄 *Periodic Update (Scan Cycle #{scan_cycle_counter})*\n\n"
+                        f"💰 Account Balance: `{balance_for_tg:.2f}` USDT\n\n"
+                        f"{positions_str_for_tg}"
+                    )
+                    send_telegram_message(periodic_update_msg)
 
                 futures = []
-                print(f"Submitting {len(monitored_symbols)} symbol tasks to {configs.get('max_scan_threads')} threads... {format_elapsed_time(cycle_start_time)}")
+                # print(f"Submitting {len(monitored_symbols)} symbol tasks to {configs.get('max_scan_threads')} threads... {format_elapsed_time(cycle_start_time)}")
                 for symbol in monitored_symbols:
                     futures.append(executor.submit(process_symbol_task, symbol, client, configs, active_trades_lock))
                 
                 processed_count = 0
                 for future in as_completed(futures):
-                    try: result = future.result(); # print(f"Task result: {result}") # Optional: log task result
-                    except Exception as e_future: print(f"Task error: {e_future}")
+                    try: result = future.result(); # print(f"Task result: {result}")
+                    except Exception as e_future: print(f"Task error from future: {e_future}") # Error in thread already sent TG message
                     processed_count += 1
-                    if processed_count % (len(monitored_symbols)//5 or 1) == 0 or processed_count == len(monitored_symbols): # Log progress periodically
-                         print(f"Symbol tasks progress: {processed_count}/{len(monitored_symbols)} completed. {format_elapsed_time(cycle_start_time)}")
-                print(f"All symbol tasks completed for cycle. {format_elapsed_time(cycle_start_time)}")
+                    # if processed_count % (len(monitored_symbols)//5 or 1) == 0 or processed_count == len(monitored_symbols):
+                         # print(f"Symbol tasks progress: {processed_count}/{len(monitored_symbols)} completed. {format_elapsed_time(cycle_start_time)}")
+                # print(f"All symbol tasks completed for cycle. {format_elapsed_time(cycle_start_time)}")
 
                 monitor_active_trades(client, configs) # Monitor after scan
-                print(f"Active trades monitoring complete. {format_elapsed_time(cycle_start_time)}")
+                # print(f"Active trades monitoring complete. {format_elapsed_time(cycle_start_time)}")
 
-            except Exception as loop_err: # Catch errors within the try block of the loop
-                print(f"ERROR in trading loop cycle: {loop_err} {format_elapsed_time(cycle_start_time)}")
+            except Exception as loop_err:
+                err_msg_loop = f"ERROR in trading loop cycle #{scan_cycle_counter}: {loop_err}"
+                print(err_msg_loop)
                 traceback.print_exc()
+                send_telegram_message(f"🔥 *Major Error in Trading Loop Cycle #{scan_cycle_counter}*\n_{loop_err}_")
 
             cycle_dur_s = time.time() - cycle_start_time
-            print(f"\n--- Scan Cycle #{current_cycle_number} Completed (Runtime: {cycle_dur_s:.2f}s / {(cycle_dur_s/60):.2f}min). Waiting for {configs['loop_delay_minutes']}m... ---")
-            time.sleep(configs['loop_delay_minutes'])
+            print(f"\n--- Scan Cycle #{scan_cycle_counter} Completed (Runtime: {cycle_dur_s:.2f}s / {(cycle_dur_s/60):.2f}min). Waiting for {configs['loop_delay_minutes']}m... ---")
+            time.sleep(configs['loop_delay_minutes'] * 60) # Corrected to seconds
     finally:
+        shutdown_msg = "🛑 Bot trading loop stopped."
+        print(shutdown_msg)
+        send_telegram_message(shutdown_msg)
         print("Shutting down thread pool executor...")
-        executor.shutdown(wait=True) # Ensure all threads finish before exiting loop/program
+        executor.shutdown(wait=True) 
         print("Thread pool executor shut down.")
 
 
@@ -870,53 +1007,92 @@ def main():
     env_for_msg = client_connection_details[1]
     server_time_obj = client_connection_details[2]
     
-    if not client_obj: # Check if the actual client object is None
-        # Error messages are printed by initialize_binance_client already
-        print("Exiting: Binance client init failed.") 
+    if not client_obj:
+        fail_msg = "Exiting: Binance client initialization failed."
+        print(fail_msg)
+        # initialize_binance_client would have printed specific errors.
+        # Send a general Telegram message for this case.
+        send_telegram_message(f"☠️ *Bot FATAL ERROR*: Binance client initialization failed. Check console logs for details.")
         sys.exit(1)
 
     # Now use client_obj for operations
     print("\nFetching initial account balance...")
-    initial_balance = get_account_balance(client_obj) # Use the actual client object
+    initial_balance = get_account_balance(client_obj) 
 
     if configs['mode'] == 'live' and initial_balance is None:
-        # get_account_balance already printed a detailed error for critical issues (like -2015)
-        print("Exiting: Cannot proceed with live trading due to critical error in fetching account balance (e.g., API key permissions or IP whitelist).")
-        print("Please check the error messages above and verify your API key configuration on Binance.")
+        # get_account_balance would have already sent a Telegram message for critical -2015 error.
+        crit_msg = "Exiting: Cannot proceed with live trading due to critical error in fetching account balance."
+        print(crit_msg)
+        # A more specific message is sent by get_account_balance for -2015.
+        # If it's None for other reasons, this generic one is fine.
+        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID: # Check if TG is configured
+             send_telegram_message(f"🛑 *Bot Start Aborted*: Critical error fetching initial account balance. Bot cannot start.")
         sys.exit(1)
     
-    if initial_balance == 0.0 and configs.get("environment") == "mainnet": # This check is fine, but None is more critical
-        print("Warning: Initial account balance is 0.0 USDT on Mainnet. Ensure funds are available for trading.")
-        # If it was critical, the 'initial_balance is None' check above would have caught it for live mode.
-        # If it's 0.0 not due to a critical error, it's just a warning.
+    # Bot Started Notification (only if not backtesting, as TG is for live)
+    if configs['mode'] == 'live':
+        start_message = (
+            f"✅ *Trading Bot Started*\n\n"
+            f"Environment: `{configs['environment'].title()}`\n"
+            f"Mode: `{configs['mode'].title()}`\n"
+            f"Strategy: `{configs['strategy_name']} (ID: {configs['strategy_id']})`\n"
+            f"Initial Balance: `{initial_balance if initial_balance is not None else 'N/A'}` USDT\n"
+        )
+        if server_time_obj and 'serverTime' in server_time_obj:
+            start_message += f"Binance Server Time: `{pd.to_datetime(server_time_obj['serverTime'], unit='ms')} UTC`\n"
+        send_telegram_message(start_message)
         
-    # Print the success message using the unpacked env and server_time
+    if initial_balance == 0.0 and configs.get("environment") == "mainnet":
+        warn_msg = "Warning: Initial account balance is 0.0 USDT on Mainnet. Ensure funds are available."
+        print(warn_msg)
+        if configs['mode'] == 'live': send_telegram_message(f"⚠️ *Warning*: {warn_msg}")
+        
+    # Print the success message to console
     if server_time_obj and isinstance(server_time_obj, dict) and 'serverTime' in server_time_obj and env_for_msg:
         print(f"\nSuccessfully connected to Binance {env_for_msg.title()} API. Server Time: {pd.to_datetime(server_time_obj['serverTime'], unit='ms')} UTC")
-    elif env_for_msg: # If client initialized but server time fetch failed or env_for_msg is None (should be rare)
+    elif env_for_msg:
         print(f"\nSuccessfully connected to Binance {env_for_msg.title()} API. (Server time not fully available)")
-    else: # Fallback if client_obj is somehow valid but other details are not
+    else:
         print(f"\nSuccessfully connected to Binance API. (Connection details partially unavailable)")
 
     configs.setdefault("api_delay_short", 1) 
-    configs.setdefault("api_delay_symbol_processing", 0.1) # Can be very short with threads
+    configs.setdefault("api_delay_symbol_processing", 0.1) 
     configs.setdefault("loop_delay_minutes", 5)
 
-    monitored_symbols = get_all_usdt_perpetual_symbols(client_obj) # Use client_obj
-    if not monitored_symbols: print("Exiting: No symbols to monitor."); sys.exit(1)
+    monitored_symbols = get_all_usdt_perpetual_symbols(client_obj)
+    if not monitored_symbols:
+        no_sym_msg = "Exiting: No symbols to monitor."
+        print(no_sym_msg)
+        if configs['mode'] == 'live': send_telegram_message(f"ℹ️ {no_sym_msg} Bot will not start trading loop.")
+        sys.exit(1)
     
-    confirm = input(f"Found {len(monitored_symbols)} USDT perpetuals. Monitor all for {'live trading' if configs['mode'] == 'live' else 'backtesting'}? (yes/no) [yes]: ").lower().strip()
-    if confirm == 'no': print("Exiting by user choice."); sys.exit(0)
+    confirm_msg = f"Found {len(monitored_symbols)} USDT perpetuals. Monitor all for {'live trading' if configs['mode'] == 'live' else 'backtesting'}? (yes/no) [yes]: "
+    confirm = input(confirm_msg).lower().strip()
+    if confirm == 'no':
+        exit_choice_msg = "Exiting by user choice."
+        print(exit_choice_msg)
+        if configs['mode'] == 'live': send_telegram_message(f"ℹ️ {exit_choice_msg} Bot will not start.")
+        sys.exit(0)
 
     if configs["mode"] == "live":
         try:
-            trading_loop(client_obj, configs, monitored_symbols) # Use client_obj
-        except KeyboardInterrupt: print("\nBot stopped by user (Ctrl+C).")
-        except Exception as e: print(f"\nCRITICAL UNEXPECTED ERROR IN LIVE TRADING: {e}"); traceback.print_exc()
+            trading_loop(client_obj, configs, monitored_symbols)
+        except KeyboardInterrupt:
+            kb_msg = "\nBot stopped by user (Ctrl+C)."
+            print(kb_msg)
+            send_telegram_message(f"⌨️ {kb_msg}")
+        except Exception as e:
+            crit_err_msg = f"\nCRITICAL UNEXPECTED ERROR IN LIVE TRADING: {e}"
+            print(crit_err_msg)
+            traceback.print_exc()
+            send_telegram_message(f"💥 *CRITICAL UNEXPECTED ERROR IN LIVE TRADING (MAIN)* 💥\n{e}\nSee console for traceback.")
         finally:
             print("\n--- Live Trading Bot Shutting Down ---")
-            if client_obj and active_trades: # Use client_obj
+            # The trading_loop's finally block already sends "Bot trading loop stopped."
+            # This is for the overall shutdown.
+            if client_obj and active_trades: 
                 print(f"Cancelling {len(active_trades)} bot-managed active SL/TP orders...")
+                # Order cancellation logic... (no specific TG message per order cancellation needed unless it fails)
                 with active_trades_lock:
                     for symbol, trade_details in list(active_trades.items()):
                         for oid_key in ['sl_order_id', 'tp_order_id']:
@@ -924,9 +1100,14 @@ def main():
                             if oid:
                                 try:
                                     print(f"Cancelling {oid_key} {oid} for {symbol}...")
-                                    client_obj.futures_cancel_order(symbol=symbol, orderId=oid) # Use client_obj
-                                except Exception as e_c: print(f"Failed to cancel {oid_key} {oid} for {symbol}: {e_c}")
-            print("Live Bot shutdown sequence complete.")
+                                    client_obj.futures_cancel_order(symbol=symbol, orderId=oid)
+                                except Exception as e_c: 
+                                    cancel_fail_msg = f"Failed to cancel {oid_key} {oid} for {symbol}: {e_c}"
+                                    print(cancel_fail_msg)
+                                    send_telegram_message(f"⚠️ *Order Cancel Fail on Shutdown*: {cancel_fail_msg}")
+            shutdown_final_msg = "💤 Live Bot shutdown sequence complete."
+            print(shutdown_final_msg)
+            send_telegram_message(shutdown_final_msg)
     elif configs["mode"] == "backtest":
         try:
             # Pass client_obj to backtesting_loop; it might also be used for initializing backtest env
