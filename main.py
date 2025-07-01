@@ -924,26 +924,78 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock):
         if symbol in active_trades and active_trades[symbol]:
             existing_details = active_trades[symbol]
             open_ts = existing_details.get('open_timestamp')
-            if open_ts and isinstance(open_ts, pd.Timestamp):
-                # Check if the existing trade for the same symbol is less than 1 hour old.
-                if (pd.Timestamp.now(tz='UTC') - open_ts).total_seconds() < 3600: # Less than 1 hour (exclusive of 1 hour itself)
-                    print(f"New signal for {symbol} IGNORED. Existing trade is less than 1 hour old ({open_ts}).")
-                    return
-                # If the trade is 1 hour old or older, proceed to process it as a potential replacement.
-                print(f"Existing trade for {symbol} is 1hr old or older. Processing new signal, cancelling old SL/TP.")
-                was_existing_trade = True
-                for oid_key in ['sl_order_id', 'tp_order_id']:
-                    oid = existing_details.get(oid_key)
-                    if oid:
-                        try: client.futures_cancel_order(symbol=symbol, orderId=oid)
-                        except BinanceAPIException as e:
-                            if e.code != -2011: print(f"ERROR cancelling old {oid_key} {oid} for {symbol}: {e}"); return
-                            else: print(f"Old {oid_key} {oid} for {symbol} already gone.")
-                        except Exception as e: print(f"ERROR cancelling old {oid_key} {oid} for {symbol}: {e}"); return
-            else: 
-                print(f"Warning: {symbol} in active_trades but no valid open_timestamp.")
+            existing_signal = existing_details.get('side')  # "LONG" or "SHORT"
+
+            # Check for invalid timestamp
+            if not open_ts or not isinstance(open_ts, pd.Timestamp):
+                print(f"CRITICAL ERROR: {symbol} has invalid/missing 'open_timestamp'. Skipping trade.")
+                if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+                    send_telegram_message(
+                        configs["telegram_bot_token"], configs["telegram_chat_id"],
+                        f"🆘 BOT ALERT: Symbol `{symbol}` has no valid `open_timestamp`. Skipping trade to avoid duplicates."
+                    )
+                return
+
+            # Check if same signal within cooldown window (1 hour)
+            time_since_last_trade = (pd.Timestamp.now(tz='UTC') - open_ts).total_seconds()
+            if time_since_last_trade < 3600 and existing_signal == signal:
+                print(f"Duplicate {signal} signal for {symbol} IGNORED. Last same-side trade was {time_since_last_trade:.0f}s ago at {open_ts}.")
+                return
+
+            # Proceed to replace if older than 1 hour or signal direction changed
+            print(f"Trade for {symbol} is eligible for replacement (age: {time_since_last_trade:.0f}s, previous: {existing_signal}, new: {signal}). Cancelling old SL/TP.")
+            was_existing_trade = True
+            for oid_key in ['sl_order_id', 'tp_order_id']:
+                oid = existing_details.get(oid_key)
+                if oid:
+                    try:
+                        client.futures_cancel_order(symbol=symbol, orderId=oid)
+                    except BinanceAPIException as e:
+                        if e.code != -2011:
+                            print(f"ERROR cancelling old {oid_key} {oid} for {symbol}: {e}")
+                            return
+                        else:
+                            print(f"Old {oid_key} {oid} for {symbol} already gone.")
+                    except Exception as e:
+                        print(f"ERROR cancelling old {oid_key} {oid} for {symbol}: {e}")
+                        return
+
+            # First, check if the timestamp is valid.
+            if not open_ts or not isinstance(open_ts, pd.Timestamp):
+                # CRITICAL: Symbol is in active_trades but has an invalid or missing open_timestamp.
+                # This prevents proper cooldown checks and could lead to re-trading.
+                print(f"CRITICAL ERROR: {symbol} found in active_trades but has an invalid/missing 'open_timestamp': {open_ts}. Skipping trade processing for this symbol to prevent re-trading.")
+                # Send a Telegram alert about this inconsistent state
+                if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+                    error_message = (
+                        f"🆘 BOT ALERT: Invalid Timestamp 🆘\n\n"
+                        f"Symbol: `{symbol}` is in `active_trades` but has a problematic `open_timestamp`.\n"
+                        f"Value: `{open_ts}`\n"
+                        f"This trade will be skipped in the current cycle to prevent errors or duplicate trades.\n"
+                        f"Please investigate `active_trades` state if this persists."
+                    )
+                    send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], error_message)
+                return # Exit to prevent re-trading due to inconsistent state
+            
+            # Timestamp is valid, proceed with 1-hour cooldown check
+            if (pd.Timestamp.now(tz='UTC') - open_ts).total_seconds() < 3600: # Less than 1 hour
+                print(f"New signal for {symbol} IGNORED. Existing trade is less than 1 hour old ({open_ts}).")
+                return
+            
+            # If the trade is 1 hour old or older, proceed to process it as a potential replacement.
+            print(f"Existing trade for {symbol} is 1hr old or older. Processing new signal, cancelling old SL/TP.")
+            was_existing_trade = True # Mark that we are intending to replace an existing trade
+            for oid_key in ['sl_order_id', 'tp_order_id']:
+                oid = existing_details.get(oid_key)
+                if oid:
+                    try: client.futures_cancel_order(symbol=symbol, orderId=oid)
+                    except BinanceAPIException as e:
+                        if e.code != -2011: print(f"ERROR cancelling old {oid_key} {oid} for {symbol}: {e}"); return # Return if cancel fails critically
+                        else: print(f"Old {oid_key} {oid} for {symbol} already gone.")
+                    except Exception as e: print(f"ERROR cancelling old {oid_key} {oid} for {symbol}: {e}"); return # Return on other cancel errors
         
-        # Max concurrent position check - only if it's a truly new symbol slot
+        # Max concurrent position check.
+        # This applies if 'was_existing_trade' is False (i.e., it's a new symbol, not a replacement)
         if not was_existing_trade and len(active_trades) >= configs["max_concurrent_positions"]:
             print(f"Max concurrent positions ({configs['max_concurrent_positions']}) reached. Cannot open for new symbol {symbol}.")
             return
@@ -1081,68 +1133,35 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock):
         }
         print(f"{log_prefix} Trade for {symbol} recorded in active_trades at {active_trades[symbol]['open_timestamp']}.")
     
-    # Send Telegram notification based on SL/TP placement success
+    # Send Telegram notification for new trade
     if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
         current_balance_for_msg = get_account_balance(client, configs)
         if current_balance_for_msg is None: current_balance_for_msg = "N/A (Error)"
         else: current_balance_for_msg = f"{current_balance_for_msg:.2f}"
 
+        # Build symbol_info_map from the current state of active_trades
+        # Lock active_trades when reading it to build the map
         with active_trades_lock:
-            s_info_map_for_trade_msg = _build_symbol_info_map_from_active_trades(active_trades)
-            current_active_trades_copy = active_trades.copy()
-        open_positions_str = get_open_positions(client, format_for_telegram=True, active_trades_data=current_active_trades_copy, symbol_info_map=s_info_map_for_trade_msg)
+            s_info_map_for_new_trade_msg = _build_symbol_info_map_from_active_trades(active_trades)
+        open_positions_str = get_open_positions(client, format_for_telegram=True, active_trades_data=active_trades.copy(), symbol_info_map=s_info_map_for_new_trade_msg)
 
+        # Ensure symbol_info is available for precision in the message
         qty_prec_msg = symbol_info.get('quantityPrecision', 0) if symbol_info else 0
         price_prec_msg = symbol_info.get('pricePrecision', 2) if symbol_info else 2
 
-        base_message_details = (
+        new_trade_message = (
+            f"🚀 NEW TRADE PLACED 🚀\n\n"
             f"Symbol: {symbol}\n"
             f"Side: {signal}\n"
             f"Quantity: {qty_to_order:.{qty_prec_msg}f}\n"
             f"Entry Price: {actual_ep:.{price_prec_msg}f}\n"
-            f"Target SL: {sl_p:.{price_prec_msg}f}\n"
-            f"Target TP: {tp_p:.{price_prec_msg}f}\n"
+            f"SL: {sl_p:.{price_prec_msg}f}\n"
+            f"TP: {tp_p:.{price_prec_msg}f}\n\n"
+            f"💰 Account Balance: {current_balance_for_msg} USDT\n"
+            f"📊 Current Open Positions:\n{open_positions_str}"
         )
-
-        final_message = ""
-        log_msg_suffix = ""
-
-        if sl_ord: # SL order placed successfully
-            if tp_ord: # TP order also placed successfully
-                final_message = (
-                    f"🚀 NEW TRADE PLACED SUCCESSFULLY 🚀\n\n"
-                    f"{base_message_details}\n"
-                    f"SL Order ID: {sl_ord.get('orderId', 'N/A')}\n"
-                    f"TP Order ID: {tp_ord.get('orderId', 'N/A')}\n\n"
-                    f"💰 Account Balance: {current_balance_for_msg} USDT\n"
-                    f"📊 Current Open Positions:\n{open_positions_str}"
-                )
-                log_msg_suffix = "New trade fully placed notification sent."
-            else: # SL success, TP failed
-                final_message = (
-                    f"⚠️ NEW TRADE PLACED - TP ORDER FAILED ⚠️\n\n"
-                    f"{base_message_details}\n"
-                    f"SL Order ID: {sl_ord.get('orderId', 'N/A')}\n"
-                    f"TP Order: FAILED TO PLACE\n\n"
-                    f"The trade is active with a Stop Loss. Please monitor manually if TP is desired.\n\n"
-                    f"💰 Account Balance: {current_balance_for_msg} USDT\n"
-                    f"📊 Current Open Positions:\n{open_positions_str}"
-                )
-                log_msg_suffix = "New trade placed (TP FAILED) notification sent."
-        else: # SL order FAILED (critical)
-            final_message = (
-                f"🆘 CRITICAL: SL ORDER FAILED FOR NEW POSITION 🆘\n\n"
-                f"{base_message_details}\n"
-                f"ENTRY ORDER FILLED, BUT STOP LOSS ORDER FAILED TO PLACE.\n"
-                f"MANUAL INTERVENTION REQUIRED IMMEDIATELY TO MANAGE RISK FOR SYMBOL {symbol}.\n"
-                f"TP Order Status: {'Placed with ID ' + tp_ord.get('orderId', 'N/A') if tp_ord else 'Also Failed or Not Attempted'}\n\n"
-                f"💰 Account Balance: {current_balance_for_msg} USDT\n"
-                f"📊 Current Open Positions:\n{open_positions_str}"
-            )
-            log_msg_suffix = "CRITICAL SL FAILURE notification sent."
-
-        send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], final_message)
-        print(f"{log_prefix} {log_msg_suffix} for {symbol}.")
+        send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], new_trade_message)
+        print(f"{log_prefix} New trade Telegram notification sent for {symbol}.")
 
     get_open_positions(client); get_open_orders(client, symbol) # Original console logging calls
 # The `else` part for failed market order was removed as the rejection path now includes a `return`.
@@ -1367,8 +1386,8 @@ def trading_loop(client, configs, monitored_symbols):
                 else:
                     print("Telegram not configured, skipping status update message.")
 
-            print(f"Waiting for {configs['loop_delay_minutes']}m...")
-            time.sleep(configs['loop_delay_minutes'])
+            print(f"Waiting for {configs['loop_delay_minutes'] * 60} m...")
+            time.sleep(configs['loop_delay_minutes'] * 60)
     finally:
         print("Shutting down thread pool executor...")
         executor.shutdown(wait=True) # Ensure all threads finish before exiting loop/program
