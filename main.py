@@ -1079,16 +1079,32 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is
         # We first check general cooldown, then calculate signal, then check active_trades.
 
         # --- Symbol Cooldown Check (1-hour cooldown after a trade) ---
+        COOLDOWN_PERIOD_SECONDS = 3600 
         with symbol_last_trade_time_lock: 
             last_trade_ts = symbol_last_trade_time.get(symbol)
+            # DEBUG LOGGING START
+            if symbol == "DOGSUSDT": # Replace "DOGSUSDT" with a symbol you are actively testing if needed
+                print(f"{log_prefix} DEBUG_COOLDOWN: Checking '{symbol}'. Found last_trade_ts in symbol_last_trade_time: {last_trade_ts} (Type: {type(last_trade_ts)})")
+            # DEBUG LOGGING END
         
         if last_trade_ts:
             time_since_last_trade_seconds = (pd.Timestamp.now(tz='UTC') - last_trade_ts).total_seconds()
-            COOLDOWN_PERIOD_SECONDS = 3600 
+            # DEBUG LOGGING START
+            if symbol == "DOGSUSDT": # Replace "DOGSUSDT"
+                 print(f"{log_prefix} DEBUG_COOLDOWN: '{symbol}' last_trade_ts is valid. Time since: {time_since_last_trade_seconds:.2f}s. COOLDOWN_PERIOD_SECONDS: {COOLDOWN_PERIOD_SECONDS}")
+            # DEBUG LOGGING END
             if time_since_last_trade_seconds < COOLDOWN_PERIOD_SECONDS:
                 print(f"{log_prefix} Symbol is on 1-hour cooldown. Last trade was {time_since_last_trade_seconds:.0f}s ago. "
                       f"Remaining cooldown: {COOLDOWN_PERIOD_SECONDS - time_since_last_trade_seconds:.0f}s. Signal ignored.")
                 return # Exit if symbol is on cooldown, finally block will release processing lock
+            # DEBUG LOGGING START
+            elif symbol == "DOGSUSDT": # Replace "DOGSUSDT"
+                 print(f"{log_prefix} DEBUG_COOLDOWN: '{symbol}' Cooldown check PASSED (trade is older than 1hr or no valid last_trade_ts). Proceeding.")
+            # DEBUG LOGGING END
+        # DEBUG LOGGING START
+        elif symbol == "DOGSUSDT": # Replace "DOGSUSDT" - Only log if last_trade_ts was None initially
+            print(f"{log_prefix} DEBUG_COOLDOWN: '{symbol}' No last_trade_ts found in symbol_last_trade_time. Proceeding as if no cooldown.")
+        # DEBUG LOGGING END
 
         # Initial check for sufficient kline data 
         if klines_df.empty or len(klines_df) < 202: 
@@ -1124,101 +1140,86 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is
             # No trade rejection notification here specifically, as check_ema_crossover_conditions logs reasons for non-actionable signals.
             return # Exit manage_trade_entry if no valid LONG/SHORT signal
 
-        # Initialize variables that might be conditionally assigned within the 'with lock' block
-        open_ts = None
-        existing_signal_side = None
+        # Initialize variables
+        open_ts = None # Will hold the timestamp of an existing trade if found
+        existing_signal_side = None # Will hold the side of an existing trade if found
         # was_existing_trade is already initialized to False at the start of the function.
 
-        # Now, handle active_trades with the new_signal
+        # Now, handle active_trades logic
         with lock: # This is active_trades_lock (passed as 'lock' argument)
             if symbol in active_trades and active_trades[symbol]:
+                # Symbol IS in active_trades. This means we are dealing with an existing trade.
                 existing_details = active_trades[symbol]
                 open_ts = existing_details.get('open_timestamp')
-                existing_signal_side = existing_details.get('side') 
+                existing_signal_side = existing_details.get('side')
 
+                # Validate the timestamp of the existing trade
                 if not open_ts or not isinstance(open_ts, pd.Timestamp):
-                    print(f"{log_prefix} DEBUG: Problematic existing_details for {symbol}: {existing_details}") # LOGGING C
-                    error_msg = f"CRITICAL ERROR: {symbol} has invalid/missing 'open_timestamp' (type: {type(open_ts)}, value: '{open_ts}'). Skipping trade."
-                    print(error_msg)
-                    try:
-                        if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
-                            send_telegram_message(
-                                configs["telegram_bot_token"], configs["telegram_chat_id"],
-                                f"🆘 BOT ALERT: Symbol `{symbol}` has invalid `open_timestamp`. Type: {type(open_ts)}. Value: `{open_ts}`. Skipping."
-                            )
-                    except Exception as tel_ex:
-                        print(f"Error sending Telegram notification for invalid open_ts for {symbol}: {tel_ex}")
-                    return # Crucial: ensure return happens if open_ts is invalid
+                    print(f"{log_prefix} DEBUG: Problematic existing_details for {symbol}: {existing_details}")
+                    error_msg = (f"🆘 BOT ALERT: Invalid Timestamp 🆘\n\n"
+                                 f"Symbol: `{symbol}` is in `active_trades` but has a problematic `open_timestamp`.\n"
+                                 f"Value: `{open_ts}` (Type: {type(open_ts)})\n"
+                                 f"This trade will be skipped in the current cycle to prevent errors or duplicate trades.\n"
+                                 f"Please investigate `active_trades` state if this persists.")
+                    print(f"{log_prefix} {error_msg.replace('`', '').replace('*', '')}") # Log without markdown for console
+                    if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+                        send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], error_msg)
+                    return # Crucial: ensure return happens if open_ts is invalid for an existing trade
 
-                # If we reach here, open_ts is a valid pd.Timestamp.
-                time_since_last_trade = (pd.Timestamp.now(tz='UTC') - open_ts).total_seconds()
+                # If we reach here, open_ts is a valid pd.Timestamp for an existing trade.
+                time_since_last_trade_seconds = (pd.Timestamp.now(tz='UTC') - open_ts).total_seconds()
+
+                # Cooldown Check 1: Duplicate signal for the same side within 1 hour
+                if time_since_last_trade_seconds < 3600 and existing_signal_side == new_signal:
+                    print(f"{log_prefix} Duplicate {new_signal} signal for {symbol} IGNORED. Last same-side trade was {time_since_last_trade_seconds:.0f}s ago at {open_ts}.")
+                    return # Exit manage_trade_entry
+
+                # Cooldown Check 2: Any new signal (even if different side) if existing trade is less than 1 hour old
+                # This is a general "don't touch for 1 hour" rule after a trade is opened/replaced.
+                if time_since_last_trade_seconds < 3600:
+                     print(f"{log_prefix} New signal ({new_signal}) for {symbol} IGNORED. Existing trade (Side: {existing_signal_side}, TS: {open_ts}) is less than 1 hour old ({time_since_last_trade_seconds:.0f}s).")
+                     return # Exit manage_trade_entry
+
+                # If we are here, the existing trade is >1hr old, or it's <1hr but the new_signal is different.
+                # The bot logic seems to imply replacement if >1hr OR if signal changes (even if <1hr, but this is covered by cooldown check 2 if it's too soon).
+                # The original code structure was a bit mixed here. Let's simplify:
+                # If an existing trade is >1hr old, it's eligible for replacement by ANY new valid signal.
+                # If an existing trade is <1hr old, NO new signal (same or different) should proceed (covered by above checks).
                 
-                # Check if same signal (new_signal) within cooldown window (1 hour)
-                if time_since_last_trade < 3600 and existing_signal_side == new_signal: # Use new_signal here
-                    print(f"Duplicate {new_signal} signal for {symbol} IGNORED. Last same-side trade was {time_since_last_trade:.0f}s ago at {open_ts}.")
-                    return
-
-                # Proceed to replace if older than 1 hour or signal direction changed
-                print(f"Trade for {symbol} is eligible for replacement (age: {time_since_last_trade:.0f}s, previous: {existing_signal_side}, new: {new_signal}). Cancelling old SL/TP.") # Use new_signal
-                was_existing_trade = True
+                # So, if we've passed the <1hr checks, it means the trade is either >1hr old,
+                # or there was some other path (which should be prevented by strict <1hr checks).
+                # Let's assume if we're here, we are clear to replace if `new_signal` is valid.
+                print(f"{log_prefix} Existing trade for {symbol} (Age: {time_since_last_trade_seconds:.0f}s, Prev Side: {existing_signal_side}, New Signal: {new_signal}) is eligible for review/replacement. Cancelling old SL/TP.")
+                was_existing_trade = True # Mark that we are intending to replace an existing trade
                 for oid_key in ['sl_order_id', 'tp_order_id']:
                     oid = existing_details.get(oid_key)
                     if oid:
                         try:
                             client.futures_cancel_order(symbol=symbol, orderId=oid)
+                            print(f"{log_prefix} Successfully cancelled old {oid_key} {oid} for {symbol}.")
                         except BinanceAPIException as e:
-                            if e.code != -2011:
-                                print(f"ERROR cancelling old {oid_key} {oid} for {symbol}: {e}")
-                                return
+                            if e.code != -2011: # -2011 is "Unknown order sent." (already filled/cancelled)
+                                print(f"{log_prefix} API ERROR cancelling old {oid_key} {oid} for {symbol}: {e}")
+                                # If cancelling orders fails for an existing trade we intend to replace,
+                                # it might be safer to return and not proceed with placing new orders.
+                                return 
                             else:
-                                print(f"Old {oid_key} {oid} for {symbol} already gone.")
+                                print(f"{log_prefix} Old {oid_key} {oid} for {symbol} was already gone or filled.")
                         except Exception as e:
-                            print(f"ERROR cancelling old {oid_key} {oid} for {symbol}: {e}")
-                            return
-
-            # First, check if the timestamp is valid.
-            # This block seems redundant or misplaced if the first check for open_ts (around line 1136) is effective.
-            # If open_ts was invalid, the function should have returned already.
-            # If this block is reached, it implies the earlier check was passed, meaning open_ts is valid.
-            # However, if this 'if' block is meant to be associated with the 'else' of 
-            # 'if symbol in active_trades and active_trades[symbol]', then its placement and condition are incorrect.
-            # For now, addressing only the indentation error. The logic of this block might need review later
-            # if errors persist around open_ts handling.
-            if not open_ts or not isinstance(open_ts, pd.Timestamp):
-                # CRITICAL: Symbol is in active_trades but has an invalid or missing open_timestamp.
-                # This prevents proper cooldown checks and could lead to re-trading.
-                print(f"CRITICAL ERROR: {symbol} found in active_trades but has an invalid/missing 'open_timestamp': {open_ts}. Skipping trade processing for this symbol to prevent re-trading.")
-                # Send a Telegram alert about this inconsistent state
-                if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
-                    error_message = (
-                        f"🆘 BOT ALERT: Invalid Timestamp 🆘\n\n"
-                        f"Symbol: `{symbol}` is in `active_trades` but has a problematic `open_timestamp`.\n"
-                        f"Value: `{open_ts}`\n"
-                        f"This trade will be skipped in the current cycle to prevent errors or duplicate trades.\n"
-                        f"Please investigate `active_trades` state if this persists."
-                    )
-                    send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], error_message)
-                return # Exit to prevent re-trading due to inconsistent state
-            
-            # Timestamp is valid, proceed with 1-hour cooldown check
-            if (pd.Timestamp.now(tz='UTC') - open_ts).total_seconds() < 3600: # Less than 1 hour
-                print(f"New signal for {symbol} IGNORED. Existing trade is less than 1 hour old ({open_ts}).")
-                return
-            
-            # If the trade is 1 hour old or older, proceed to process it as a potential replacement.
-            print(f"Existing trade for {symbol} is 1hr old or older. Processing new signal, cancelling old SL/TP.")
-            was_existing_trade = True # Mark that we are intending to replace an existing trade
-            for oid_key in ['sl_order_id', 'tp_order_id']:
-                oid = existing_details.get(oid_key)
-                if oid:
-                    try: client.futures_cancel_order(symbol=symbol, orderId=oid)
-                    except BinanceAPIException as e:
-                        if e.code != -2011: print(f"ERROR cancelling old {oid_key} {oid} for {symbol}: {e}"); return # Return if cancel fails critically
-                        else: print(f"Old {oid_key} {oid} for {symbol} already gone.")
-                    except Exception as e: print(f"ERROR cancelling old {oid_key} {oid} for {symbol}: {e}"); return # Return on other cancel errors
+                            print(f"{log_prefix} UNEXPECTED ERROR cancelling old {oid_key} {oid} for {symbol}: {e}")
+                            return # Safer to return
+            # else:
+                # Symbol was NOT in active_trades. This means it's a potential new trade.
+                # `open_ts` remains None (its initial value).
+                # `existing_signal_side` remains None.
+                # `was_existing_trade` remains False.
+                # No alert for invalid timestamp here, as there's no existing timestamp to validate.
+                # Proceed to new trade logic further down.
+                # print(f"{log_prefix} No existing trade found in active_trades for {symbol}. Will proceed as new trade if other checks pass.")
+                pass
         
         # Max concurrent position check.
-        # This applies if 'was_existing_trade' is False (i.e., it's a new symbol, not a replacement)
+        # This applies if 'was_existing_trade' is False (i.e., it's a new symbol, not a replacement for an existing one in active_trades)
         if not was_existing_trade and len(active_trades) >= configs["max_concurrent_positions"]:
             print(f"Max concurrent positions ({configs['max_concurrent_positions']}) reached. Cannot open for new symbol {symbol}.")
             return
@@ -1374,22 +1375,26 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is
         else: print(f"{log_prefix} TP order placed for {symbol}. Order details: {tp_ord}")
 
         with lock: 
-            current_pd_timestamp = pd.Timestamp.now(tz='UTC') # LOGGING A - Part 1
-            print(f"{log_prefix} DEBUG: Timestamp to be used for new trade {symbol}: {current_pd_timestamp} (Type: {type(current_pd_timestamp)})") # LOGGING A - Part 2
+                current_pd_timestamp = pd.Timestamp.now(tz='UTC') 
+                # print(f"{log_prefix} DEBUG: Timestamp to be used for new trade {symbol}: {current_pd_timestamp} (Type: {type(current_pd_timestamp)})") 
             
-            new_trade_data = {
-                "entry_order_id": entry_order['orderId'], "sl_order_id": sl_ord.get('orderId') if sl_ord else None,
-                "tp_order_id": tp_ord.get('orderId') if tp_ord else None, "entry_price": actual_ep,
-                "current_sl_price": sl_p, "current_tp_price": tp_p, "initial_sl_price": sl_p, "initial_tp_price": tp_p,
-                "quantity": qty_to_order, "side": signal, "symbol_info": symbol_info, "open_timestamp": current_pd_timestamp
-            }
-            active_trades[symbol] = new_trade_data
-            print(f"{log_prefix} DEBUG: Full active_trades entry for {symbol} after creation: {active_trades[symbol]}") # LOGGING B
-            print(f"{log_prefix} Trade for {symbol} recorded in active_trades at {active_trades[symbol]['open_timestamp']}.")
-            
-            with symbol_last_trade_time_lock:
-                symbol_last_trade_time[symbol] = active_trades[symbol]['open_timestamp'] 
-                print(f"{log_prefix} Updated last trade time for {symbol} to {symbol_last_trade_time[symbol]} for cooldown.")
+                new_trade_data = {
+                    "entry_order_id": entry_order['orderId'], "sl_order_id": sl_ord.get('orderId') if sl_ord else None,
+                    "tp_order_id": tp_ord.get('orderId') if tp_ord else None, "entry_price": actual_ep,
+                    "current_sl_price": sl_p, "current_tp_price": tp_p, "initial_sl_price": sl_p, "initial_tp_price": tp_p,
+                    "quantity": qty_to_order, "side": signal, "symbol_info": symbol_info, "open_timestamp": current_pd_timestamp
+                }
+                active_trades[symbol] = new_trade_data
+                    # print(f"{log_prefix} DEBUG: Full active_trades entry for {symbol} after creation: {active_trades[symbol]}") 
+                print(f"{log_prefix} Trade for {symbol} recorded in active_trades at {active_trades[symbol]['open_timestamp']}.")
+                
+                with symbol_last_trade_time_lock:
+                        # DEBUG LOGGING START
+                        if symbol == "DOGSUSDT": # Replace "DOGSUSDT" with the symbol you are testing
+                            print(f"{log_prefix} DEBUG_COOLDOWN: Updating symbol_last_trade_time for '{symbol}' to: {current_pd_timestamp}")
+                        # DEBUG LOGGING END
+                        symbol_last_trade_time[symbol] = current_pd_timestamp # Use current_pd_timestamp directly
+                        print(f"{log_prefix} Updated last trade time for {symbol} to {symbol_last_trade_time[symbol]} for cooldown.")
 
         if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
             current_balance_for_msg = get_account_balance(client, configs)
