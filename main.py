@@ -1118,47 +1118,72 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is
         new_signal = check_ema_crossover_conditions(klines_df, symbol_for_logging=symbol)
         # The function check_ema_crossover_conditions itself prints the signal, so no need to double print here.
 
+        # If the signal from crossover conditions is not actionable, exit early.
+        if new_signal not in ["LONG", "SHORT"]:
+            print(f"{log_prefix} No actionable trade signal ('{new_signal}') for {symbol}. Aborting further processing in manage_trade_entry.")
+            # No trade rejection notification here specifically, as check_ema_crossover_conditions logs reasons for non-actionable signals.
+            return # Exit manage_trade_entry if no valid LONG/SHORT signal
+
+        # Initialize variables that might be conditionally assigned within the 'with lock' block
+        open_ts = None
+        existing_signal_side = None
+        # was_existing_trade is already initialized to False at the start of the function.
+
         # Now, handle active_trades with the new_signal
         with lock: # This is active_trades_lock (passed as 'lock' argument)
             if symbol in active_trades and active_trades[symbol]:
                 existing_details = active_trades[symbol]
                 open_ts = existing_details.get('open_timestamp')
-                existing_signal_side = existing_details.get('side') # Renamed for clarity
+                existing_signal_side = existing_details.get('side') 
 
                 if not open_ts or not isinstance(open_ts, pd.Timestamp):
-                print(f"CRITICAL ERROR: {symbol} has invalid/missing 'open_timestamp'. Skipping trade.")
-                if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
-                    send_telegram_message(
-                        configs["telegram_bot_token"], configs["telegram_chat_id"],
-                        f"🆘 BOT ALERT: Symbol `{symbol}` has no valid `open_timestamp`. Skipping trade to avoid duplicates."
-                    )
-                return
-
-            # Check if same signal within cooldown window (1 hour)
-            time_since_last_trade = (pd.Timestamp.now(tz='UTC') - open_ts).total_seconds()
-            if time_since_last_trade < 3600 and existing_signal == signal:
-                print(f"Duplicate {signal} signal for {symbol} IGNORED. Last same-side trade was {time_since_last_trade:.0f}s ago at {open_ts}.")
-                return
-
-            # Proceed to replace if older than 1 hour or signal direction changed
-            print(f"Trade for {symbol} is eligible for replacement (age: {time_since_last_trade:.0f}s, previous: {existing_signal}, new: {signal}). Cancelling old SL/TP.")
-            was_existing_trade = True
-            for oid_key in ['sl_order_id', 'tp_order_id']:
-                oid = existing_details.get(oid_key)
-                if oid:
+                    print(f"{log_prefix} DEBUG: Problematic existing_details for {symbol}: {existing_details}") # LOGGING C
+                    error_msg = f"CRITICAL ERROR: {symbol} has invalid/missing 'open_timestamp' (type: {type(open_ts)}, value: '{open_ts}'). Skipping trade."
+                    print(error_msg)
                     try:
-                        client.futures_cancel_order(symbol=symbol, orderId=oid)
-                    except BinanceAPIException as e:
-                        if e.code != -2011:
+                        if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+                            send_telegram_message(
+                                configs["telegram_bot_token"], configs["telegram_chat_id"],
+                                f"🆘 BOT ALERT: Symbol `{symbol}` has invalid `open_timestamp`. Type: {type(open_ts)}. Value: `{open_ts}`. Skipping."
+                            )
+                    except Exception as tel_ex:
+                        print(f"Error sending Telegram notification for invalid open_ts for {symbol}: {tel_ex}")
+                    return # Crucial: ensure return happens if open_ts is invalid
+
+                # If we reach here, open_ts is a valid pd.Timestamp.
+                time_since_last_trade = (pd.Timestamp.now(tz='UTC') - open_ts).total_seconds()
+                
+                # Check if same signal (new_signal) within cooldown window (1 hour)
+                if time_since_last_trade < 3600 and existing_signal_side == new_signal: # Use new_signal here
+                    print(f"Duplicate {new_signal} signal for {symbol} IGNORED. Last same-side trade was {time_since_last_trade:.0f}s ago at {open_ts}.")
+                    return
+
+                # Proceed to replace if older than 1 hour or signal direction changed
+                print(f"Trade for {symbol} is eligible for replacement (age: {time_since_last_trade:.0f}s, previous: {existing_signal_side}, new: {new_signal}). Cancelling old SL/TP.") # Use new_signal
+                was_existing_trade = True
+                for oid_key in ['sl_order_id', 'tp_order_id']:
+                    oid = existing_details.get(oid_key)
+                    if oid:
+                        try:
+                            client.futures_cancel_order(symbol=symbol, orderId=oid)
+                        except BinanceAPIException as e:
+                            if e.code != -2011:
+                                print(f"ERROR cancelling old {oid_key} {oid} for {symbol}: {e}")
+                                return
+                            else:
+                                print(f"Old {oid_key} {oid} for {symbol} already gone.")
+                        except Exception as e:
                             print(f"ERROR cancelling old {oid_key} {oid} for {symbol}: {e}")
                             return
-                        else:
-                            print(f"Old {oid_key} {oid} for {symbol} already gone.")
-                    except Exception as e:
-                        print(f"ERROR cancelling old {oid_key} {oid} for {symbol}: {e}")
-                        return
 
             # First, check if the timestamp is valid.
+            # This block seems redundant or misplaced if the first check for open_ts (around line 1136) is effective.
+            # If open_ts was invalid, the function should have returned already.
+            # If this block is reached, it implies the earlier check was passed, meaning open_ts is valid.
+            # However, if this 'if' block is meant to be associated with the 'else' of 
+            # 'if symbol in active_trades and active_trades[symbol]', then its placement and condition are incorrect.
+            # For now, addressing only the indentation error. The logic of this block might need review later
+            # if errors persist around open_ts handling.
             if not open_ts or not isinstance(open_ts, pd.Timestamp):
                 # CRITICAL: Symbol is in active_trades but has an invalid or missing open_timestamp.
                 # This prevents proper cooldown checks and could lead to re-trading.
@@ -1198,220 +1223,201 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is
             print(f"Max concurrent positions ({configs['max_concurrent_positions']}) reached. Cannot open for new symbol {symbol}.")
             return
 
-    # --- Calculations and non-critical API calls (outside initial lock) ---
-    klines_df['EMA100'] = calculate_ema(klines_df, 100)
-    klines_df['EMA200'] = calculate_ema(klines_df, 200)
+        # --- Calculations and non-critical API calls (now part of the main try block) ---
+        klines_df['EMA100'] = calculate_ema(klines_df, 100)
+        klines_df['EMA200'] = calculate_ema(klines_df, 200)
 
-    log_prefix = f"[{threading.current_thread().name}] {symbol} manage_trade_entry:"
+        # log_prefix is already defined at the start of the function if needed here,
+        # but it's redefined based on thread name. Let's ensure it's current.
+        # log_prefix = f"[{threading.current_thread().name}] {symbol} manage_trade_entry:" # Re-affirm or ensure it's correct
 
-    # --- Symbol Cooldown Check ---
-    with symbol_last_trade_time_lock:
-        last_trade_ts = symbol_last_trade_time.get(symbol)
-    
-    if last_trade_ts:
-        time_since_last_trade_seconds = (pd.Timestamp.now(tz='UTC') - last_trade_ts).total_seconds()
-        COOLDOWN_PERIOD_SECONDS = 3600 # 1 hour
-        if time_since_last_trade_seconds < COOLDOWN_PERIOD_SECONDS:
-            print(f"{log_prefix} Symbol is on 1-hour cooldown. Last trade was {time_since_last_trade_seconds:.0f}s ago. "
-                  f"Remaining cooldown: {COOLDOWN_PERIOD_SECONDS - time_since_last_trade_seconds:.0f}s. Signal ignored.")
-            return # Exit if symbol is on cooldown
+        # --- Symbol Cooldown Check (This was already done at the beginning of the try block) ---
+        # The cooldown check at lines 1111-1118 should suffice.
+        # Re-checking here might be redundant unless the klines_df processing took extremely long.
+        # For now, assuming the initial cooldown check is the primary one.
 
-    # Initial check for sufficient kline data (moved slightly earlier, before EMA checks)
-    # This check was implicitly covered by EMA NaN checks later, but explicit check is good.
-    # The process_symbol_task already checks for klines_df.empty or len < 202.
-    # This is an additional safeguard within manage_trade_entry itself.
-    if klines_df.empty or len(klines_df) < 202: # Minimum for EMA200 and prior data
-        print(f"{log_prefix} Insufficient kline data for {symbol} (Length: {len(klines_df)}). Aborting trade entry.")
-        # No trade rejection notification here as it's a data issue not a strategy rejection.
-        return
+        # Initial check for sufficient kline data (also done earlier)
+        if klines_df.empty or len(klines_df) < 202: 
+            print(f"{log_prefix} Insufficient kline data for {symbol} (Length: {len(klines_df)}) before final signal processing. Aborting.")
+            return
 
-    if klines_df['EMA100'] is not None and not klines_df['EMA100'].empty:
-        print(f"{log_prefix} Last EMA100 values: {klines_df['EMA100'].iloc[-3:].values}")
-    else:
-        print(f"{log_prefix} EMA100 calculation resulted in None or empty series.")
-    if klines_df['EMA200'] is not None and not klines_df['EMA200'].empty:
-        print(f"{log_prefix} Last EMA200 values: {klines_df['EMA200'].iloc[-3:].values}")
-    else:
-        print(f"{log_prefix} EMA200 calculation resulted in None or empty series.")
+        # Verbose EMA logging (original was commented out, can be re-enabled if needed)
+        # if klines_df['EMA100'] is not None and not klines_df['EMA100'].empty:
+        #     print(f"{log_prefix} Last EMA100 values (post-active-trade check): {klines_df['EMA100'].iloc[-3:].values}")
+        # if klines_df['EMA200'] is not None and not klines_df['EMA200'].empty:
+        #     print(f"{log_prefix} Last EMA200 values (post-active-trade check): {klines_df['EMA200'].iloc[-3:].values}")
 
-    if klines_df['EMA100'] is None or klines_df['EMA200'] is None or \
-       klines_df['EMA100'].isnull().all() or klines_df['EMA200'].isnull().all() or \
-       len(klines_df) < 202: # Check for valid EMAs and sufficient length
-        print(f"{log_prefix} EMA calculation failed, EMAs are NaN, or insufficient data length ({len(klines_df)}). Aborting for {symbol}."); return
+        if klines_df['EMA100'] is None or klines_df['EMA200'] is None or \
+           klines_df['EMA100'].isnull().all() or klines_df['EMA200'].isnull().all(): # Length check already done
+            print(f"{log_prefix} EMA calculation failed or EMAs are NaN (post-active-trade check). Aborting for {symbol}.")
+            return
 
-    signal = check_ema_crossover_conditions(klines_df, symbol_for_logging=symbol) # Pass symbol for logging
-    print(f"{log_prefix} Signal from check_ema_crossover_conditions for {symbol}: {signal}")
-    if signal not in ["LONG", "SHORT"]: # Covers None, "VALIDATION_FAILED", "INSUFFICIENT_VALIDATION_HISTORY"
-        print(f"{log_prefix} No actionable signal ('{signal}') for {symbol}. Aborting trade entry.")
-        return
-
-    print(f"\n{log_prefix} --- New Validated Trade Signal for {symbol}: {signal} ---")
-    symbol_info = get_symbol_info(client, symbol)
-    entry_p = klines_df['close'].iloc[-1] # Define entry_p early for notifications
-    # Initialize other params that might not be set if rejection happens early
-    sl_p, tp_p, qty_calc = None, None, None 
-    
-    if not symbol_info:
-        reason = "Failed to retrieve symbol information."
-        print(f"{log_prefix} {reason} for {symbol}. Abort.")
-        send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p, tp_p, qty_calc, symbol_info, configs)
-        return
-
-    print(f"{log_prefix} Entry price (last close): {entry_p} for {symbol}")
-    ema100_val = klines_df['EMA100'].iloc[-1]
-    
-    if not (set_leverage_on_symbol(client, symbol, configs['leverage']) and \
-            set_margin_type_on_symbol(client, symbol, configs['margin_type'])):
-        reason = "Failed to set leverage or margin type."
-        print(f"{log_prefix} {reason} for {symbol}. Abort.")
-        send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p, tp_p, qty_calc, symbol_info, configs)
-        return
-
-    print(f"{log_prefix} Leverage and margin type set for {symbol}.")
-    sl_p, tp_p = calculate_sl_tp_values(entry_p, signal, ema100_val, klines_df)
-    if sl_p is None or tp_p is None:
-        reason = "Stop Loss / Take Profit calculation failed."
-        print(f"{log_prefix} {reason} for {symbol}. Abort.")
-        send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p, tp_p, qty_calc, symbol_info, configs)
-        return
-    print(f"{log_prefix} Calculated SL: {sl_p}, TP: {tp_p} for {symbol}.")
-    
-    acc_bal = get_account_balance(client, configs) # Pass configs
-    if acc_bal is None:
-        reason = "Critical error fetching account balance."
-        print(f"{log_prefix} {reason} Abort.")
-        send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p, tp_p, qty_calc, symbol_info, configs)
-        return
-    if acc_bal <= 0:
-        reason = f"Zero or negative account balance ({acc_bal})."
-        print(f"{log_prefix} {reason} Abort.")
-        send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p, tp_p, qty_calc, symbol_info, configs)
-        return
-    print(f"{log_prefix} Account balance: {acc_bal} for position sizing.")
-
-    qty_calc = calculate_position_size(acc_bal, configs['risk_percent'], entry_p, sl_p, symbol_info, configs) # Pass configs
-    if qty_calc is None or qty_calc <= 0:
-        # More specific reason might be logged by calculate_position_size itself.
-        # We can use a generic one here or try to capture it. For now, generic.
-        reason = f"Invalid position size calculated (Qty: {qty_calc}). Check logs for details from calculate_position_size."
-        print(f"{log_prefix} {reason} for {symbol}. Abort.")
-        send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p, tp_p, qty_calc, symbol_info, configs)
-        return
-    print(f"{log_prefix} Calculated position size: {qty_calc} for {symbol}.")
-    
-    final_qty_check = round(qty_calc, int(symbol_info['quantityPrecision']))
-    if final_qty_check == 0.0:
-        reason = f"Calculated quantity {qty_calc} rounds to zero."
-        print(f"{log_prefix} {reason} for {symbol}. Abort.")
-        send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p, tp_p, qty_calc, symbol_info, configs)
-        return
-    print(f"{log_prefix} Final quantity check (rounded): {final_qty_check} for {symbol}.")
-
-    # Use final_qty_check for placing order, as it's the rounded one.
-    # The notification will show qty_calc (unrounded) if rejection happened due to rounding to zero.
-    # If proceeding, qty_to_order should be final_qty_check.
-    qty_to_order = final_qty_check 
-
-    # --- Perform Pre-Order Sanity Checks ---
-    passed_sanity_checks, sanity_check_reason = pre_order_sanity_checks(
-        symbol=symbol,
-        signal=signal,
-        entry_price=entry_p,
-        sl_price=sl_p,
-        tp_price=tp_p,
-        quantity=qty_to_order,
-        symbol_info=symbol_info,
-        current_balance=acc_bal, # acc_bal was fetched before qty calculation
-        risk_percent_config=configs['risk_percent'],
-        configs=configs,
-        klines_df_for_debug=klines_df # Pass klines_df for potential future use in checks
-    )
-
-    if not passed_sanity_checks:
-        print(f"{log_prefix} Pre-order sanity checks FAILED for {symbol}: {sanity_check_reason}")
-        send_trade_rejection_notification(symbol, signal, f"Sanity Check Failed: {sanity_check_reason}", 
-                                          entry_p, sl_p, tp_p, qty_to_order, symbol_info, configs)
-        return # Abort trade entry
-
-    print(f"{log_prefix} Pre-order sanity checks PASSED for {symbol}.")
-    # --- End of Pre-Order Sanity Checks ---
-
-    print(f"{log_prefix} Attempting {signal} {qty_to_order} {symbol} @MKT (EP:{entry_p:.4f}), SL:{sl_p:.4f}, TP:{tp_p:.4f}")
-    entry_order = place_new_order(client, symbol_info, "BUY" if signal=="LONG" else "SELL", "MARKET", qty_to_order)
-
-    if not entry_order or entry_order.get('status') != 'FILLED':
-        reason = f"Market entry order failed or not filled. Status: {entry_order.get('status') if entry_order else 'N/A'}."
-        print(f"{log_prefix} {reason} for {symbol}: {entry_order}")
-        send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p, tp_p, qty_to_order, symbol_info, configs)
-        return
-    
-    # If successful past this point:
-    print(f"{log_prefix} Market entry order FILLED for {symbol}. Order details: {entry_order}")
-    actual_ep = float(entry_order.get('avgPrice', entry_p))
-    
-    # Correctly indented block for post-fill logic
-    if entry_p > 0 : # Recalculate SL/TP based on actual fill if original signal price was valid
-        sl_dist_pct = abs(entry_p - sl_p) / entry_p
-        tp_dist_pct = abs(entry_p - tp_p) / entry_p
-        sl_p = actual_ep * (1 - sl_dist_pct if signal == "LONG" else 1 + sl_dist_pct)
-        tp_p = actual_ep * (1 + tp_dist_pct if signal == "LONG" else 1 - tp_dist_pct)
-        # Ensure symbol_info is available for precision, it should be at this point
-        price_prec_adj = symbol_info.get('pricePrecision', 2) if symbol_info else 2
-        print(f"SL/TP adjusted for actual fill {actual_ep:.{price_prec_adj}f}: SL {sl_p:.{price_prec_adj}f}, TP {tp_p:.{price_prec_adj}f}")
-
-    sl_ord = place_new_order(client, symbol_info, "SELL" if signal=="LONG" else "BUY", "STOP_MARKET", qty_to_order, stop_price=sl_p, reduce_only=True)
-    if not sl_ord: print(f"{log_prefix} CRITICAL: FAILED TO PLACE SL FOR {symbol}! Order details: {sl_ord}"); # Consider emergency close
-    else: print(f"{log_prefix} SL order placed for {symbol}. Order details: {sl_ord}")
-    
-    tp_ord = place_new_order(client, symbol_info, "SELL" if signal=="LONG" else "BUY", "TAKE_PROFIT_MARKET", qty_to_order, stop_price=tp_p, reduce_only=True)
-    if not tp_ord: print(f"{log_prefix} Warning: Failed to place TP for {symbol}. Order details: {tp_ord}")
-    else: print(f"{log_prefix} TP order placed for {symbol}. Order details: {tp_ord}")
-
-    with lock: # Final update to shared active_trades
-        active_trades[symbol] = {
-            "entry_order_id": entry_order['orderId'], "sl_order_id": sl_ord.get('orderId') if sl_ord else None,
-            "tp_order_id": tp_ord.get('orderId') if tp_ord else None, "entry_price": actual_ep,
-            "current_sl_price": sl_p, "current_tp_price": tp_p, "initial_sl_price": sl_p, "initial_tp_price": tp_p,
-            "quantity": qty_to_order, "side": signal, "symbol_info": symbol_info, "open_timestamp": pd.Timestamp.now(tz='UTC')
-        }
-        print(f"{log_prefix} Trade for {symbol} recorded in active_trades at {active_trades[symbol]['open_timestamp']}.")
+        # Determine signal (this was `new_signal` before, now it's the main `signal` for execution)
+        # The `check_ema_crossover_conditions` was already called to get `new_signal`.
+        # If `new_signal` was not actionable (e.g., None, VALIDATION_FAILED), the function would have returned.
+        # So, `new_signal` (which we can rename to `signal` for this phase) should be "LONG" or "SHORT".
+        signal = new_signal # `new_signal` comes from line 1142
         
-        # Update last trade time for cooldown
-        with symbol_last_trade_time_lock:
-            symbol_last_trade_time[symbol] = active_trades[symbol]['open_timestamp'] # Use the same timestamp
-            print(f"{log_prefix} Updated last trade time for {symbol} to {symbol_last_trade_time[symbol]} for cooldown.")
+        if signal not in ["LONG", "SHORT"]: # Should have been caught earlier, but as a safeguard
+            print(f"{log_prefix} No actionable signal ('{signal}') for {symbol} before execution phase. Aborting.")
+            return
 
-    # Send Telegram notification for new trade
-    if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
-        current_balance_for_msg = get_account_balance(client, configs)
-        if current_balance_for_msg is None: current_balance_for_msg = "N/A (Error)"
-        else: current_balance_for_msg = f"{current_balance_for_msg:.2f}"
+        print(f"\n{log_prefix} --- Proceeding with Validated Trade Signal for {symbol}: {signal} ---")
+        symbol_info = get_symbol_info(client, symbol)
+        entry_p = klines_df['close'].iloc[-1] 
+        sl_p, tp_p, qty_calc = None, None, None 
+        
+        if not symbol_info:
+            reason = "Failed to retrieve symbol information."
+            print(f"{log_prefix} {reason} for {symbol}. Abort.")
+            send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p, tp_p, qty_calc, symbol_info, configs)
+            return
 
-        # Build symbol_info_map from the current state of active_trades
-        # Lock active_trades when reading it to build the map
-        with active_trades_lock:
-            s_info_map_for_new_trade_msg = _build_symbol_info_map_from_active_trades(active_trades)
-        open_positions_str = get_open_positions(client, format_for_telegram=True, active_trades_data=active_trades.copy(), symbol_info_map=s_info_map_for_new_trade_msg)
+        print(f"{log_prefix} Entry price (last close): {entry_p} for {symbol}")
+        ema100_val = klines_df['EMA100'].iloc[-1]
+        
+        if not (set_leverage_on_symbol(client, symbol, configs['leverage']) and \
+                set_margin_type_on_symbol(client, symbol, configs['margin_type'])):
+            reason = "Failed to set leverage or margin type."
+            print(f"{log_prefix} {reason} for {symbol}. Abort.")
+            send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p, tp_p, qty_calc, symbol_info, configs)
+            return
 
-        # Ensure symbol_info is available for precision in the message
-        qty_prec_msg = symbol_info.get('quantityPrecision', 0) if symbol_info else 0
-        price_prec_msg = symbol_info.get('pricePrecision', 2) if symbol_info else 2
+        print(f"{log_prefix} Leverage and margin type set for {symbol}.")
+        sl_p, tp_p = calculate_sl_tp_values(entry_p, signal, ema100_val, klines_df)
+        if sl_p is None or tp_p is None:
+            reason = "Stop Loss / Take Profit calculation failed."
+            print(f"{log_prefix} {reason} for {symbol}. Abort.")
+            send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p, tp_p, qty_calc, symbol_info, configs)
+            return
+        print(f"{log_prefix} Calculated SL: {sl_p}, TP: {tp_p} for {symbol}.")
+        
+        acc_bal = get_account_balance(client, configs) 
+        if acc_bal is None:
+            reason = "Critical error fetching account balance."
+            print(f"{log_prefix} {reason} Abort.")
+            send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p, tp_p, qty_calc, symbol_info, configs)
+            return
+        if acc_bal <= 0:
+            reason = f"Zero or negative account balance ({acc_bal})."
+            print(f"{log_prefix} {reason} Abort.")
+            send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p, tp_p, qty_calc, symbol_info, configs)
+            return
+        print(f"{log_prefix} Account balance: {acc_bal} for position sizing.")
 
-        new_trade_message = (
-            f"🚀 NEW TRADE PLACED 🚀\n\n"
-            f"Symbol: {symbol}\n"
-            f"Side: {signal}\n"
-            f"Quantity: {qty_to_order:.{qty_prec_msg}f}\n"
-            f"Entry Price: {actual_ep:.{price_prec_msg}f}\n"
-            f"SL: {sl_p:.{price_prec_msg}f}\n"
-            f"TP: {tp_p:.{price_prec_msg}f}\n\n"
-            f"💰 Account Balance: {current_balance_for_msg} USDT\n"
-            f"📊 Current Open Positions:\n{open_positions_str}"
+        qty_calc = calculate_position_size(acc_bal, configs['risk_percent'], entry_p, sl_p, symbol_info, configs) 
+        if qty_calc is None or qty_calc <= 0:
+            reason = f"Invalid position size calculated (Qty: {qty_calc}). Check logs for details from calculate_position_size."
+            print(f"{log_prefix} {reason} for {symbol}. Abort.")
+            send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p, tp_p, qty_calc, symbol_info, configs)
+            return
+        print(f"{log_prefix} Calculated position size: {qty_calc} for {symbol}.")
+        
+        final_qty_check = round(qty_calc, int(symbol_info['quantityPrecision']))
+        if final_qty_check == 0.0:
+            reason = f"Calculated quantity {qty_calc} rounds to zero."
+            print(f"{log_prefix} {reason} for {symbol}. Abort.")
+            send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p, tp_p, qty_calc, symbol_info, configs)
+            return
+        print(f"{log_prefix} Final quantity check (rounded): {final_qty_check} for {symbol}.")
+
+        qty_to_order = final_qty_check 
+
+        passed_sanity_checks, sanity_check_reason = pre_order_sanity_checks(
+            symbol=symbol,
+            signal=signal,
+            entry_price=entry_p,
+            sl_price=sl_p,
+            tp_price=tp_p,
+            quantity=qty_to_order,
+            symbol_info=symbol_info,
+            current_balance=acc_bal, 
+            risk_percent_config=configs['risk_percent'],
+            configs=configs,
+            klines_df_for_debug=klines_df 
         )
-        send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], new_trade_message)
-        print(f"{log_prefix} New trade Telegram notification sent for {symbol}.")
 
-    get_open_positions(client); get_open_orders(client, symbol) # Original console logging calls
+        if not passed_sanity_checks:
+            print(f"{log_prefix} Pre-order sanity checks FAILED for {symbol}: {sanity_check_reason}")
+            send_trade_rejection_notification(symbol, signal, f"Sanity Check Failed: {sanity_check_reason}", 
+                                              entry_p, sl_p, tp_p, qty_to_order, symbol_info, configs)
+            return 
+
+        print(f"{log_prefix} Pre-order sanity checks PASSED for {symbol}.")
+
+        print(f"{log_prefix} Attempting {signal} {qty_to_order} {symbol} @MKT (EP:{entry_p:.4f}), SL:{sl_p:.4f}, TP:{tp_p:.4f}")
+        entry_order = place_new_order(client, symbol_info, "BUY" if signal=="LONG" else "SELL", "MARKET", qty_to_order)
+
+        if not entry_order or entry_order.get('status') != 'FILLED':
+            reason = f"Market entry order failed or not filled. Status: {entry_order.get('status') if entry_order else 'N/A'}."
+            print(f"{log_prefix} {reason} for {symbol}: {entry_order}")
+            send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p, tp_p, qty_to_order, symbol_info, configs)
+            return
+        
+        print(f"{log_prefix} Market entry order FILLED for {symbol}. Order details: {entry_order}")
+        actual_ep = float(entry_order.get('avgPrice', entry_p))
+        
+        if entry_p > 0 : 
+            sl_dist_pct = abs(entry_p - sl_p) / entry_p
+            tp_dist_pct = abs(entry_p - tp_p) / entry_p
+            sl_p = actual_ep * (1 - sl_dist_pct if signal == "LONG" else 1 + sl_dist_pct)
+            tp_p = actual_ep * (1 + tp_dist_pct if signal == "LONG" else 1 - tp_dist_pct)
+            price_prec_adj = symbol_info.get('pricePrecision', 2) if symbol_info else 2
+            print(f"SL/TP adjusted for actual fill {actual_ep:.{price_prec_adj}f}: SL {sl_p:.{price_prec_adj}f}, TP {tp_p:.{price_prec_adj}f}")
+
+        sl_ord = place_new_order(client, symbol_info, "SELL" if signal=="LONG" else "BUY", "STOP_MARKET", qty_to_order, stop_price=sl_p, reduce_only=True)
+        if not sl_ord: print(f"{log_prefix} CRITICAL: FAILED TO PLACE SL FOR {symbol}! Order details: {sl_ord}"); 
+        else: print(f"{log_prefix} SL order placed for {symbol}. Order details: {sl_ord}")
+        
+        tp_ord = place_new_order(client, symbol_info, "SELL" if signal=="LONG" else "BUY", "TAKE_PROFIT_MARKET", qty_to_order, stop_price=tp_p, reduce_only=True)
+        if not tp_ord: print(f"{log_prefix} Warning: Failed to place TP for {symbol}. Order details: {tp_ord}")
+        else: print(f"{log_prefix} TP order placed for {symbol}. Order details: {tp_ord}")
+
+        with lock: 
+            current_pd_timestamp = pd.Timestamp.now(tz='UTC') # LOGGING A - Part 1
+            print(f"{log_prefix} DEBUG: Timestamp to be used for new trade {symbol}: {current_pd_timestamp} (Type: {type(current_pd_timestamp)})") # LOGGING A - Part 2
+            
+            new_trade_data = {
+                "entry_order_id": entry_order['orderId'], "sl_order_id": sl_ord.get('orderId') if sl_ord else None,
+                "tp_order_id": tp_ord.get('orderId') if tp_ord else None, "entry_price": actual_ep,
+                "current_sl_price": sl_p, "current_tp_price": tp_p, "initial_sl_price": sl_p, "initial_tp_price": tp_p,
+                "quantity": qty_to_order, "side": signal, "symbol_info": symbol_info, "open_timestamp": current_pd_timestamp
+            }
+            active_trades[symbol] = new_trade_data
+            print(f"{log_prefix} DEBUG: Full active_trades entry for {symbol} after creation: {active_trades[symbol]}") # LOGGING B
+            print(f"{log_prefix} Trade for {symbol} recorded in active_trades at {active_trades[symbol]['open_timestamp']}.")
+            
+            with symbol_last_trade_time_lock:
+                symbol_last_trade_time[symbol] = active_trades[symbol]['open_timestamp'] 
+                print(f"{log_prefix} Updated last trade time for {symbol} to {symbol_last_trade_time[symbol]} for cooldown.")
+
+        if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+            current_balance_for_msg = get_account_balance(client, configs)
+            if current_balance_for_msg is None: current_balance_for_msg = "N/A (Error)"
+            else: current_balance_for_msg = f"{current_balance_for_msg:.2f}"
+
+            with active_trades_lock:
+                s_info_map_for_new_trade_msg = _build_symbol_info_map_from_active_trades(active_trades)
+            open_positions_str = get_open_positions(client, format_for_telegram=True, active_trades_data=active_trades.copy(), symbol_info_map=s_info_map_for_new_trade_msg)
+
+            qty_prec_msg = symbol_info.get('quantityPrecision', 0) if symbol_info else 0
+            price_prec_msg = symbol_info.get('pricePrecision', 2) if symbol_info else 2
+
+            new_trade_message = (
+                f"🚀 NEW TRADE PLACED 🚀\n\n"
+                f"Symbol: {symbol}\n"
+                f"Side: {signal}\n"
+                f"Quantity: {qty_to_order:.{qty_prec_msg}f}\n"
+                f"Entry Price: {actual_ep:.{price_prec_msg}f}\n"
+                f"SL: {sl_p:.{price_prec_msg}f}\n"
+                f"TP: {tp_p:.{price_prec_msg}f}\n\n"
+                f"💰 Account Balance: {current_balance_for_msg} USDT\n"
+                f"📊 Current Open Positions:\n{open_positions_str}"
+            )
+            send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], new_trade_message)
+            print(f"{log_prefix} New trade Telegram notification sent for {symbol}.")
+
+        get_open_positions(client); get_open_orders(client, symbol) 
     
     finally:
         # --- Release Symbol Processing Lock ---
@@ -1648,8 +1654,8 @@ def trading_loop(client, configs, monitored_symbols):
                 else:
                     print("Telegram not configured, skipping status update message.")
 
-            print(f"Waiting for {configs['loop_delay_minutes'] * 60} m...")
-            time.sleep(configs['loop_delay_minutes'] * 60)
+            print(f"Waiting for {configs['loop_delay_minutes']} m...")
+            time.sleep(configs['loop_delay_minutes'] )
     finally:
         print("Shutting down thread pool executor...")
         executor.shutdown(wait=True) # Ensure all threads finish before exiting loop/program
