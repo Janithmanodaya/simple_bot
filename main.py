@@ -40,11 +40,6 @@ DEFAULT_ALLOW_EXCEED_RISK_FOR_MIN_NOTIONAL = False # Default for allowing higher
 active_trades = {}
 active_trades_lock = threading.Lock() # Lock for synchronizing access to active_trades
 
-# Stores the timestamp of the last trade initiation for each symbol to manage cooldowns.
-# Key: symbol (e.g., "BTCUSDT"), Value: pd.Timestamp
-symbol_last_trade_time = {}
-symbol_last_trade_time_lock = threading.Lock() # Lock for synchronizing access to symbol_last_trade_time
-
 # Set to keep track of symbols currently being processed by manage_trade_entry to prevent race conditions.
 symbols_currently_processing = set()
 symbols_currently_processing_lock = threading.Lock()
@@ -1058,222 +1053,69 @@ def process_symbol_task(symbol, client, configs, lock):
         return f"{symbol}: Error - {e}"
 
 def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is active_trades_lock
-    global active_trades, symbol_last_trade_time, symbol_last_trade_time_lock, symbols_currently_processing, symbols_currently_processing_lock
+    global active_trades, symbols_currently_processing, symbols_currently_processing_lock
 
     log_prefix = f"[{threading.current_thread().name}] {symbol} manage_trade_entry:"
 
-    # --- Symbol Processing Lock (to prevent concurrent execution for the same symbol) ---
+    # Attempt to mark this symbol as being processed by this thread.
+    # If another thread has already marked it, this thread will skip.
     with symbols_currently_processing_lock:
         if symbol in symbols_currently_processing:
-            print(f"{log_prefix} {symbol} is ALREADY BEING PROCESSED by another thread. Skipping this instance.")
+            print(f"{log_prefix} Symbol is already being processed by another thread. Skipping this instance.")
             return
         symbols_currently_processing.add(symbol)
-        print(f"{log_prefix} Acquired processing lock for {symbol}.")
+        # print(f"{log_prefix} Acquired processing rights for symbol.") # Less verbose
 
     try:
-        # --- Original start of function logic begins here ---
-        was_existing_trade = False # Flag to see if we are replacing a trade
-        
-        # The 'signal' variable (new_signal) is determined later. 
-        # The check for active_trades needs to be aware of this.
-        # We first check general cooldown, then calculate signal, then check active_trades.
-
-        # --- Symbol Cooldown Check (1-hour cooldown after a trade) ---
-        COOLDOWN_PERIOD_SECONDS = 3600 
-        with symbol_last_trade_time_lock: 
-            last_trade_ts = symbol_last_trade_time.get(symbol)
-            # DEBUG LOGGING START
-            if symbol == "DOGSUSDT": # Replace "DOGSUSDT" with a symbol you are actively testing if needed
-                print(f"{log_prefix} DEBUG_COOLDOWN: Checking '{symbol}'. Found last_trade_ts in symbol_last_trade_time: {last_trade_ts} (Type: {type(last_trade_ts)})")
-            # DEBUG LOGGING END
-        
-        if last_trade_ts:
-            time_since_last_trade_seconds = (pd.Timestamp.now(tz='UTC') - last_trade_ts).total_seconds()
-            # DEBUG LOGGING START
-            if symbol == "DOGSUSDT": # Replace "DOGSUSDT"
-                 print(f"{log_prefix} DEBUG_COOLDOWN: '{symbol}' last_trade_ts is valid. Time since: {time_since_last_trade_seconds:.2f}s. COOLDOWN_PERIOD_SECONDS: {COOLDOWN_PERIOD_SECONDS}")
-            # DEBUG LOGGING END
-            if time_since_last_trade_seconds < COOLDOWN_PERIOD_SECONDS:
-                print(f"{log_prefix} Symbol is on 1-hour cooldown. Last trade was {time_since_last_trade_seconds:.0f}s ago. "
-                      f"Remaining cooldown: {COOLDOWN_PERIOD_SECONDS - time_since_last_trade_seconds:.0f}s. Signal ignored.")
-                return # Exit if symbol is on cooldown, finally block will release processing lock
-            # DEBUG LOGGING START
-            elif symbol == "DOGSUSDT": # Replace "DOGSUSDT"
-                 print(f"{log_prefix} DEBUG_COOLDOWN: '{symbol}' Cooldown check PASSED (trade is older than 1hr or no valid last_trade_ts). Proceeding.")
-            # DEBUG LOGGING END
-        # DEBUG LOGGING START
-        elif symbol == "DOGSUSDT": # Replace "DOGSUSDT" - Only log if last_trade_ts was None initially
-            print(f"{log_prefix} DEBUG_COOLDOWN: '{symbol}' No last_trade_ts found in symbol_last_trade_time. Proceeding as if no cooldown.")
-        # DEBUG LOGGING END
+        # --- All subsequent logic is now within this try block ---
 
         # Initial check for sufficient kline data 
         if klines_df.empty or len(klines_df) < 202: 
-            print(f"{log_prefix} Insufficient kline data for {symbol} (Length: {len(klines_df)}). Aborting trade entry.")
-            return # finally block will release processing lock
+            print(f"{log_prefix} Insufficient kline data ({len(klines_df)}). Aborting.")
+            return 
 
         klines_df['EMA100'] = calculate_ema(klines_df, 100)
         klines_df['EMA200'] = calculate_ema(klines_df, 200)
-
-        # Verbose logging for EMAs can be enabled if needed by uncommenting below
-        # if klines_df['EMA100'] is not None and not klines_df['EMA100'].empty:
-        #     print(f"{log_prefix} Last EMA100 values: {klines_df['EMA100'].iloc[-3:].values}")
-        # else:
-        #     print(f"{log_prefix} EMA100 calculation resulted in None or empty series.")
-        # if klines_df['EMA200'] is not None and not klines_df['EMA200'].empty:
-        #     print(f"{log_prefix} Last EMA200 values: {klines_df['EMA200'].iloc[-3:].values}")
-        # else:
-        #     print(f"{log_prefix} EMA200 calculation resulted in None or empty series.")
 
         if klines_df['EMA100'] is None or klines_df['EMA200'] is None or \
            klines_df['EMA100'].isnull().all() or klines_df['EMA200'].isnull().all() or \
            len(klines_df) < 202: 
-            print(f"{log_prefix} EMA calculation failed, EMAs are NaN, or insufficient data length ({len(klines_df)}). Aborting for {symbol}.")
-            return # finally block will release processing lock
+            print(f"{log_prefix} EMA calculation failed or insufficient data. Aborting.")
+            return
 
-        # Determine the new signal based on current klines
         new_signal = check_ema_crossover_conditions(klines_df, symbol_for_logging=symbol)
-        # The function check_ema_crossover_conditions itself prints the signal, so no need to double print here.
-
-        # If the signal from crossover conditions is not actionable, exit early.
         if new_signal not in ["LONG", "SHORT"]:
-            print(f"{log_prefix} No actionable trade signal ('{new_signal}') for {symbol}. Aborting further processing in manage_trade_entry.")
-            # No trade rejection notification here specifically, as check_ema_crossover_conditions logs reasons for non-actionable signals.
-            return # Exit manage_trade_entry if no valid LONG/SHORT signal
+            # No actionable signal, check_ema_crossover_conditions logs reasons.
+            return 
 
-        # Initialize variables
-        open_ts = None # Will hold the timestamp of an existing trade if found
-        existing_signal_side = None # Will hold the side of an existing trade if found
-        # was_existing_trade is already initialized to False at the start of the function.
+        # Check if symbol is already in active_trades (protected by active_trades_lock)
+        with lock: 
+            if symbol in active_trades:
+                print(f"{log_prefix} Signal {new_signal} IGNORED. Symbol already has an active trade: {active_trades[symbol].get('side')} @ {active_trades[symbol].get('entry_price')}")
+                return
 
-        # Now, handle active_trades logic
-        with lock: # This is active_trades_lock (passed as 'lock' argument)
-            if symbol in active_trades and active_trades[symbol]:
-                # Symbol IS in active_trades. This means we are dealing with an existing trade.
-                existing_details = active_trades[symbol]
-                open_ts = existing_details.get('open_timestamp')
-                existing_signal_side = existing_details.get('side')
-
-                # Validate the timestamp of the existing trade
-                if not open_ts or not isinstance(open_ts, pd.Timestamp):
-                    print(f"{log_prefix} DEBUG: Problematic existing_details for {symbol}: {existing_details}")
-                    error_msg = (f"🆘 BOT ALERT: Invalid Timestamp 🆘\n\n"
-                                 f"Symbol: `{symbol}` is in `active_trades` but has a problematic `open_timestamp`.\n"
-                                 f"Value: `{open_ts}` (Type: {type(open_ts)})\n"
-                                 f"This trade will be skipped in the current cycle to prevent errors or duplicate trades.\n"
-                                 f"Please investigate `active_trades` state if this persists.")
-                    print(f"{log_prefix} {error_msg.replace('`', '').replace('*', '')}") # Log without markdown for console
-                    if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
-                        send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], error_msg)
-                    return # Crucial: ensure return happens if open_ts is invalid for an existing trade
-
-                # If we reach here, open_ts is a valid pd.Timestamp for an existing trade.
-                time_since_last_trade_seconds = (pd.Timestamp.now(tz='UTC') - open_ts).total_seconds()
-
-                # Cooldown Check 1: Duplicate signal for the same side within 1 hour
-                if time_since_last_trade_seconds < 3600 and existing_signal_side == new_signal:
-                    print(f"{log_prefix} Duplicate {new_signal} signal for {symbol} IGNORED. Last same-side trade was {time_since_last_trade_seconds:.0f}s ago at {open_ts}.")
-                    return # Exit manage_trade_entry
-
-                # Cooldown Check 2: Any new signal (even if different side) if existing trade is less than 1 hour old
-                # This is a general "don't touch for 1 hour" rule after a trade is opened/replaced.
-                if time_since_last_trade_seconds < 3600:
-                     print(f"{log_prefix} New signal ({new_signal}) for {symbol} IGNORED. Existing trade (Side: {existing_signal_side}, TS: {open_ts}) is less than 1 hour old ({time_since_last_trade_seconds:.0f}s).")
-                     return # Exit manage_trade_entry
-
-                # If we are here, the existing trade is >1hr old, or it's <1hr but the new_signal is different.
-                # The bot logic seems to imply replacement if >1hr OR if signal changes (even if <1hr, but this is covered by cooldown check 2 if it's too soon).
-                # The original code structure was a bit mixed here. Let's simplify:
-                # If an existing trade is >1hr old, it's eligible for replacement by ANY new valid signal.
-                # If an existing trade is <1hr old, NO new signal (same or different) should proceed (covered by above checks).
-                
-                # So, if we've passed the <1hr checks, it means the trade is either >1hr old,
-                # or there was some other path (which should be prevented by strict <1hr checks).
-                # Let's assume if we're here, we are clear to replace if `new_signal` is valid.
-                print(f"{log_prefix} Existing trade for {symbol} (Age: {time_since_last_trade_seconds:.0f}s, Prev Side: {existing_signal_side}, New Signal: {new_signal}) is eligible for review/replacement. Cancelling old SL/TP.")
-                was_existing_trade = True # Mark that we are intending to replace an existing trade
-                for oid_key in ['sl_order_id', 'tp_order_id']:
-                    oid = existing_details.get(oid_key)
-                    if oid:
-                        try:
-                            client.futures_cancel_order(symbol=symbol, orderId=oid)
-                            print(f"{log_prefix} Successfully cancelled old {oid_key} {oid} for {symbol}.")
-                        except BinanceAPIException as e:
-                            if e.code != -2011: # -2011 is "Unknown order sent." (already filled/cancelled)
-                                print(f"{log_prefix} API ERROR cancelling old {oid_key} {oid} for {symbol}: {e}")
-                                # If cancelling orders fails for an existing trade we intend to replace,
-                                # it might be safer to return and not proceed with placing new orders.
-                                return 
-                            else:
-                                print(f"{log_prefix} Old {oid_key} {oid} for {symbol} was already gone or filled.")
-                        except Exception as e:
-                            print(f"{log_prefix} UNEXPECTED ERROR cancelling old {oid_key} {oid} for {symbol}: {e}")
-                            return # Safer to return
-            # else:
-                # Symbol was NOT in active_trades. This means it's a potential new trade.
-                # `open_ts` remains None (its initial value).
-                # `existing_signal_side` remains None.
-                # `was_existing_trade` remains False.
-                # No alert for invalid timestamp here, as there's no existing timestamp to validate.
-                # Proceed to new trade logic further down.
-                # print(f"{log_prefix} No existing trade found in active_trades for {symbol}. Will proceed as new trade if other checks pass.")
-                pass
+        # Max concurrent position check (protected by active_trades_lock)
+        with lock: 
+            if len(active_trades) >= configs["max_concurrent_positions"]:
+                print(f"{log_prefix} Max concurrent positions ({configs['max_concurrent_positions']}) reached. Cannot open new trade for {symbol}.")
+                return
         
-        # Max concurrent position check.
-        # This applies if 'was_existing_trade' is False (i.e., it's a new symbol, not a replacement for an existing one in active_trades)
-        if not was_existing_trade and len(active_trades) >= configs["max_concurrent_positions"]:
-            print(f"Max concurrent positions ({configs['max_concurrent_positions']}) reached. Cannot open for new symbol {symbol}.")
-            return
+        # If we reach here, it's a valid signal for a new trade, symbol not active, and under max positions.
+        signal = new_signal # To be used consistently hereafter
+        # was_existing_trade = False # This is implicitly true now if we proceed.
 
-        # --- Calculations and non-critical API calls (now part of the main try block) ---
-        klines_df['EMA100'] = calculate_ema(klines_df, 100)
-        klines_df['EMA200'] = calculate_ema(klines_df, 200)
+        print(f"\n{log_prefix} --- Proceeding with New Validated Trade Signal: {signal} (No existing active trade) ---")
 
-        # log_prefix is already defined at the start of the function if needed here,
-        # but it's redefined based on thread name. Let's ensure it's current.
-        # log_prefix = f"[{threading.current_thread().name}] {symbol} manage_trade_entry:" # Re-affirm or ensure it's correct
-
-        # --- Symbol Cooldown Check (This was already done at the beginning of the try block) ---
-        # The cooldown check at lines 1111-1118 should suffice.
-        # Re-checking here might be redundant unless the klines_df processing took extremely long.
-        # For now, assuming the initial cooldown check is the primary one.
-
-        # Initial check for sufficient kline data (also done earlier)
-        if klines_df.empty or len(klines_df) < 202: 
-            print(f"{log_prefix} Insufficient kline data for {symbol} (Length: {len(klines_df)}) before final signal processing. Aborting.")
-            return
-
-        # Verbose EMA logging (original was commented out, can be re-enabled if needed)
-        # if klines_df['EMA100'] is not None and not klines_df['EMA100'].empty:
-        #     print(f"{log_prefix} Last EMA100 values (post-active-trade check): {klines_df['EMA100'].iloc[-3:].values}")
-        # if klines_df['EMA200'] is not None and not klines_df['EMA200'].empty:
-        #     print(f"{log_prefix} Last EMA200 values (post-active-trade check): {klines_df['EMA200'].iloc[-3:].values}")
-
-        if klines_df['EMA100'] is None or klines_df['EMA200'] is None or \
-           klines_df['EMA100'].isnull().all() or klines_df['EMA200'].isnull().all(): # Length check already done
-            print(f"{log_prefix} EMA calculation failed or EMAs are NaN (post-active-trade check). Aborting for {symbol}.")
-            return
-
-        # Determine signal (this was `new_signal` before, now it's the main `signal` for execution)
-        # The `check_ema_crossover_conditions` was already called to get `new_signal`.
-        # If `new_signal` was not actionable (e.g., None, VALIDATION_FAILED), the function would have returned.
-        # So, `new_signal` (which we can rename to `signal` for this phase) should be "LONG" or "SHORT".
-        signal = new_signal # `new_signal` comes from line 1142
-        
-        if signal not in ["LONG", "SHORT"]: # Should have been caught earlier, but as a safeguard
-            print(f"{log_prefix} No actionable signal ('{signal}') for {symbol} before execution phase. Aborting.")
-            return
-
-        print(f"\n{log_prefix} --- Proceeding with Validated Trade Signal for {symbol}: {signal} ---")
         symbol_info = get_symbol_info(client, symbol)
-        entry_p = klines_df['close'].iloc[-1] 
-        sl_p, tp_p, qty_calc = None, None, None 
-        
         if not symbol_info:
-            reason = "Failed to retrieve symbol information."
-            print(f"{log_prefix} {reason} for {symbol}. Abort.")
-            send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p, tp_p, qty_calc, symbol_info, configs)
+            print(f"{log_prefix} Failed to retrieve symbol information for {symbol}. Abort.")
+            # Not sending trade rejection here as parameters for it aren't fully formed.
             return
 
+        entry_p = klines_df['close'].iloc[-1] 
+        # Ensure sl_p, tp_p, qty_calc are initialized for send_trade_rejection_notification calls
+        sl_p_calc, tp_p_calc, qty_calc_val = None, None, None 
+        
         print(f"{log_prefix} Entry price (last close): {entry_p} for {symbol}")
         ema100_val = klines_df['EMA100'].iloc[-1]
         
@@ -1281,141 +1123,154 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is
                 set_margin_type_on_symbol(client, symbol, configs['margin_type'])):
             reason = "Failed to set leverage or margin type."
             print(f"{log_prefix} {reason} for {symbol}. Abort.")
-            send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p, tp_p, qty_calc, symbol_info, configs)
+            send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p_calc, tp_p_calc, qty_calc_val, symbol_info, configs)
             return
 
         print(f"{log_prefix} Leverage and margin type set for {symbol}.")
-        sl_p, tp_p = calculate_sl_tp_values(entry_p, signal, ema100_val, klines_df)
-        if sl_p is None or tp_p is None:
+        sl_p_calc, tp_p_calc = calculate_sl_tp_values(entry_p, signal, ema100_val, klines_df)
+        if sl_p_calc is None or tp_p_calc is None:
             reason = "Stop Loss / Take Profit calculation failed."
             print(f"{log_prefix} {reason} for {symbol}. Abort.")
-            send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p, tp_p, qty_calc, symbol_info, configs)
+            send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p_calc, tp_p_calc, qty_calc_val, symbol_info, configs)
             return
-        print(f"{log_prefix} Calculated SL: {sl_p}, TP: {tp_p} for {symbol}.")
+        print(f"{log_prefix} Calculated SL: {sl_p_calc}, TP: {tp_p_calc} for {symbol}.")
         
         acc_bal = get_account_balance(client, configs) 
         if acc_bal is None:
             reason = "Critical error fetching account balance."
             print(f"{log_prefix} {reason} Abort.")
-            send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p, tp_p, qty_calc, symbol_info, configs)
+            send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p_calc, tp_p_calc, qty_calc_val, symbol_info, configs)
             return
         if acc_bal <= 0:
             reason = f"Zero or negative account balance ({acc_bal})."
             print(f"{log_prefix} {reason} Abort.")
-            send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p, tp_p, qty_calc, symbol_info, configs)
+            send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p_calc, tp_p_calc, qty_calc_val, symbol_info, configs)
             return
         print(f"{log_prefix} Account balance: {acc_bal} for position sizing.")
 
-        qty_calc = calculate_position_size(acc_bal, configs['risk_percent'], entry_p, sl_p, symbol_info, configs) 
-        if qty_calc is None or qty_calc <= 0:
-            reason = f"Invalid position size calculated (Qty: {qty_calc}). Check logs for details from calculate_position_size."
+        qty_to_order_val = calculate_position_size(acc_bal, configs['risk_percent'], entry_p, sl_p_calc, symbol_info, configs) 
+        if qty_to_order_val is None or qty_to_order_val <= 0:
+            reason = f"Invalid position size calculated (Qty: {qty_to_order_val}). Check logs."
             print(f"{log_prefix} {reason} for {symbol}. Abort.")
-            send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p, tp_p, qty_calc, symbol_info, configs)
+            send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p_calc, tp_p_calc, qty_to_order_val, symbol_info, configs)
             return
-        print(f"{log_prefix} Calculated position size: {qty_calc} for {symbol}.")
+        print(f"{log_prefix} Calculated position size: {qty_to_order_val} for {symbol}.")
         
-        final_qty_check = round(qty_calc, int(symbol_info['quantityPrecision']))
-        if final_qty_check == 0.0:
-            reason = f"Calculated quantity {qty_calc} rounds to zero."
+        # Use rounded quantity for all further steps including sanity checks and order placement
+        qty_to_order_final = round(qty_to_order_val, int(symbol_info['quantityPrecision']))
+        if qty_to_order_final == 0.0:
+            reason = f"Calculated quantity {qty_to_order_val} rounds to zero."
             print(f"{log_prefix} {reason} for {symbol}. Abort.")
-            send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p, tp_p, qty_calc, symbol_info, configs)
+            send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p_calc, tp_p_calc, qty_to_order_val, symbol_info, configs) # Log original calc for rejection
             return
-        print(f"{log_prefix} Final quantity check (rounded): {final_qty_check} for {symbol}.")
-
-        qty_to_order = final_qty_check 
+        print(f"{log_prefix} Final quantity to order (rounded): {qty_to_order_final} for {symbol}.")
 
         passed_sanity_checks, sanity_check_reason = pre_order_sanity_checks(
-            symbol=symbol,
-            signal=signal,
-            entry_price=entry_p,
-            sl_price=sl_p,
-            tp_price=tp_p,
-            quantity=qty_to_order,
-            symbol_info=symbol_info,
-            current_balance=acc_bal, 
-            risk_percent_config=configs['risk_percent'],
-            configs=configs,
-            klines_df_for_debug=klines_df 
+            symbol=symbol, signal=signal, entry_price=entry_p, sl_price=sl_p_calc, tp_price=tp_p_calc,
+            quantity=qty_to_order_final, symbol_info=symbol_info, current_balance=acc_bal, 
+            risk_percent_config=configs['risk_percent'], configs=configs, klines_df_for_debug=klines_df 
         )
 
         if not passed_sanity_checks:
-            print(f"{log_prefix} Pre-order sanity checks FAILED for {symbol}: {sanity_check_reason}")
+            print(f"{log_prefix} Pre-order sanity checks FAILED: {sanity_check_reason}")
             send_trade_rejection_notification(symbol, signal, f"Sanity Check Failed: {sanity_check_reason}", 
-                                              entry_p, sl_p, tp_p, qty_to_order, symbol_info, configs)
+                                              entry_p, sl_p_calc, tp_p_calc, qty_to_order_final, symbol_info, configs)
             return 
 
-        print(f"{log_prefix} Pre-order sanity checks PASSED for {symbol}.")
-
-        print(f"{log_prefix} Attempting {signal} {qty_to_order} {symbol} @MKT (EP:{entry_p:.4f}), SL:{sl_p:.4f}, TP:{tp_p:.4f}")
-        entry_order = place_new_order(client, symbol_info, "BUY" if signal=="LONG" else "SELL", "MARKET", qty_to_order)
+        print(f"{log_prefix} Pre-order sanity checks PASSED.")
+        print(f"{log_prefix} Attempting {signal} {qty_to_order_final} {symbol} @MKT (EP:{entry_p:.{symbol_info['pricePrecision']}f}), SL:{sl_p_calc:.{symbol_info['pricePrecision']}f}, TP:{tp_p_calc:.{symbol_info['pricePrecision']}f}")
+        entry_order = place_new_order(client, symbol_info, "BUY" if signal=="LONG" else "SELL", "MARKET", qty_to_order_final)
 
         if not entry_order or entry_order.get('status') != 'FILLED':
             reason = f"Market entry order failed or not filled. Status: {entry_order.get('status') if entry_order else 'N/A'}."
             print(f"{log_prefix} {reason} for {symbol}: {entry_order}")
-            send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p, tp_p, qty_to_order, symbol_info, configs)
+            send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p_calc, tp_p_calc, qty_to_order_final, symbol_info, configs)
             return
         
-        print(f"{log_prefix} Market entry order FILLED for {symbol}. Order details: {entry_order}")
+        print(f"{log_prefix} Market entry order FILLED. Details: {entry_order}")
         actual_ep = float(entry_order.get('avgPrice', entry_p))
         
-        if entry_p > 0 : 
-            sl_dist_pct = abs(entry_p - sl_p) / entry_p
-            tp_dist_pct = abs(entry_p - tp_p) / entry_p
-            sl_p = actual_ep * (1 - sl_dist_pct if signal == "LONG" else 1 + sl_dist_pct)
-            tp_p = actual_ep * (1 + tp_dist_pct if signal == "LONG" else 1 - tp_dist_pct)
-            price_prec_adj = symbol_info.get('pricePrecision', 2) if symbol_info else 2
-            print(f"SL/TP adjusted for actual fill {actual_ep:.{price_prec_adj}f}: SL {sl_p:.{price_prec_adj}f}, TP {tp_p:.{price_prec_adj}f}")
+        # SL/TP prices might need adjustment based on actual fill price
+        # Use sl_p_calc and tp_p_calc (from initial calculation) to derive percentages relative to entry_p (signal price)
+        # Then apply these percentages to actual_ep
+        final_sl_price = sl_p_calc
+        final_tp_price = tp_p_calc
 
-        sl_ord = place_new_order(client, symbol_info, "SELL" if signal=="LONG" else "BUY", "STOP_MARKET", qty_to_order, stop_price=sl_p, reduce_only=True)
-        if not sl_ord: print(f"{log_prefix} CRITICAL: FAILED TO PLACE SL FOR {symbol}! Order details: {sl_ord}"); 
-        else: print(f"{log_prefix} SL order placed for {symbol}. Order details: {sl_ord}")
+        if entry_p > 0 : # Ensure entry_p (signal price) is not zero to avoid division by zero
+            sl_dist_pct = abs(entry_p - sl_p_calc) / entry_p
+            tp_dist_pct = abs(entry_p - tp_p_calc) / entry_p
+            
+            sl_p_adj = actual_ep * (1 - sl_dist_pct if signal == "LONG" else 1 + sl_dist_pct)
+            tp_p_adj = actual_ep * (1 + tp_dist_pct if signal == "LONG" else 1 - tp_dist_pct)
+            
+            price_prec_for_print = int(symbol_info.get('pricePrecision', 2))
+            print(f"SL/TP adjusted for actual fill {actual_ep:.{price_prec_for_print}f}: SL {sl_p_adj:.{price_prec_for_print}f}, TP {tp_p_adj:.{price_prec_for_print}f}")
+            final_sl_price, final_tp_price = sl_p_adj, tp_p_adj # Update to adjusted values for order placement
+
+        sl_ord = place_new_order(client, symbol_info, "SELL" if signal=="LONG" else "BUY", "STOP_MARKET", qty_to_order_final, stop_price=final_sl_price, reduce_only=True)
+        if not sl_ord: print(f"{log_prefix} CRITICAL: FAILED TO PLACE SL! Details: {sl_ord}"); 
+        else: print(f"{log_prefix} SL order placed. Details: {sl_ord}")
         
-        tp_ord = place_new_order(client, symbol_info, "SELL" if signal=="LONG" else "BUY", "TAKE_PROFIT_MARKET", qty_to_order, stop_price=tp_p, reduce_only=True)
-        if not tp_ord: print(f"{log_prefix} Warning: Failed to place TP for {symbol}. Order details: {tp_ord}")
-        else: print(f"{log_prefix} TP order placed for {symbol}. Order details: {tp_ord}")
+        tp_ord = place_new_order(client, symbol_info, "SELL" if signal=="LONG" else "BUY", "TAKE_PROFIT_MARKET", qty_to_order_final, stop_price=final_tp_price, reduce_only=True)
+        if not tp_ord: print(f"{log_prefix} Warning: Failed to place TP. Details: {tp_ord}")
+        else: print(f"{log_prefix} TP order placed. Details: {tp_ord}")
+
+        if not sl_ord or not tp_ord:
+            failure_reason_list = []
+            if not sl_ord: failure_reason_list.append("SL placement failed")
+            if not tp_ord: failure_reason_list.append("TP placement failed")
+            combined_reason_str = " and ".join(failure_reason_list)
+            error_message_str = f"❌ {log_prefix} CRITICAL SL/TP PLACEMENT FAILURE for {symbol} immediately after entry: {combined_reason_str}. Entry ID: {entry_order['orderId']}. SL: {sl_ord}, TP: {tp_ord}"
+            print(error_message_str)
+            if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+                telegram_alert_msg = (
+                    f"⚠️ IMMEDIATE SL/TP PLACEMENT FAILURE ⚠️\n\n"
+                    f"Symbol: `{symbol}`\n"
+                    f"Reason: _{combined_reason_str}_\n"
+                    f"Entry Order ID: `{entry_order['orderId']}`\n"
+                    f"Avg Entry Price: `{actual_ep}`\n"
+                    f"Intended SL Price: `{final_sl_price}`\n" # Use final prices
+                    f"Intended TP Price: `{final_tp_price}`\n\n" # Use final prices
+                    f"Bot will still record this trade in `active_trades` but SL/TP might be missing or incorrect. "
+                    f"The safety net should attempt to fix this in the next cycle. Monitor closely."
+                )
+                send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], telegram_alert_msg)
 
         with lock: 
-                current_pd_timestamp = pd.Timestamp.now(tz='UTC') 
-                # print(f"{log_prefix} DEBUG: Timestamp to be used for new trade {symbol}: {current_pd_timestamp} (Type: {type(current_pd_timestamp)})") 
-            
-                new_trade_data = {
-                    "entry_order_id": entry_order['orderId'], "sl_order_id": sl_ord.get('orderId') if sl_ord else None,
-                    "tp_order_id": tp_ord.get('orderId') if tp_ord else None, "entry_price": actual_ep,
-                    "current_sl_price": sl_p, "current_tp_price": tp_p, "initial_sl_price": sl_p, "initial_tp_price": tp_p,
-                    "quantity": qty_to_order, "side": signal, "symbol_info": symbol_info, "open_timestamp": current_pd_timestamp
-                }
-                active_trades[symbol] = new_trade_data
-                    # print(f"{log_prefix} DEBUG: Full active_trades entry for {symbol} after creation: {active_trades[symbol]}") 
-                print(f"{log_prefix} Trade for {symbol} recorded in active_trades at {active_trades[symbol]['open_timestamp']}.")
+            current_pd_timestamp = pd.Timestamp.now(tz='UTC') 
+            new_trade_data = {
+                "entry_order_id": entry_order['orderId'], 
+                "sl_order_id": sl_ord.get('orderId') if sl_ord else None,
+                "tp_order_id": tp_ord.get('orderId') if tp_ord else None, 
+                "entry_price": actual_ep,
+                "current_sl_price": final_sl_price, "current_tp_price": final_tp_price, 
+                "initial_sl_price": final_sl_price, "initial_tp_price": final_tp_price, # Store the prices used for SL/TP orders
+                "quantity": qty_to_order_final, "side": signal, 
+                "symbol_info": symbol_info, "open_timestamp": current_pd_timestamp
+            }
+            active_trades[symbol] = new_trade_data
+            print(f"{log_prefix} Trade for {symbol} recorded in active_trades at {active_trades[symbol]['open_timestamp']}.")
                 
-                with symbol_last_trade_time_lock:
-                        # DEBUG LOGGING START
-                        if symbol == "DOGSUSDT": # Replace "DOGSUSDT" with the symbol you are testing
-                            print(f"{log_prefix} DEBUG_COOLDOWN: Updating symbol_last_trade_time for '{symbol}' to: {current_pd_timestamp}")
-                        # DEBUG LOGGING END
-                        symbol_last_trade_time[symbol] = current_pd_timestamp # Use current_pd_timestamp directly
-                        print(f"{log_prefix} Updated last trade time for {symbol} to {symbol_last_trade_time[symbol]} for cooldown.")
-
         if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
             current_balance_for_msg = get_account_balance(client, configs)
             if current_balance_for_msg is None: current_balance_for_msg = "N/A (Error)"
             else: current_balance_for_msg = f"{current_balance_for_msg:.2f}"
 
-            with active_trades_lock:
+            with active_trades_lock: # Ensure this is the correct lock variable 'lock'
                 s_info_map_for_new_trade_msg = _build_symbol_info_map_from_active_trades(active_trades)
             open_positions_str = get_open_positions(client, format_for_telegram=True, active_trades_data=active_trades.copy(), symbol_info_map=s_info_map_for_new_trade_msg)
 
-            qty_prec_msg = symbol_info.get('quantityPrecision', 0) if symbol_info else 0
-            price_prec_msg = symbol_info.get('pricePrecision', 2) if symbol_info else 2
+            qty_prec_msg = int(symbol_info.get('quantityPrecision', 0))
+            price_prec_msg = int(symbol_info.get('pricePrecision', 2))
 
             new_trade_message = (
                 f"🚀 NEW TRADE PLACED 🚀\n\n"
                 f"Symbol: {symbol}\n"
                 f"Side: {signal}\n"
-                f"Quantity: {qty_to_order:.{qty_prec_msg}f}\n"
+                f"Quantity: {qty_to_order_final:.{qty_prec_msg}f}\n"
                 f"Entry Price: {actual_ep:.{price_prec_msg}f}\n"
-                f"SL: {sl_p:.{price_prec_msg}f}\n"
-                f"TP: {tp_p:.{price_prec_msg}f}\n\n"
+                f"SL: {final_sl_price:.{price_prec_msg}f}\n"
+                f"TP: {final_tp_price:.{price_prec_msg}f}\n\n"
                 f"💰 Account Balance: {current_balance_for_msg} USDT\n"
                 f"📊 Current Open Positions:\n{open_positions_str}"
             )
@@ -1425,10 +1280,11 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is
         get_open_positions(client); get_open_orders(client, symbol) 
     
     finally:
-        # --- Release Symbol Processing Lock ---
+        # This block ensures the symbol is removed from symbols_currently_processing
+        # if this thread was the one that added it.
         with symbols_currently_processing_lock:
-            symbols_currently_processing.discard(symbol) # Use discard to avoid KeyError if not present
-            print(f"{log_prefix} Released processing lock for {symbol}.")
+            symbols_currently_processing.discard(symbol)
+            # print(f"{log_prefix} Released processing rights for symbol.") # Less verbose
 
 def monitor_active_trades(client, configs): # Needs lock for active_trades access
     global active_trades, active_trades_lock
@@ -2338,54 +2194,185 @@ def process_pending_simulated_orders(symbol, current_candle_high, current_candle
         del backtest_simulated_orders[symbol]
 
 
-def manage_trade_entry_backtest(client_dummy, configs, symbol, klines_df_current_slice, symbol_info_map):
+def manage_trade_entry_backtest(client_dummy, configs, symbol, klines_df_current_slice, symbol_info_map, current_active_trades_bt):
     # This function is a wrapper around the core strategy logic for backtesting.
     # It uses simulated order placement and state management.
-    global active_trades, active_trades_lock, backtest_current_time, backtest_simulated_positions
+    # `current_active_trades_bt` is passed in, representing the state of active_trades for the backtest.
+    global backtest_current_time, backtest_simulated_positions # backtest_simulated_positions is the ground truth for positions
 
-    # The lock might not be strictly necessary if backtesting is single-threaded for decision making per symbol
-    # but good to keep if any part of the original manage_trade_entry expects it.
-    # For pure backtesting, we can simplify and remove the lock if threading is not used for symbol processing.
+    # The lock (`active_trades_lock`) is not used here as backtesting is typically single-threaded per candle loop.
     
-    # --- Simulate `active_trades` logic for backtesting ---
-    # In backtesting, `active_trades` would store the state of trades as if they were live.
-    # Max concurrent positions check
-    # Simplified: count entries in `backtest_simulated_positions` that are not fully closed.
-    # A more robust check would be against `active_trades` which should mirror `backtest_simulated_positions` states.
-
     current_candle_close = klines_df_current_slice['close'].iloc[-1]
     current_candle_high = klines_df_current_slice['high'].iloc[-1]
     current_candle_low = klines_df_current_slice['low'].iloc[-1]
 
-    # Check if we are already in a trade for this symbol (based on backtest_simulated_positions)
-    if symbol in backtest_simulated_positions and backtest_simulated_positions[symbol]['positionAmt'] != 0:
-        # print(f"[SIM-{backtest_current_time}] Already in position for {symbol}. Skipping new entry signal check.")
-        return # Already in a position, monitoring will handle SL/TP.
+    # --- Calculations (same as live, moved before active trade check for signal determination) ---
+    # Ensure EMAs are calculated on a copy to avoid SettingWithCopyWarning if klines_df_current_slice is a view
+    klines_df_for_calc = klines_df_current_slice.copy()
+    klines_df_for_calc['EMA100'] = calculate_ema(klines_df_for_calc, 100)
+    klines_df_for_calc['EMA200'] = calculate_ema(klines_df_for_calc, 200)
 
-    # Max concurrent positions check based on `active_trades` which should be kept in sync
-    # with `backtest_simulated_positions`
-    if len(active_trades) >= configs["max_concurrent_positions"] and symbol not in active_trades:
-         print(f"[SIM-{backtest_current_time}] Max concurrent positions ({configs['max_concurrent_positions']}) reached. Cannot open for new symbol {symbol}.")
+    if klines_df_for_calc['EMA100'] is None or klines_df_for_calc['EMA200'] is None or \
+       klines_df_for_calc['EMA100'].isnull().all() or klines_df_for_calc['EMA200'].isnull().all() or \
+       len(klines_df_for_calc) < 202:
+        # print(f"[SIM-{backtest_current_time}] EMA calculation failed or insufficient data for {symbol}. Length: {len(klines_df_current_slice)}")
+        return
+
+    signal_status = check_ema_crossover_conditions(klines_df_for_calc) 
+    
+    if signal_status not in ["LONG", "SHORT"]: # Not a valid, validated signal
+        # Log reasons for no signal if needed from check_ema_crossover_conditions internal prints
+        return # No actionable signal
+
+    # --- NEW TRADE ENTRY CONDITION for Backtest: Check if symbol is already in active_trades ---
+    # `current_active_trades_bt` is the dictionary representing active_trades passed into this function
+    if symbol in current_active_trades_bt:
+        # print(f"[SIM-{backtest_current_time}] Signal {signal_status} for {symbol} IGNORED. Symbol already has an active trade in backtest.")
+        return # Exit if symbol already has an active trade.
+
+    # Max concurrent positions check using the passed current_active_trades_bt
+    if len(current_active_trades_bt) >= configs["max_concurrent_positions"]:
+         # print(f"[SIM-{backtest_current_time}] Max concurrent positions ({configs['max_concurrent_positions']}) reached. Cannot open for new symbol {symbol}.")
          return
+    
+    # If here, signal is valid, symbol not in current_active_trades_bt, and not exceeding max positions.
+    signal = signal_status 
+    print(f"\n[SIM-{backtest_current_time}] --- New Validated Trade Signal for {symbol}: {signal} (No existing active trade in backtest) ---")
+    
+    symbol_info = symbol_info_map.get(symbol) 
+    if not symbol_info: 
+        print(f"[SIM-{backtest_current_time}] No symbol info for {symbol}. Abort signal processing."); return
 
-    # --- Symbol Cooldown Check for Backtest ---
-    # No lock needed for backtest symbol_last_trade_time if backtesting is sequential for this part.
-    last_trade_ts_bt = symbol_last_trade_time.get(symbol)
-    if last_trade_ts_bt:
-        time_since_last_trade_seconds_bt = (backtest_current_time - last_trade_ts_bt).total_seconds()
-        COOLDOWN_PERIOD_SECONDS_BT = 3600  # 1 hour
-        if time_since_last_trade_seconds_bt < COOLDOWN_PERIOD_SECONDS_BT:
-            # Don't print excessively in backtest, but log it.
-            # print(f"[SIM-{backtest_current_time}] Symbol {symbol} on cooldown. Last trade {time_since_last_trade_seconds_bt:.0f}s ago. Ignored.")
-            backtest_trade_log.append({
-                "time": backtest_current_time, "symbol": symbol, "type": "COOLDOWN_SKIP",
-                "reason": f"Last trade {time_since_last_trade_seconds_bt:.0f}s ago.",
-                "remaining_cooldown_seconds": COOLDOWN_PERIOD_SECONDS_BT - time_since_last_trade_seconds_bt
-            })
-            return
+    entry_p_signal = klines_df_for_calc['close'].iloc[-1] 
+    ema100_val = klines_df_for_calc['EMA100'].iloc[-1]
+    sl_p, tp_p = calculate_sl_tp_values(entry_p_signal, signal, ema100_val, klines_df_for_calc)
+    
+    current_sim_balance = get_simulated_account_balance()
+    # Pass configs to calculate_position_size for backtesting as well
+    qty = calculate_position_size(current_sim_balance, configs['risk_percent'], entry_p_signal, sl_p, symbol_info, configs) 
+    
+    # Calculate Risk:Reward Ratio
+    rr_ratio = None
+    if sl_p is not None and tp_p is not None and entry_p_signal != sl_p:
+        reward_abs = abs(tp_p - entry_p_signal)
+        risk_abs = abs(entry_p_signal - sl_p)
+        if risk_abs > 1e-9 : rr_ratio = reward_abs / risk_abs
 
-    # --- Calculations (same as live) ---
-    klines_df_current_slice['EMA100'] = calculate_ema(klines_df_current_slice, 100)
+    evaluated_trade_details = {
+        "time": backtest_current_time, "symbol": symbol, "type": "SIGNAL_EVALUATED",
+        "signal_side": signal, "calc_entry": entry_p_signal, "calc_sl": sl_p, "calc_tp": tp_p,
+        "calc_qty": qty if qty is not None else 0.0, "initial_rr_ratio": rr_ratio
+    }
+
+    if sl_p is None or tp_p is None:
+        print(f"[SIM-{backtest_current_time}] SL/TP calc failed for {symbol}. Abort."); 
+        evaluated_trade_details.update({"status": "REJECTED", "reason": "SL_TP_CALC_FAILED"})
+        backtest_trade_log.append(evaluated_trade_details)
+        return
+    
+    if current_sim_balance <= 0:
+        print(f"[SIM-{backtest_current_time}] Zero/unavailable simulated balance. Abort."); 
+        evaluated_trade_details.update({"status": "REJECTED", "reason": "ZERO_BALANCE"})
+        backtest_trade_log.append(evaluated_trade_details)
+        return
+
+    if qty is None or qty <= 0: 
+        print(f"[SIM-{backtest_current_time}] Invalid position size for {symbol}. Abort."); 
+        evaluated_trade_details.update({"status": "REJECTED", "reason": "INVALID_POS_SIZE", "calc_qty": qty if qty is not None else 0.0})
+        backtest_trade_log.append(evaluated_trade_details)
+        return
+        
+    if round(qty, int(symbol_info['quantityPrecision'])) == 0.0:
+        print(f"[SIM-{backtest_current_time}] Qty for {symbol} rounds to 0. Abort."); 
+        evaluated_trade_details.update({"status": "REJECTED", "reason": "QTY_ROUNDS_TO_ZERO"})
+        backtest_trade_log.append(evaluated_trade_details)
+        return
+
+    # Log evaluated signal before attempting to place
+    backtest_trade_log.append(evaluated_trade_details)
+
+    # --- Perform Pre-Order Sanity Checks for Backtest ---
+    # Note: `current_sim_balance` is used for `current_balance` parameter.
+    # `klines_df_current_slice` is passed for `klines_df_for_debug`.
+    passed_sanity_checks_bt, sanity_check_reason_bt = pre_order_sanity_checks(
+        symbol=symbol,
+        signal=signal,
+        entry_price=entry_p_signal, # entry_p_signal is used as the proposed entry for backtest
+        sl_price=sl_p,
+        tp_price=tp_p,
+        quantity=qty,
+        symbol_info=symbol_info,
+        current_balance=current_sim_balance,
+        risk_percent_config=configs['risk_percent'],
+        configs=configs,
+        klines_df_for_debug=klines_df_for_calc # Use the df with EMAs
+    )
+
+    if not passed_sanity_checks_bt:
+        print(f"[SIM-{backtest_current_time}] Pre-order sanity checks FAILED for {symbol}: {sanity_check_reason_bt}")
+        # Log this failure specifically
+        backtest_trade_log.append({
+            "time": backtest_current_time, "symbol": symbol, "type": "SANITY_CHECK_FAILED",
+            "reason": sanity_check_reason_bt, "signal_side": signal, 
+            "calc_entry": entry_p_signal, "calc_sl": sl_p, "calc_tp": tp_p, "calc_qty": qty
+        })
+        # Update the status of the previously logged "SIGNAL_EVALUATED" to "REJECTED_SANITY_CHECK"
+        # Find the last "SIGNAL_EVALUATED" for this symbol and time (should be the one just added)
+        for log_item in reversed(backtest_trade_log):
+            if log_item.get("type") == "SIGNAL_EVALUATED" and \
+               log_item.get("symbol") == symbol and \
+               log_item.get("time") == backtest_current_time:
+                log_item["status"] = "REJECTED_SANITY_CHECK"
+                log_item["reject_reason"] = sanity_check_reason_bt
+                break
+        return # Abort trade entry for backtest
+
+    print(f"[SIM-{backtest_current_time}] Pre-order sanity checks PASSED for {symbol}.")
+    # --- End of Pre-Order Sanity Checks for Backtest ---
+
+    print(f"[SIM-{backtest_current_time}] Attempting {signal} {qty} {symbol} @SIM_MARKET (EP_signal:{entry_p_signal:.4f}), SL:{sl_p:.4f}, TP:{tp_p:.4f}, RR:{(f'{rr_ratio:.2f}' if isinstance(rr_ratio, float) else 'N/A')})")
+    
+    # In backtest, MARKET order fills at current_candle_close (or open of next, configurable)
+    # For this simulation, let's assume it fills at `entry_p_signal` which is current_candle_close
+    entry_order = place_simulated_order(symbol_info, "BUY" if signal=="LONG" else "SELL", "MARKET", qty, 
+                                        current_candle_price=entry_p_signal)
+
+    if entry_order and entry_order.get('status') == 'FILLED':
+        actual_ep = float(entry_order.get('avgPrice', entry_p_signal)) # Should be entry_p_signal here
+        
+        # SL/TP might need slight re-calc if actual_ep differs from entry_p_signal due to simulated slippage
+        # For now, assume actual_ep IS entry_p_signal for simplicity if no slippage model.
+        # If slippage was modeled in place_simulated_order, then recalculate:
+        if abs(actual_ep - entry_p_signal) > 1e-9 : # If there was slippage
+            sl_dist_pct = abs(entry_p_signal - sl_p) / entry_p_signal
+            tp_dist_pct = abs(entry_p_signal - tp_p) / entry_p_signal
+            sl_p = actual_ep * (1 - sl_dist_pct if signal == "LONG" else 1 + sl_dist_pct)
+            tp_p = actual_ep * (1 + tp_dist_pct if signal == "LONG" else 1 - tp_dist_pct)
+            print(f"[SIM-{backtest_current_time}] SL/TP adjusted for actual fill {actual_ep:.4f}: SL {sl_p:.4f}, TP {tp_p:.4f}")
+
+        sl_ord = place_simulated_order(symbol_info, "SELL" if signal=="LONG" else "BUY", "STOP_MARKET", qty, stop_price=sl_p, reduce_only=True)
+        if not sl_ord: print(f"[SIM-{backtest_current_time}] CRITICAL: FAILED TO PLACE SIMULATED SL FOR {symbol}!")
+        
+        tp_ord = place_simulated_order(symbol_info, "SELL" if signal=="LONG" else "BUY", "TAKE_PROFIT_MARKET", qty, stop_price=tp_p, reduce_only=True)
+        if not tp_ord: print(f"[SIM-{backtest_current_time}] Warning: Failed to place simulated TP for {symbol}.")
+
+        # Update active_trades for the backtester's internal tracking (mirroring live bot)
+        # This active_trades is the global one, ensure it's managed correctly for backtesting context
+        # IMPORTANT: current_active_trades_bt is the one passed in, which is the global active_trades.
+        current_active_trades_bt[symbol] = {
+            "entry_order_id": entry_order['orderId'], "sl_order_id": sl_ord.get('orderId') if sl_ord else None,
+            "tp_order_id": tp_ord.get('orderId') if tp_ord else None, "entry_price": actual_ep,
+            "current_sl_price": sl_p, "current_tp_price": tp_p, "initial_sl_price": sl_p, "initial_tp_price": tp_p,
+            "quantity": qty, "side": signal, "symbol_info": symbol_info, 
+            "open_timestamp": backtest_current_time # Use backtest_current_time
+        }
+        print(f"[SIM-{backtest_current_time}] Trade for {symbol} recorded in active_trades at {current_active_trades_bt[symbol]['open_timestamp']}.")
+        
+        # Update last trade time for cooldown in backtest - REMOVED
+        # symbol_last_trade_time[symbol] = active_trades[symbol]['open_timestamp'] 
+        # print(f"[SIM-{backtest_current_time}] Updated last trade time for {symbol} to {symbol_last_trade_time[symbol]} for backtest cooldown.")
+    else:
+        print(f"[SIM-{backtest_current_time}] Simulated Market order for {symbol} failed or not filled: {entry_order}")
     klines_df_current_slice['EMA200'] = calculate_ema(klines_df_current_slice, 200)
     if klines_df_current_slice['EMA100'] is None or klines_df_current_slice['EMA200'] is None or \
        klines_df_current_slice['EMA100'].isnull().all() or klines_df_current_slice['EMA200'].isnull().all() or \
@@ -2542,10 +2529,9 @@ def manage_trade_entry_backtest(client_dummy, configs, symbol, klines_df_current
         }
         print(f"[SIM-{backtest_current_time}] Trade for {symbol} recorded in active_trades at {active_trades[symbol]['open_timestamp']}.")
         
-        # Update last trade time for cooldown in backtest
-        # No lock needed for backtest if assuming single-threaded decision making per symbol iteration
-        symbol_last_trade_time[symbol] = active_trades[symbol]['open_timestamp'] # Use the same timestamp
-        print(f"[SIM-{backtest_current_time}] Updated last trade time for {symbol} to {symbol_last_trade_time[symbol]} for backtest cooldown.")
+        # Update last trade time for cooldown in backtest - REMOVED
+        # symbol_last_trade_time[symbol] = active_trades[symbol]['open_timestamp'] 
+        # print(f"[SIM-{backtest_current_time}] Updated last trade time for {symbol} to {symbol_last_trade_time[symbol]} for backtest cooldown.")
     else:
         print(f"[SIM-{backtest_current_time}] Simulated Market order for {symbol} failed or not filled: {entry_order}")
 
@@ -2884,10 +2870,11 @@ def backtesting_loop(client, configs, monitored_symbols):
             
             # Call the modified trade entry logic
             # The `client` object passed here is a dummy or the real one but its API calls for orders/balance are mocked/redirected
-            manage_trade_entry_backtest(client, configs, symbol, klines_slice_for_symbol, symbol_info_map)
+    # Pass active_trades (the global one, used by backtester) to manage_trade_entry_backtest
+    manage_trade_entry_backtest(client, configs, symbol, klines_slice_for_symbol, symbol_info_map, active_trades)
 
         # Step D: Perform dynamic SL/TP adjustments (after all entries and SL/TP hits for the current candle)
-        monitor_active_trades_backtest(configs)
+        monitor_active_trades_backtest(configs) # This function uses the global active_trades
 
 
     # 3. Print summary report
