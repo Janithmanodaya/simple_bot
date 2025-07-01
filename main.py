@@ -645,19 +645,37 @@ def set_margin_type_on_symbol(client, symbol, margin_type):
         print(f"API Error setting margin for {symbol}: {e}"); return False
     except Exception as e: print(f"Error setting margin for {symbol}: {e}"); return False
 
-def place_new_order(client, symbol_info, side, order_type, quantity, price=None, stop_price=None, reduce_only=None):
+def place_new_order(client, symbol_info, side, order_type, quantity, price=None, stop_price=None, reduce_only=None, position_side=None, is_closing_order=False): # Added position_side and is_closing_order
     symbol, p_prec, q_prec = symbol_info['symbol'], int(symbol_info['pricePrecision']), int(symbol_info['quantityPrecision'])
     params = {"symbol": symbol, "side": side.upper(), "type": order_type.upper(), "quantity": f"{quantity:.{q_prec}f}"}
+
+    if position_side: # Add positionSide if provided
+        params["positionSide"] = position_side.upper()
+
     if order_type.upper() in ["LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"]:
         if price is None: print(f"Price needed for {order_type} on {symbol}"); return None
-        params.update({"price": f"{price:.{p_prec}f}", "timeInForce": "GTC"})
+        params.update({"price": f"{price:.{p_prec}f}", "timeInForce": "GTC"}) # GTC for limit type orders
+    
     if order_type.upper() in ["STOP_MARKET", "TAKE_PROFIT_MARKET", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"]:
         if stop_price is None: print(f"Stop price needed for {order_type} on {symbol}"); return None
         params["stopPrice"] = f"{stop_price:.{p_prec}f}"
-    if reduce_only is not None: params["reduceOnly"] = str(reduce_only).lower()
+        # If it's an SL/TP order, use closePosition=True instead of reduceOnly
+        if is_closing_order:
+            params["closePosition"] = "true" # API expects string "true"
+            if "reduceOnly" in params: # Remove reduceOnly if closePosition is used
+                del params["reduceOnly"]
+        elif reduce_only is not None: # Fallback to reduce_only if not explicitly a closing order but reduce_only is specified
+             params["reduceOnly"] = str(reduce_only).lower()
+
+    # For entry orders (not SL/TP), reduceOnly should not be set unless specifically intended for position reduction without full closure
+    # If it's not a closing order and reduce_only is explicitly passed, respect it.
+    # Otherwise, for typical entry orders, neither closePosition nor reduceOnly are needed.
+    elif reduce_only is not None: # This handles cases where reduce_only is passed for non-SL/TP orders
+        params["reduceOnly"] = str(reduce_only).lower()
+        
     try:
         order = client.futures_create_order(**params)
-        print(f"Order PLACED: {order['symbol']} ID {order['orderId']} {order['side']} {order['type']} {order['origQty']} @ {order.get('price','MARKET')} SP:{order.get('stopPrice','N/A')} AvgP:{order.get('avgPrice','N/A')} Status:{order['status']}")
+        print(f"Order PLACED: {order['symbol']} ID {order['orderId']} {order.get('positionSide','N/A')} {order['side']} {order['type']} {order['origQty']} @ {order.get('price','MARKET')} SP:{order.get('stopPrice','N/A')} CP:{order.get('closePosition','false')} RO:{order.get('reduceOnly','false')} AvgP:{order.get('avgPrice','N/A')} Status:{order['status']}")
         return order
     except Exception as e: print(f"ORDER FAILED for {symbol} {side} {quantity} {order_type}: {e}"); return None
 
@@ -1178,8 +1196,17 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is
             return 
 
         print(f"{log_prefix} Pre-order sanity checks PASSED.")
-        print(f"{log_prefix} Attempting {signal} {qty_to_order_final} {symbol} @MKT (EP:{entry_p:.{symbol_info['pricePrecision']}f}), SL:{sl_p_calc:.{symbol_info['pricePrecision']}f}, TP:{tp_p_calc:.{symbol_info['pricePrecision']}f}")
-        entry_order = place_new_order(client, symbol_info, "BUY" if signal=="LONG" else "SELL", "MARKET", qty_to_order_final)
+        
+        # Determine positionSide based on signal
+        position_side_for_trade = "LONG" if signal == "LONG" else "SHORT"
+
+        print(f"{log_prefix} Attempting {signal} ({position_side_for_trade}) {qty_to_order_final} {symbol} @MKT (EP:{entry_p:.{symbol_info['pricePrecision']}f}), SL:{sl_p_calc:.{symbol_info['pricePrecision']}f}, TP:{tp_p_calc:.{symbol_info['pricePrecision']}f}")
+        entry_order = place_new_order(client, 
+                                      symbol_info, 
+                                      "BUY" if signal=="LONG" else "SELL", 
+                                      "MARKET", 
+                                      qty_to_order_final,
+                                      position_side=position_side_for_trade)
 
         if not entry_order or entry_order.get('status') != 'FILLED':
             reason = f"Market entry order failed or not filled. Status: {entry_order.get('status') if entry_order else 'N/A'}."
@@ -1187,34 +1214,110 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is
             send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p_calc, tp_p_calc, qty_to_order_final, symbol_info, configs)
             return
         
-        print(f"{log_prefix} Market entry order FILLED. Details: {entry_order}")
-        actual_ep = float(entry_order.get('avgPrice', entry_p))
-        
-        # SL/TP prices might need adjustment based on actual fill price
-        # Use sl_p_calc and tp_p_calc (from initial calculation) to derive percentages relative to entry_p (signal price)
-        # Then apply these percentages to actual_ep
-        final_sl_price = sl_p_calc
-        final_tp_price = tp_p_calc
+        # --- Final Lock for Order Placement and active_trades update ---
+        with lock: # This is active_trades_lock
+            # Perform the final check for max concurrent positions INSIDE the lock,
+            # right before placing the order.
+            if len(active_trades) >= configs["max_concurrent_positions"]:
+                print(f"{log_prefix} Final check: Max concurrent positions ({configs['max_concurrent_positions']}) filled by another thread just before placing order for {symbol}. Aborting.")
+                # Optionally, send a specific notification for this scenario
+                # send_trade_rejection_notification(symbol, signal, "Max positions filled (race condition)", entry_p, sl_p_calc, tp_p_calc, qty_to_order_final, symbol_info, configs)
+                return
 
-        if entry_p > 0 : # Ensure entry_p (signal price) is not zero to avoid division by zero
-            sl_dist_pct = abs(entry_p - sl_p_calc) / entry_p
-            tp_dist_pct = abs(entry_p - tp_p_calc) / entry_p
-            
-            sl_p_adj = actual_ep * (1 - sl_dist_pct if signal == "LONG" else 1 + sl_dist_pct)
-            tp_p_adj = actual_ep * (1 + tp_dist_pct if signal == "LONG" else 1 - tp_dist_pct)
-            
-            price_prec_for_print = int(symbol_info.get('pricePrecision', 2))
-            print(f"SL/TP adjusted for actual fill {actual_ep:.{price_prec_for_print}f}: SL {sl_p_adj:.{price_prec_for_print}f}, TP {tp_p_adj:.{price_prec_for_print}f}")
-            final_sl_price, final_tp_price = sl_p_adj, tp_p_adj # Update to adjusted values for order placement
+            # If check passes, proceed to place entry order
+            entry_order = place_new_order(client, 
+                                          symbol_info, 
+                                          "BUY" if signal=="LONG" else "SELL", 
+                                          "MARKET", 
+                                          qty_to_order_final,
+                                          position_side=position_side_for_trade)
 
-        sl_ord = place_new_order(client, symbol_info, "SELL" if signal=="LONG" else "BUY", "STOP_MARKET", qty_to_order_final, stop_price=final_sl_price, reduce_only=True)
+            if not entry_order or entry_order.get('status') != 'FILLED':
+                reason = f"Market entry order failed or not filled (within final lock). Status: {entry_order.get('status') if entry_order else 'N/A'}."
+                print(f"{log_prefix} {reason} for {symbol}: {entry_order}")
+                # Note: This rejection happens inside the lock. If it's frequent, it might briefly hold up other threads.
+                # However, order placement failures should be relatively rare with prior checks.
+                send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p_calc, tp_p_calc, qty_to_order_final, symbol_info, configs)
+                return # Return from within the lock if entry order fails
+            
+            print(f"{log_prefix} Market entry order FILLED. Details: {entry_order}")
+            actual_ep = float(entry_order.get('avgPrice', entry_p))
+            
+            final_sl_price = sl_p_calc
+            final_tp_price = tp_p_calc
+
+            if entry_p > 0 : 
+                sl_dist_pct = abs(entry_p - sl_p_calc) / entry_p
+                tp_dist_pct = abs(entry_p - tp_p_calc) / entry_p
+                
+                sl_p_adj = actual_ep * (1 - sl_dist_pct if signal == "LONG" else 1 + sl_dist_pct)
+                tp_p_adj = actual_ep * (1 + tp_dist_pct if signal == "LONG" else 1 - tp_dist_pct)
+                
+                price_prec_for_print = int(symbol_info.get('pricePrecision', 2))
+                print(f"SL/TP adjusted for actual fill {actual_ep:.{price_prec_for_print}f}: SL {sl_p_adj:.{price_prec_for_print}f}, TP {tp_p_adj:.{price_prec_for_print}f}")
+                final_sl_price, final_tp_price = sl_p_adj, tp_p_adj
+
+            # SL and TP orders are placed after the entry order is confirmed and still within the main lock.
+            # This ensures that if SL/TP placement fails, the trade isn't fully recorded in active_trades
+            # without its SL/TP, or handled more gracefully.
+            # However, placing SL/TP outside the immediate lock of adding to active_trades might be cleaner
+            # if their failure doesn't mean the main trade should be unwound (which is hard with market orders).
+            # For now, keeping them conceptually linked but their placement calls are outside this specific `active_trades` update lock.
+            # The critical part is that `active_trades` is updated atomically with the *decision* to trade based on slot availability.
+
+            # Record the trade in active_trades
+            current_pd_timestamp = pd.Timestamp.now(tz='UTC') 
+            # Pre-initialize sl_order_id and tp_order_id to None for the new_trade_data
+            # They will be updated after SL/TP placement attempts.
+            new_trade_data = {
+                "entry_order_id": entry_order['orderId'], 
+                "sl_order_id": None, # Initialize as None
+                "tp_order_id": None, # Initialize as None
+                "entry_price": actual_ep,
+                "current_sl_price": final_sl_price, "current_tp_price": final_tp_price, 
+                "initial_sl_price": final_sl_price, "initial_tp_price": final_tp_price, 
+                "quantity": qty_to_order_final, "side": signal, 
+                "symbol_info": symbol_info, "open_timestamp": current_pd_timestamp
+            }
+            active_trades[symbol] = new_trade_data
+            print(f"{log_prefix} Trade for {symbol} (Entry ID: {entry_order['orderId']}) preliminarily recorded in active_trades. SL/TP placement follows.")
+
+        # --- SL/TP Placement (occurs outside the immediate active_trades update lock for atomicity of count) ---
+        # This means if SL/TP placement fails, the trade is already in active_trades.
+        # The safety net (ensure_sl_tp_for_all_open_positions) is crucial to catch this.
+        # And immediate SL/TP failure alert is also important.
+
+        sl_ord = place_new_order(client, 
+                                 symbol_info, 
+                                 "SELL" if signal=="LONG" else "BUY", 
+                                 "STOP_MARKET", 
+                                 qty_to_order_final, 
+                                 stop_price=final_sl_price, 
+                                 position_side=position_side_for_trade,
+                                 is_closing_order=True)
         if not sl_ord: print(f"{log_prefix} CRITICAL: FAILED TO PLACE SL! Details: {sl_ord}"); 
-        else: print(f"{log_prefix} SL order placed. Details: {sl_ord}")
+        else: 
+            print(f"{log_prefix} SL order placed. Details: {sl_ord}")
+            with lock: # Update active_trades with SL order ID
+                if symbol in active_trades and active_trades[symbol]["entry_order_id"] == entry_order['orderId']:
+                    active_trades[symbol]['sl_order_id'] = sl_ord.get('orderId')
         
-        tp_ord = place_new_order(client, symbol_info, "SELL" if signal=="LONG" else "BUY", "TAKE_PROFIT_MARKET", qty_to_order_final, stop_price=final_tp_price, reduce_only=True)
+        tp_ord = place_new_order(client, 
+                                 symbol_info, 
+                                 "SELL" if signal=="LONG" else "BUY", 
+                                 "TAKE_PROFIT_MARKET", 
+                                 qty_to_order_final, 
+                                 stop_price=final_tp_price, 
+                                 position_side=position_side_for_trade,
+                                 is_closing_order=True)
         if not tp_ord: print(f"{log_prefix} Warning: Failed to place TP. Details: {tp_ord}")
-        else: print(f"{log_prefix} TP order placed. Details: {tp_ord}")
+        else: 
+            print(f"{log_prefix} TP order placed. Details: {tp_ord}")
+            with lock: # Update active_trades with TP order ID
+                if symbol in active_trades and active_trades[symbol]["entry_order_id"] == entry_order['orderId']:
+                     active_trades[symbol]['tp_order_id'] = tp_ord.get('orderId')
 
+        # Check for SL/TP placement failures and send alert
         if not sl_ord or not tp_ord:
             failure_reason_list = []
             if not sl_ord: failure_reason_list.append("SL placement failed")
@@ -1222,6 +1325,7 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is
             combined_reason_str = " and ".join(failure_reason_list)
             error_message_str = f"❌ {log_prefix} CRITICAL SL/TP PLACEMENT FAILURE for {symbol} immediately after entry: {combined_reason_str}. Entry ID: {entry_order['orderId']}. SL: {sl_ord}, TP: {tp_ord}"
             print(error_message_str)
+            # Telegram alert logic (already exists)
             if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
                 telegram_alert_msg = (
                     f"⚠️ IMMEDIATE SL/TP PLACEMENT FAILURE ⚠️\n\n"
@@ -1315,14 +1419,41 @@ def monitor_active_trades(client, configs): # Needs lock for active_trades acces
         except Exception as e: print(f"Error getting position for {symbol} in monitor: {e}"); continue
 
         if not pos_exists:
-            print(f"Position for {symbol} closed/zero. Removing from active list.")
+            print(f"Position for {symbol} closed/zero. Attempting OCO cancellation and removing from active list.")
+            
+            # --- OCO Logic Implementation ---
+            # If position is closed, try to cancel the corresponding SL and TP orders.
+            # One of them might have triggered the closure, the other is now orphaned.
+            sl_order_id_to_cancel = trade_details.get('sl_order_id')
+            tp_order_id_to_cancel = trade_details.get('tp_order_id')
+
+            if sl_order_id_to_cancel:
+                try:
+                    print(f"Attempting to cancel SL order {sl_order_id_to_cancel} for closed position {symbol} (OCO)...")
+                    client.futures_cancel_order(symbol=symbol, orderId=sl_order_id_to_cancel)
+                    print(f"Successfully cancelled SL order {sl_order_id_to_cancel} for {symbol} as part of OCO.")
+                except BinanceAPIException as e:
+                    if e.code == -2011: # Order filled or cancelled / Does not exist
+                        print(f"SL order {sl_order_id_to_cancel} for {symbol} already filled or does not exist (OCO check). Code: {e.code}")
+                    else:
+                        print(f"API Error cancelling SL order {sl_order_id_to_cancel} for {symbol} (OCO): {e}")
+                except Exception as e:
+                    print(f"Unexpected error cancelling SL order {sl_order_id_to_cancel} for {symbol} (OCO): {e}")
+            
+            if tp_order_id_to_cancel:
+                try:
+                    print(f"Attempting to cancel TP order {tp_order_id_to_cancel} for closed position {symbol} (OCO)...")
+                    client.futures_cancel_order(symbol=symbol, orderId=tp_order_id_to_cancel)
+                    print(f"Successfully cancelled TP order {tp_order_id_to_cancel} for {symbol} as part of OCO.")
+                except BinanceAPIException as e:
+                    if e.code == -2011: # Order filled or cancelled / Does not exist
+                        print(f"TP order {tp_order_id_to_cancel} for {symbol} already filled or does not exist (OCO check). Code: {e.code}")
+                    else:
+                        print(f"API Error cancelling TP order {tp_order_id_to_cancel} for {symbol} (OCO): {e}")
+                except Exception as e:
+                    print(f"Unexpected error cancelling TP order {tp_order_id_to_cancel} for {symbol} (OCO): {e}")
+            
             symbols_to_remove.append(symbol)
-            # Cancel any residual SL/TP (already done if bot closed it, but good for external close)
-            for oid_key in ['sl_order_id', 'tp_order_id']:
-                oid = trade_details.get(oid_key)
-                if oid:
-                    try: client.futures_cancel_order(symbol=symbol, orderId=oid)
-                    except Exception: pass # Ignore errors, order might be gone
             continue
 
         # Dynamic SL/TP adjustment logic
@@ -1335,38 +1466,56 @@ def monitor_active_trades(client, configs): # Needs lock for active_trades acces
                                                         trade_details['side'])
         s_info = trade_details['symbol_info']
         qty = trade_details['quantity']
-        side = trade_details['side']
+        original_trade_side = trade_details['side'] # This is "LONG" or "SHORT" for the main position
+        # positionSide for SL/TP orders should match the main position's side.
+        position_side_for_sl_tp = original_trade_side 
         updated_orders = False
 
         if new_sl is not None and abs(new_sl - trade_details['current_sl_price']) > 1e-9:
-            print(f"Adjusting SL for {symbol} to {new_sl:.4f}")
+            print(f"Adjusting SL for {symbol} ({position_side_for_sl_tp}) to {new_sl:.4f}")
             if trade_details.get('sl_order_id'): # Cancel old
                 try: client.futures_cancel_order(symbol=symbol, orderId=trade_details['sl_order_id'])
                 except Exception as e: print(f"Warn: Old SL {trade_details['sl_order_id']} for {symbol} cancel fail: {e}")
-            # Place new
-            sl_ord_new = place_new_order(client, s_info, "SELL" if side=="LONG" else "BUY", "STOP_MARKET", qty, stop_price=new_sl, reduce_only=True)
+            
+            # Place new SL order
+            sl_ord_new = place_new_order(client, 
+                                         s_info, 
+                                         "SELL" if original_trade_side == "LONG" else "BUY", # Order side is opposite to position
+                                         "STOP_MARKET", 
+                                         qty, 
+                                         stop_price=new_sl, 
+                                         position_side=position_side_for_sl_tp,
+                                         is_closing_order=True)
             if sl_ord_new: 
-                with active_trades_lock: # Lock for update
-                    if symbol in active_trades: # Check if still there (might have been removed if pos closed rapidly)
+                with active_trades_lock: 
+                    if symbol in active_trades: 
                          active_trades[symbol]['current_sl_price'] = new_sl
                          active_trades[symbol]['sl_order_id'] = sl_ord_new.get('orderId')
                          updated_orders = True
-            else: print(f"CRITICAL: FAILED TO PLACE NEW SL FOR {symbol}!")
+            else: print(f"CRITICAL: FAILED TO PLACE NEW DYNAMIC SL FOR {symbol}!")
         
         if new_tp is not None and abs(new_tp - trade_details['current_tp_price']) > 1e-9:
-            print(f"Adjusting TP for {symbol} to {new_tp:.4f}")
+            print(f"Adjusting TP for {symbol} ({position_side_for_sl_tp}) to {new_tp:.4f}")
             if trade_details.get('tp_order_id'): # Cancel old
                 try: client.futures_cancel_order(symbol=symbol, orderId=trade_details['tp_order_id'])
                 except Exception as e: print(f"Warn: Old TP {trade_details['tp_order_id']} for {symbol} cancel fail: {e}")
-            # Place new
-            tp_ord_new = place_new_order(client, s_info, "SELL" if side=="LONG" else "BUY", "TAKE_PROFIT_MARKET", qty, stop_price=new_tp, reduce_only=True)
+
+            # Place new TP order
+            tp_ord_new = place_new_order(client, 
+                                         s_info, 
+                                         "SELL" if original_trade_side == "LONG" else "BUY", # Order side is opposite to position
+                                         "TAKE_PROFIT_MARKET", 
+                                         qty, 
+                                         stop_price=new_tp, 
+                                         position_side=position_side_for_sl_tp,
+                                         is_closing_order=True)
             if tp_ord_new: 
-                with active_trades_lock: # Lock for update
+                with active_trades_lock: 
                      if symbol in active_trades:
                         active_trades[symbol]['current_tp_price'] = new_tp
                         active_trades[symbol]['tp_order_id'] = tp_ord_new.get('orderId')
                         updated_orders = True
-            else: print(f"Warning: Failed to place new TP for {symbol}.")
+            else: print(f"Warning: Failed to place new dynamic TP for {symbol}.")
         
         if updated_orders: get_open_orders(client, symbol) # Show updated orders
 
@@ -1450,31 +1599,60 @@ def trading_loop(client, configs, monitored_symbols):
                 # The rest of the loop (symbol processing, monitoring) will still run.
                 # manage_trade_entry has its own balance check.
 
-                futures = []
-                print(f"Submitting {len(monitored_symbols)} symbol tasks to {configs.get('max_scan_threads')} threads... {format_elapsed_time(cycle_start_time)}")
-                for symbol in monitored_symbols:
-                    futures.append(executor.submit(process_symbol_task, symbol, client, configs, active_trades_lock))
-                
-                processed_count = 0
-                for future in as_completed(futures):
-                    try: result = future.result(); # print(f"Task result: {result}") # Optional: log task result
-                    except Exception as e_future: print(f"Task error: {e_future}")
-                    processed_count += 1
-                    if processed_count % (len(monitored_symbols)//5 or 1) == 0 or processed_count == len(monitored_symbols): # Log progress periodically
-                         print(f"Symbol tasks progress: {processed_count}/{len(monitored_symbols)} completed. {format_elapsed_time(cycle_start_time)}")
-                print(f"All symbol tasks completed for cycle. {format_elapsed_time(cycle_start_time)}")
+                # --- Check for max concurrent positions ---
+                with active_trades_lock: # Ensure thread-safe reading of active_trades length
+                    num_active_trades = len(active_trades)
 
-                monitor_active_trades(client, configs) # Monitor after scan
-                print(f"Active trades monitoring complete. {format_elapsed_time(cycle_start_time)}")
+                if num_active_trades >= configs["max_concurrent_positions"]:
+                    print(f"Max concurrent positions ({configs['max_concurrent_positions']}) reached. Pausing new trade scanning. Monitoring existing trades. {format_elapsed_time(cycle_start_time)}")
+                    
+                    # Still monitor existing trades and ensure SL/TP
+                    monitor_active_trades(client, configs)
+                    print(f"Active trades monitoring complete (while paused). {format_elapsed_time(cycle_start_time)}")
 
-                # --- SL/TP Safety Net Check for All Open Positions ---
-                # Initialize a cache for symbol_info for this cycle of the safety net check
-                # Alternatively, could try to pass/build upon the main symbol_info_map if available and up-to-date
-                symbol_info_cache_for_safety_net = {} 
-                print(f"Running SL/TP safety net check for all open positions... {format_elapsed_time(cycle_start_time)}")
-                ensure_sl_tp_for_all_open_positions(client, configs, active_trades, symbol_info_cache_for_safety_net)
-                print(f"SL/TP safety net check complete. {format_elapsed_time(cycle_start_time)}")
-                # --- End SL/TP Safety Net Check ---
+                    symbol_info_cache_for_safety_net = {}
+                    print(f"Running SL/TP safety net check (while paused)... {format_elapsed_time(cycle_start_time)}")
+                    ensure_sl_tp_for_all_open_positions(client, configs, active_trades, symbol_info_cache_for_safety_net)
+                    print(f"SL/TP safety net check complete (while paused). {format_elapsed_time(cycle_start_time)}")
+                    
+                    # Shorter wait time when paused, to quickly pick up when a slot frees up
+                    paused_wait_time_seconds = 60 
+                    print(f"Waiting for {paused_wait_time_seconds} seconds before re-checking position availability...")
+                    time.sleep(paused_wait_time_seconds)
+                    # End of this cycle's operations when paused
+                    cycle_dur_s_paused = time.time() - cycle_start_time
+                    print(f"\n--- Paused Scan Cycle #{current_cycle_number} Completed (Runtime: {cycle_dur_s_paused:.2f}s). Re-evaluating positions. ---")
+                    continue # Skip to the next iteration of the while loop to re-check conditions
+
+                else: # Space available for new trades
+                    print(f"Space available for new trades ({num_active_trades}/{configs['max_concurrent_positions']}). Proceeding with symbol scan. {format_elapsed_time(cycle_start_time)}")
+                    futures = []
+                    print(f"Submitting {len(monitored_symbols)} symbol tasks to {configs.get('max_scan_threads')} threads... {format_elapsed_time(cycle_start_time)}")
+                    for symbol in monitored_symbols:
+                        futures.append(executor.submit(process_symbol_task, symbol, client, configs, active_trades_lock))
+                    
+                    processed_count = 0
+                    for future in as_completed(futures):
+                        try: result = future.result(); # print(f"Task result: {result}") # Optional: log task result
+                        except Exception as e_future: print(f"Task error: {e_future}")
+                        processed_count += 1
+                        if processed_count % (len(monitored_symbols)//5 or 1) == 0 or processed_count == len(monitored_symbols): # Log progress periodically
+                             print(f"Symbol tasks progress: {processed_count}/{len(monitored_symbols)} completed. {format_elapsed_time(cycle_start_time)}")
+                    print(f"All symbol tasks completed for cycle. {format_elapsed_time(cycle_start_time)}")
+
+                    monitor_active_trades(client, configs) # Monitor after scan
+                    print(f"Active trades monitoring complete. {format_elapsed_time(cycle_start_time)}")
+
+                    # --- SL/TP Safety Net Check for All Open Positions ---
+                    symbol_info_cache_for_safety_net = {} 
+                    print(f"Running SL/TP safety net check for all open positions... {format_elapsed_time(cycle_start_time)}")
+                    ensure_sl_tp_for_all_open_positions(client, configs, active_trades, symbol_info_cache_for_safety_net)
+                    print(f"SL/TP safety net check complete. {format_elapsed_time(cycle_start_time)}")
+                    # --- End SL/TP Safety Net Check ---
+                    
+                    # Standard loop delay when not paused
+                    print(f"Waiting for {configs['loop_delay_minutes']} m...")
+                    time.sleep(configs['loop_delay_minutes'] * 24 ) # Convert minutes to seconds
 
             except Exception as loop_err: # Catch errors within the try block of the loop
                 print(f"ERROR in trading loop cycle: {loop_err} {format_elapsed_time(cycle_start_time)}")
@@ -1483,40 +1661,47 @@ def trading_loop(client, configs, monitored_symbols):
             cycle_dur_s = time.time() - cycle_start_time
             print(f"\n--- Scan Cycle #{current_cycle_number} Completed (Runtime: {cycle_dur_s:.2f}s / {(cycle_dur_s/60):.2f}min). ---")
 
-            # Send status update every 100 cycles
+            # Send status update every 100 cycles (This part remains largely the same, just ensure it's outside the 'else' of the pause logic)
             if current_cycle_number > 0 and current_cycle_number % 100 == 0:
                 print(f"Scan cycle {current_cycle_number} reached. Sending status update to Telegram...")
                 if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
                     current_balance_for_update = get_account_balance(client, configs)
-                    if current_balance_for_update is None: # Handle critical balance fetch error
-                        current_balance_for_update = "Error fetching" # Placeholder for message
+                    if current_balance_for_update is None: 
+                        current_balance_for_update = "Error fetching" 
 
                     open_pos_text_update = "None"
-                    if client: # Check if client is valid
-                        if configs["mode"] == "live": # Ensure it's live mode for position check
-                            # Use the new formatting option
-                            with active_trades_lock: # Lock when reading active_trades
+                    if client: 
+                        if configs["mode"] == "live": 
+                            with active_trades_lock: 
                                 s_info_map_for_status_update = _build_symbol_info_map_from_active_trades(active_trades)
-                                # Pass a copy of active_trades to avoid issues if it's modified elsewhere
-                                # while get_open_positions is running, though the lock helps.
                                 current_active_trades_copy = active_trades.copy()
                             open_pos_text_update = get_open_positions(client, format_for_telegram=True, active_trades_data=current_active_trades_copy, symbol_info_map=s_info_map_for_status_update)
                         else:
-                            open_pos_text_update = "None (Backtest Mode)" # Should not happen if in live trading_loop
+                            open_pos_text_update = "None (Backtest Mode)" 
                     else:
-                        open_pos_text_update = "N/A (Client not initialized)" # Should not happen
+                        open_pos_text_update = "N/A (Client not initialized)" 
 
                     retrieved_bot_start_time_str = configs.get('bot_start_time_str', 'N/A')
                     
                     status_update_msg = build_startup_message(configs, current_balance_for_update, open_pos_text_update, retrieved_bot_start_time_str)
                     send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], status_update_msg)
-                    configs["last_startup_message"] = status_update_msg # Update for /command3
+                    configs["last_startup_message"] = status_update_msg 
                     print("Telegram status update sent.")
                 else:
                     print("Telegram not configured, skipping status update message.")
+            
+            # This `time.sleep` was part of the original `else` block for normal operation.
+            # If the loop was paused, it `continue`d before reaching here.
+            # If it was a normal cycle, this sleep is now handled within the `else` block above.
+            # So, this specific `print` and `time.sleep` might be redundant or needs to be placed carefully
+            # if there's a path that reaches here without either sleeping for pause or sleeping for normal delay.
+            # Let's assume the `time.sleep` is correctly placed within the `else` for normal operation,
+            # and the `continue` handles the pause. The `print(f"Waiting for {configs['loop_delay_minutes']} m...")`
+            # should also be within that `else`.
 
-            print(f"Waiting for {configs['loop_delay_minutes']} m...")
-            time.sleep(configs['loop_delay_minutes'] )
+            # Corrected structure: The loop_delay_minutes sleep should only happen if NOT paused.
+            # The current diff places it correctly inside the `else` block for normal operation.
+            # The status update logic can remain common after the main try/except of the cycle.
     finally:
         print("Shutting down thread pool executor...")
         executor.shutdown(wait=True) # Ensure all threads finish before exiting loop/program
@@ -1772,43 +1957,50 @@ def ensure_sl_tp_for_all_open_positions(client, configs, active_trades_ref, symb
                             break
 
                 if not sl_order_active:
-                    print(f"{log_prefix} SL order for managed trade {symbol} is MISSING or incorrect. Attempting to re-place.")
-                    new_sl_order = place_new_order(client, s_info_managed, 
+                    print(f"{log_prefix} SL order for managed trade {symbol} ({side}) is MISSING or incorrect. Attempting to re-place.")
+                    new_sl_order = place_new_order(client, 
+                                                   s_info_managed, 
                                                    "SELL" if side == "LONG" else "BUY", 
-                                                   "STOP_MARKET", qty_for_new_sl_tp_orders, 
-                                                   stop_price=target_sl_price, reduce_only=True)
+                                                   "STOP_MARKET", 
+                                                   qty_for_new_sl_tp_orders, 
+                                                   stop_price=target_sl_price, 
+                                                   position_side=side, # side here is the position's side (LONG/SHORT)
+                                                   is_closing_order=True)
                     if new_sl_order and new_sl_order.get('orderId'):
                         print(f"{log_prefix} Successfully re-placed SL order for {symbol}. New ID: {new_sl_order['orderId']}")
-                        with active_trades_lock: # Lock to update shared active_trades
-                             if symbol in active_trades_ref: # Check again as it might have been removed by another thread
+                        with active_trades_lock: 
+                             if symbol in active_trades_ref: 
                                 active_trades_ref[symbol]['sl_order_id'] = new_sl_order['orderId']
-                        # Send Telegram notification for successful re-placement
                         send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"),
-                                              f"✅ {log_prefix} Re-placed MISSING SL for managed {symbol} @ {target_sl_price:.{s_info_managed['pricePrecision']}f}")
+                                              f"✅ {log_prefix} Re-placed MISSING SL for managed {symbol} ({side}) @ {target_sl_price:.{s_info_managed['pricePrecision']}f}")
                     else:
-                        err_msg_sl = f"⚠️ {log_prefix} FAILED to re-place SL for managed {symbol}. Target SL: {target_sl_price:.{s_info_managed['pricePrecision']}f}. Details: {new_sl_order or 'No order object'}"
+                        err_msg_sl = f"⚠️ {log_prefix} FAILED to re-place SL for managed {symbol} ({side}). Target SL: {target_sl_price:.{s_info_managed['pricePrecision']}f}. Details: {new_sl_order or 'No order object'}"
                         print(err_msg_sl)
                         send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"), err_msg_sl)
 
                 if not tp_order_active:
-                    print(f"{log_prefix} TP order for managed trade {symbol} is MISSING or incorrect. Attempting to re-place.")
-                    new_tp_order = place_new_order(client, s_info_managed,
+                    print(f"{log_prefix} TP order for managed trade {symbol} ({side}) is MISSING or incorrect. Attempting to re-place.")
+                    new_tp_order = place_new_order(client, 
+                                                   s_info_managed,
                                                    "SELL" if side == "LONG" else "BUY",
-                                                   "TAKE_PROFIT_MARKET", qty_for_new_sl_tp_orders,
-                                                   stop_price=target_tp_price, reduce_only=True)
+                                                   "TAKE_PROFIT_MARKET", 
+                                                   qty_for_new_sl_tp_orders,
+                                                   stop_price=target_tp_price, 
+                                                   position_side=side, # side here is the position's side (LONG/SHORT)
+                                                   is_closing_order=True)
                     if new_tp_order and new_tp_order.get('orderId'):
                         print(f"{log_prefix} Successfully re-placed TP order for {symbol}. New ID: {new_tp_order['orderId']}")
-                        with active_trades_lock: # Lock to update shared active_trades
+                        with active_trades_lock: 
                             if symbol in active_trades_ref:
                                 active_trades_ref[symbol]['tp_order_id'] = new_tp_order['orderId']
                         send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"),
-                                              f"✅ {log_prefix} Re-placed MISSING TP for managed {symbol} @ {target_tp_price:.{s_info_managed['pricePrecision']}f}")
+                                              f"✅ {log_prefix} Re-placed MISSING TP for managed {symbol} ({side}) @ {target_tp_price:.{s_info_managed['pricePrecision']}f}")
                     else:
-                        err_msg_tp = f"⚠️ {log_prefix} FAILED to re-place TP for managed {symbol}. Target TP: {target_tp_price:.{s_info_managed['pricePrecision']}f}. Details: {new_tp_order or 'No order object'}"
+                        err_msg_tp = f"⚠️ {log_prefix} FAILED to re-place TP for managed {symbol} ({side}). Target TP: {target_tp_price:.{s_info_managed['pricePrecision']}f}. Details: {new_tp_order or 'No order object'}"
                         print(err_msg_tp)
                         send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"), err_msg_tp)
-            else:
-                print(f"{log_prefix} {symbol} is UNMANAGED by the bot. Attempting to calculate and set SL/TP.")
+            else: # UNMANAGED TRADE
+                print(f"{log_prefix} {symbol} is UNMANAGED by the bot. Attempting to calculate and set SL/TP ({side} position).")
                 
                 # 1. Fetch Symbol Info (use cache)
                 s_info_unmanaged = symbol_info_cache.get(symbol)
@@ -2869,9 +3061,9 @@ def backtesting_loop(client, configs, monitored_symbols):
                 continue
             
             # Call the modified trade entry logic
-            # The `client` object passed here is a dummy or the real one but its API calls for orders/balance are mocked/redirected
-    # Pass active_trades (the global one, used by backtester) to manage_trade_entry_backtest
-    manage_trade_entry_backtest(client, configs, symbol, klines_slice_for_symbol, symbol_info_map, active_trades)
+                # The `client` object passed here is a dummy or the real one but its API calls for orders/balance are mocked/redirected
+        # Pass active_trades (the global one, used by backtester) to manage_trade_entry_backtest
+        manage_trade_entry_backtest(client, configs, symbol, klines_slice_for_symbol, symbol_info_map, active_trades)
 
         # Step D: Perform dynamic SL/TP adjustments (after all entries and SL/TP hits for the current candle)
         monitor_active_trades_backtest(configs) # This function uses the global active_trades
