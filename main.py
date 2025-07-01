@@ -40,6 +40,15 @@ DEFAULT_ALLOW_EXCEED_RISK_FOR_MIN_NOTIONAL = False # Default for allowing higher
 active_trades = {}
 active_trades_lock = threading.Lock() # Lock for synchronizing access to active_trades
 
+# Stores the timestamp of the last trade initiation for each symbol to manage cooldowns.
+# Key: symbol (e.g., "BTCUSDT"), Value: pd.Timestamp
+symbol_last_trade_time = {}
+symbol_last_trade_time_lock = threading.Lock() # Lock for synchronizing access to symbol_last_trade_time
+
+# Set to keep track of symbols currently being processed by manage_trade_entry to prevent race conditions.
+symbols_currently_processing = set()
+symbols_currently_processing_lock = threading.Lock()
+
 # --- Utility and Configuration Functions ---
 
 def get_public_ip():
@@ -884,6 +893,137 @@ def calculate_position_size(balance, risk_pct, entry, sl, symbol_info, configs=N
     print(f"Calculated Position Size: {adj_size} for {symbol_info['symbol']} (Risk: ${(adj_size*abs(entry-sl)):.2f}, Notional: ${(adj_size*entry):.2f})")
     return adj_size
 
+# --- Pre-Order Sanity Checks ---
+def pre_order_sanity_checks(symbol, signal, entry_price, sl_price, tp_price, quantity, 
+                            symbol_info, current_balance, risk_percent_config, configs, 
+                            klines_df_for_debug=None, is_unmanaged_check=False): # Added is_unmanaged_check
+    """
+    Performs a series of checks before placing an order to ensure parameters are valid
+    and risk is managed according to configuration.
+    For unmanaged checks, risk percentage validation is skipped.
+
+    Args:
+        symbol (str): Trading symbol (e.g., "BTCUSDT").
+        signal (str): "LONG" or "SHORT".
+        entry_price (float): Proposed entry price.
+        sl_price (float): Proposed stop-loss price.
+        tp_price (float): Proposed take-profit price.
+        quantity (float): Proposed quantity to trade.
+        symbol_info (dict): Symbol information from Binance API.
+        current_balance (float): Current account balance.
+        risk_percent_config (float): User-configured risk percentage (e.g., 0.01 for 1%).
+        configs (dict): Overall bot configurations.
+        klines_df_for_debug (pd.DataFrame, optional): Kline data, for potential future advanced checks like ATR.
+
+    Returns:
+        tuple: (bool, str) - (True, "Checks passed") if all checks are okay.
+                             (False, "Reason for failure") if any check fails.
+    """
+    p_prec = int(symbol_info['pricePrecision'])
+    q_prec = int(symbol_info['quantityPrecision'])
+
+    # 1. Price Sanity Checks
+    if not all(isinstance(p, (int, float)) and p > 0 and math.isfinite(p) for p in [entry_price, sl_price, tp_price]):
+        return False, f"Invalid price(s): Entry={entry_price}, SL={sl_price}, TP={tp_price}. Must be positive finite numbers."
+
+    # 2. SL/TP Validity Checks
+    if signal == "LONG":
+        if not (sl_price < entry_price):
+            return False, f"SL price ({sl_price:.{p_prec}f}) must be below entry price ({entry_price:.{p_prec}f}) for LONG."
+        if not (tp_price > entry_price):
+            return False, f"TP price ({tp_price:.{p_prec}f}) must be above entry price ({entry_price:.{p_prec}f}) for LONG."
+    elif signal == "SHORT":
+        if not (sl_price > entry_price):
+            return False, f"SL price ({sl_price:.{p_prec}f}) must be above entry price ({entry_price:.{p_prec}f}) for SHORT."
+        if not (tp_price < entry_price):
+            return False, f"TP price ({tp_price:.{p_prec}f}) must be below entry price ({entry_price:.{p_prec}f}) for SHORT."
+    else:
+        return False, f"Invalid signal type: {signal}."
+
+    if sl_price == entry_price:
+        return False, f"SL price ({sl_price:.{p_prec}f}) cannot be equal to entry price ({entry_price:.{p_prec}f})."
+    if tp_price == entry_price:
+        return False, f"TP price ({tp_price:.{p_prec}f}) cannot be equal to entry price ({entry_price:.{p_prec}f})."
+
+    # 3. Quantity and Notional Value Checks
+    if not (isinstance(quantity, (int, float)) and quantity > 0 and math.isfinite(quantity)):
+        return False, f"Invalid quantity ({quantity}). Must be a positive finite number."
+
+    lot_size_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
+    if lot_size_filter:
+        min_qty = float(lot_size_filter['minQty'])
+        step_size = float(lot_size_filter['stepSize'])
+        if quantity < min_qty:
+            return False, f"Quantity ({quantity:.{q_prec}f}) is less than minQty ({min_qty:.{q_prec}f})."
+        # Check if quantity adheres to stepSize (modulo check for floats is tricky, use decimal or string formatting)
+        # For simplicity, assume calculate_position_size correctly handles stepSize.
+        # A more precise check: (Decimal(str(quantity)) - Decimal(str(min_qty))) % Decimal(str(step_size)) == 0
+        # Or check if round(quantity / step_size) * step_size == quantity (within tolerance)
+        if abs(round(quantity / step_size) * step_size - quantity) > 1e-9 and step_size > 1e-9 : # Tolerance for float math
+             # Check if quantity is a multiple of step_size starting from min_qty
+            if abs((quantity - min_qty) % step_size) > 1e-9 and abs(quantity % step_size) > 1e-9 : # Check both relative to min_qty and absolute
+                return False, f"Quantity ({quantity:.{q_prec}f}) does not meet stepSize ({step_size:.{q_prec}f}) requirement."
+
+    min_notional_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'MIN_NOTIONAL'), None)
+    if min_notional_filter:
+        min_notional_val = float(min_notional_filter['notional'])
+        current_notional = quantity * entry_price
+        if current_notional < min_notional_val:
+            return False, f"Notional value ({current_notional:.2f}) is less than MIN_NOTIONAL ({min_notional_val:.2f})."
+
+    # 4. Risk Calculation Verification
+    if current_balance <= 0:
+        return False, f"Current balance ({current_balance:.2f}) is zero or negative."
+        
+    risk_amount_abs = quantity * abs(entry_price - sl_price)
+    if risk_amount_abs == 0 and entry_price != sl_price : # Should not happen if prices are different and qty > 0
+        return False, "Calculated absolute risk amount is zero despite different entry/SL. Check inputs."
+
+    # If entry_price == sl_price, risk_amount_abs would be 0. This case is already caught by "SL price cannot be equal to entry price".
+    # So abs(entry_price - sl_price) should always be > 0 here.
+
+    risk_percentage_actual = risk_amount_abs / current_balance
+    
+    if not is_unmanaged_check: # Only perform detailed risk % checks for normally managed new trades
+        # Define a small tolerance for float comparisons of percentages
+        strict_risk_tolerance = 0.0001 # Absolute 0.01% deviation from target risk percentage
+        allow_exceed_risk = configs.get('allow_exceed_risk_for_min_notional', DEFAULT_ALLOW_EXCEED_RISK_FOR_MIN_NOTIONAL)
+
+        if not allow_exceed_risk:
+            # Strict check: actual risk should be very close to configured risk
+            if abs(risk_percentage_actual - risk_percent_config) > strict_risk_tolerance:
+                return False, (f"Actual risk ({risk_percentage_actual*100:.3f}%) deviates "
+                               f"from configured risk ({risk_percent_config*100:.3f}%) by more than "
+                               f"{strict_risk_tolerance*100:.3f}%. Stricter risk adherence is enabled.")
+        else: # allow_exceed_risk is True
+            # More lenient check: actual risk should not exceed a cap (e.g., 1.5x configured risk)
+            max_permissible_risk = risk_percent_config * 1.5 
+            if risk_percentage_actual > (max_permissible_risk + strict_risk_tolerance): 
+                return False, (f"Actual risk ({risk_percentage_actual*100:.3f}%) exceeds "
+                               f"the maximum permissible risk limit ({max_permissible_risk*100:.3f}%) "
+                               f"even when 'allow_exceed_risk_for_min_notional' is enabled.")
+    else: # For unmanaged checks, just ensure risk is not absurdly high, e.g. > 50% of balance for a single trade SL
+        if risk_percentage_actual > 0.5: # Arbitrary high cap for unmanaged safety SL/TP
+             return False, (f"Calculated SL for UNMANAGED trade implies extremely high risk ({risk_percentage_actual*100:.2f}% of balance). "
+                            f"Entry: {entry_price}, SL: {sl_price}, Qty: {quantity}. Check position and SL logic.")
+
+
+    # 5. Sufficient Balance (Basic Margin Check)
+    # For unmanaged trades, this check is against current balance for an existing position's margin,
+    # which is implicitly covered as the position exists.
+    # For new trades, it's a pre-check.
+    leverage = configs.get('leverage', DEFAULT_LEVERAGE) # This might be different from actual position leverage for unmanaged
+    if leverage <= 0:
+        return False, f"Leverage ({leverage}) must be positive."
+    
+    required_margin = (quantity * entry_price) / leverage
+    if required_margin > current_balance: # This is a simplified check. Binance actual margin req might differ.
+        return False, (f"Estimated required margin ({required_margin:.2f} USDT) exceeds "
+                       f"current balance ({current_balance:.2f} USDT) for quantity {quantity:.{q_prec}f} at {entry_price:.{p_prec}f} with {leverage}x leverage.")
+
+    return True, "Checks passed"
+
+
 # --- Main Trading Logic ---
 def get_all_usdt_perpetual_symbols(client):
     print("\nFetching all USDT perpetual symbols...")
@@ -917,17 +1057,75 @@ def process_symbol_task(symbol, client, configs, lock):
         traceback.print_exc() # Print full traceback for thread errors
         return f"{symbol}: Error - {e}"
 
-def manage_trade_entry(client, configs, symbol, klines_df, lock):
-    global active_trades
-    was_existing_trade = False # Flag to see if we are replacing a trade
-    with lock:
-        if symbol in active_trades and active_trades[symbol]:
-            existing_details = active_trades[symbol]
-            open_ts = existing_details.get('open_timestamp')
-            existing_signal = existing_details.get('side')  # "LONG" or "SHORT"
+def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is active_trades_lock
+    global active_trades, symbol_last_trade_time, symbol_last_trade_time_lock, symbols_currently_processing, symbols_currently_processing_lock
 
-            # Check for invalid timestamp
-            if not open_ts or not isinstance(open_ts, pd.Timestamp):
+    log_prefix = f"[{threading.current_thread().name}] {symbol} manage_trade_entry:"
+
+    # --- Symbol Processing Lock (to prevent concurrent execution for the same symbol) ---
+    with symbols_currently_processing_lock:
+        if symbol in symbols_currently_processing:
+            print(f"{log_prefix} {symbol} is ALREADY BEING PROCESSED by another thread. Skipping this instance.")
+            return
+        symbols_currently_processing.add(symbol)
+        print(f"{log_prefix} Acquired processing lock for {symbol}.")
+
+    try:
+        # --- Original start of function logic begins here ---
+        was_existing_trade = False # Flag to see if we are replacing a trade
+        
+        # The 'signal' variable (new_signal) is determined later. 
+        # The check for active_trades needs to be aware of this.
+        # We first check general cooldown, then calculate signal, then check active_trades.
+
+        # --- Symbol Cooldown Check (1-hour cooldown after a trade) ---
+        with symbol_last_trade_time_lock: 
+            last_trade_ts = symbol_last_trade_time.get(symbol)
+        
+        if last_trade_ts:
+            time_since_last_trade_seconds = (pd.Timestamp.now(tz='UTC') - last_trade_ts).total_seconds()
+            COOLDOWN_PERIOD_SECONDS = 3600 
+            if time_since_last_trade_seconds < COOLDOWN_PERIOD_SECONDS:
+                print(f"{log_prefix} Symbol is on 1-hour cooldown. Last trade was {time_since_last_trade_seconds:.0f}s ago. "
+                      f"Remaining cooldown: {COOLDOWN_PERIOD_SECONDS - time_since_last_trade_seconds:.0f}s. Signal ignored.")
+                return # Exit if symbol is on cooldown, finally block will release processing lock
+
+        # Initial check for sufficient kline data 
+        if klines_df.empty or len(klines_df) < 202: 
+            print(f"{log_prefix} Insufficient kline data for {symbol} (Length: {len(klines_df)}). Aborting trade entry.")
+            return # finally block will release processing lock
+
+        klines_df['EMA100'] = calculate_ema(klines_df, 100)
+        klines_df['EMA200'] = calculate_ema(klines_df, 200)
+
+        # Verbose logging for EMAs can be enabled if needed by uncommenting below
+        # if klines_df['EMA100'] is not None and not klines_df['EMA100'].empty:
+        #     print(f"{log_prefix} Last EMA100 values: {klines_df['EMA100'].iloc[-3:].values}")
+        # else:
+        #     print(f"{log_prefix} EMA100 calculation resulted in None or empty series.")
+        # if klines_df['EMA200'] is not None and not klines_df['EMA200'].empty:
+        #     print(f"{log_prefix} Last EMA200 values: {klines_df['EMA200'].iloc[-3:].values}")
+        # else:
+        #     print(f"{log_prefix} EMA200 calculation resulted in None or empty series.")
+
+        if klines_df['EMA100'] is None or klines_df['EMA200'] is None or \
+           klines_df['EMA100'].isnull().all() or klines_df['EMA200'].isnull().all() or \
+           len(klines_df) < 202: 
+            print(f"{log_prefix} EMA calculation failed, EMAs are NaN, or insufficient data length ({len(klines_df)}). Aborting for {symbol}.")
+            return # finally block will release processing lock
+
+        # Determine the new signal based on current klines
+        new_signal = check_ema_crossover_conditions(klines_df, symbol_for_logging=symbol)
+        # The function check_ema_crossover_conditions itself prints the signal, so no need to double print here.
+
+        # Now, handle active_trades with the new_signal
+        with lock: # This is active_trades_lock (passed as 'lock' argument)
+            if symbol in active_trades and active_trades[symbol]:
+                existing_details = active_trades[symbol]
+                open_ts = existing_details.get('open_timestamp')
+                existing_signal_side = existing_details.get('side') # Renamed for clarity
+
+                if not open_ts or not isinstance(open_ts, pd.Timestamp):
                 print(f"CRITICAL ERROR: {symbol} has invalid/missing 'open_timestamp'. Skipping trade.")
                 if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
                     send_telegram_message(
@@ -1005,6 +1203,27 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock):
     klines_df['EMA200'] = calculate_ema(klines_df, 200)
 
     log_prefix = f"[{threading.current_thread().name}] {symbol} manage_trade_entry:"
+
+    # --- Symbol Cooldown Check ---
+    with symbol_last_trade_time_lock:
+        last_trade_ts = symbol_last_trade_time.get(symbol)
+    
+    if last_trade_ts:
+        time_since_last_trade_seconds = (pd.Timestamp.now(tz='UTC') - last_trade_ts).total_seconds()
+        COOLDOWN_PERIOD_SECONDS = 3600 # 1 hour
+        if time_since_last_trade_seconds < COOLDOWN_PERIOD_SECONDS:
+            print(f"{log_prefix} Symbol is on 1-hour cooldown. Last trade was {time_since_last_trade_seconds:.0f}s ago. "
+                  f"Remaining cooldown: {COOLDOWN_PERIOD_SECONDS - time_since_last_trade_seconds:.0f}s. Signal ignored.")
+            return # Exit if symbol is on cooldown
+
+    # Initial check for sufficient kline data (moved slightly earlier, before EMA checks)
+    # This check was implicitly covered by EMA NaN checks later, but explicit check is good.
+    # The process_symbol_task already checks for klines_df.empty or len < 202.
+    # This is an additional safeguard within manage_trade_entry itself.
+    if klines_df.empty or len(klines_df) < 202: # Minimum for EMA200 and prior data
+        print(f"{log_prefix} Insufficient kline data for {symbol} (Length: {len(klines_df)}). Aborting trade entry.")
+        # No trade rejection notification here as it's a data issue not a strategy rejection.
+        return
 
     if klines_df['EMA100'] is not None and not klines_df['EMA100'].empty:
         print(f"{log_prefix} Last EMA100 values: {klines_df['EMA100'].iloc[-3:].values}")
@@ -1093,6 +1312,30 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock):
     # If proceeding, qty_to_order should be final_qty_check.
     qty_to_order = final_qty_check 
 
+    # --- Perform Pre-Order Sanity Checks ---
+    passed_sanity_checks, sanity_check_reason = pre_order_sanity_checks(
+        symbol=symbol,
+        signal=signal,
+        entry_price=entry_p,
+        sl_price=sl_p,
+        tp_price=tp_p,
+        quantity=qty_to_order,
+        symbol_info=symbol_info,
+        current_balance=acc_bal, # acc_bal was fetched before qty calculation
+        risk_percent_config=configs['risk_percent'],
+        configs=configs,
+        klines_df_for_debug=klines_df # Pass klines_df for potential future use in checks
+    )
+
+    if not passed_sanity_checks:
+        print(f"{log_prefix} Pre-order sanity checks FAILED for {symbol}: {sanity_check_reason}")
+        send_trade_rejection_notification(symbol, signal, f"Sanity Check Failed: {sanity_check_reason}", 
+                                          entry_p, sl_p, tp_p, qty_to_order, symbol_info, configs)
+        return # Abort trade entry
+
+    print(f"{log_prefix} Pre-order sanity checks PASSED for {symbol}.")
+    # --- End of Pre-Order Sanity Checks ---
+
     print(f"{log_prefix} Attempting {signal} {qty_to_order} {symbol} @MKT (EP:{entry_p:.4f}), SL:{sl_p:.4f}, TP:{tp_p:.4f}")
     entry_order = place_new_order(client, symbol_info, "BUY" if signal=="LONG" else "SELL", "MARKET", qty_to_order)
 
@@ -1132,7 +1375,12 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock):
             "quantity": qty_to_order, "side": signal, "symbol_info": symbol_info, "open_timestamp": pd.Timestamp.now(tz='UTC')
         }
         print(f"{log_prefix} Trade for {symbol} recorded in active_trades at {active_trades[symbol]['open_timestamp']}.")
-    
+        
+        # Update last trade time for cooldown
+        with symbol_last_trade_time_lock:
+            symbol_last_trade_time[symbol] = active_trades[symbol]['open_timestamp'] # Use the same timestamp
+            print(f"{log_prefix} Updated last trade time for {symbol} to {symbol_last_trade_time[symbol]} for cooldown.")
+
     # Send Telegram notification for new trade
     if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
         current_balance_for_msg = get_account_balance(client, configs)
@@ -1164,7 +1412,12 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock):
         print(f"{log_prefix} New trade Telegram notification sent for {symbol}.")
 
     get_open_positions(client); get_open_orders(client, symbol) # Original console logging calls
-# The `else` part for failed market order was removed as the rejection path now includes a `return`.
+    
+    finally:
+        # --- Release Symbol Processing Lock ---
+        with symbols_currently_processing_lock:
+            symbols_currently_processing.discard(symbol) # Use discard to avoid KeyError if not present
+            print(f"{log_prefix} Released processing lock for {symbol}.")
 
 def monitor_active_trades(client, configs): # Needs lock for active_trades access
     global active_trades, active_trades_lock
@@ -1346,6 +1599,15 @@ def trading_loop(client, configs, monitored_symbols):
 
                 monitor_active_trades(client, configs) # Monitor after scan
                 print(f"Active trades monitoring complete. {format_elapsed_time(cycle_start_time)}")
+
+                # --- SL/TP Safety Net Check for All Open Positions ---
+                # Initialize a cache for symbol_info for this cycle of the safety net check
+                # Alternatively, could try to pass/build upon the main symbol_info_map if available and up-to-date
+                symbol_info_cache_for_safety_net = {} 
+                print(f"Running SL/TP safety net check for all open positions... {format_elapsed_time(cycle_start_time)}")
+                ensure_sl_tp_for_all_open_positions(client, configs, active_trades, symbol_info_cache_for_safety_net)
+                print(f"SL/TP safety net check complete. {format_elapsed_time(cycle_start_time)}")
+                # --- End SL/TP Safety Net Check ---
 
             except Exception as loop_err: # Catch errors within the try block of the loop
                 print(f"ERROR in trading loop cycle: {loop_err} {format_elapsed_time(cycle_start_time)}")
@@ -1558,6 +1820,272 @@ def main():
         
             active_trades.clear() # Clear trades for a clean slate if re-run or for reporting
             print("Backtest shutdown sequence complete.")
+
+
+# --- SL/TP Safety Net Function ---
+def ensure_sl_tp_for_all_open_positions(client, configs, active_trades_ref, symbol_info_cache):
+    """
+    Checks all open positions on Binance.
+    For positions managed by the bot (in active_trades_ref), it verifies SL/TP orders exist.
+    If not, it attempts to re-place them based on stored values.
+    For positions NOT managed by the bot, it attempts to calculate and set new SL/TP orders
+    based on current strategy logic.
+    Sends Telegram alerts for failures or significant actions.
+    """
+    log_prefix = "[SL/TP SafetyNet]"
+    print(f"\n{log_prefix} Starting check for all open positions to ensure SL/TP...")
+
+    try:
+        all_positions = client.futures_position_information()
+        open_positions = [p for p in all_positions if float(p.get('positionAmt', 0)) != 0]
+
+        if not open_positions:
+            print(f"{log_prefix} No open positions found.")
+            return
+
+        print(f"{log_prefix} Found {len(open_positions)} open position(s). Processing...")
+        current_balance_for_check = get_account_balance(client, configs) # For sanity checks
+
+        for pos in open_positions:
+            symbol = pos['symbol']
+            entry_price = float(pos['entryPrice'])
+            position_qty_raw = float(pos['positionAmt']) # Can be positive or negative
+            leverage = int(pos.get('leverage', configs.get('leverage'))) # Get actual leverage from position
+
+            print(f"\n{log_prefix} Checking position: {symbol}, Entry: {entry_price}, Qty: {position_qty_raw}, Leverage: {leverage}x")
+
+            # Determine side and absolute quantity
+            side = "LONG" if position_qty_raw > 0 else "SHORT"
+            abs_position_qty = abs(position_qty_raw)
+
+            with active_trades_lock: # Ensure thread-safe access to active_trades_ref
+                is_managed_trade = symbol in active_trades_ref
+
+            if is_managed_trade:
+                with active_trades_lock: # Re-acquire lock if reading mutable details
+                    trade_details = active_trades_ref.get(symbol) # Use .get for safety, though 'in' check was done
+                
+                if not trade_details: # Should not happen if is_managed_trade is true and lock is proper
+                    print(f"{log_prefix} CRITICAL: {symbol} was in active_trades_ref but now missing. Concurrency issue?")
+                    continue
+
+                print(f"{log_prefix} {symbol} is MANAGED by the bot. Verifying SL/TP orders.")
+                
+                s_info_managed = trade_details['symbol_info'] # Already available
+                target_sl_price = trade_details['current_sl_price']
+                target_tp_price = trade_details['current_tp_price']
+                expected_qty_for_sl_tp = trade_details['quantity'] # Bot's tracked quantity
+
+                # It's possible the position quantity on exchange differs slightly from bot's tracked quantity
+                # due to partial fills on SL/TP, or manual intervention.
+                # For re-placing SL/TP, use the *actual current position quantity* on the exchange.
+                qty_for_new_sl_tp_orders = abs_position_qty
+
+
+                open_orders_for_symbol = client.futures_get_open_orders(symbol=symbol)
+                
+                sl_order_active = False
+                if trade_details.get('sl_order_id'):
+                    for o in open_orders_for_symbol:
+                        if o['orderId'] == trade_details['sl_order_id'] and \
+                           o['type'] == 'STOP_MARKET' and \
+                           abs(float(o['origQty']) - expected_qty_for_sl_tp) < 1e-9 : # Check if qty matches expected
+                            sl_order_active = True
+                            print(f"{log_prefix} SL order {trade_details['sl_order_id']} for {symbol} is ACTIVE.")
+                            break
+                
+                tp_order_active = False
+                if trade_details.get('tp_order_id'):
+                    for o in open_orders_for_symbol:
+                        if o['orderId'] == trade_details['tp_order_id'] and \
+                           o['type'] == 'TAKE_PROFIT_MARKET' and \
+                           abs(float(o['origQty']) - expected_qty_for_sl_tp) < 1e-9:
+                            tp_order_active = True
+                            print(f"{log_prefix} TP order {trade_details['tp_order_id']} for {symbol} is ACTIVE.")
+                            break
+
+                if not sl_order_active:
+                    print(f"{log_prefix} SL order for managed trade {symbol} is MISSING or incorrect. Attempting to re-place.")
+                    new_sl_order = place_new_order(client, s_info_managed, 
+                                                   "SELL" if side == "LONG" else "BUY", 
+                                                   "STOP_MARKET", qty_for_new_sl_tp_orders, 
+                                                   stop_price=target_sl_price, reduce_only=True)
+                    if new_sl_order and new_sl_order.get('orderId'):
+                        print(f"{log_prefix} Successfully re-placed SL order for {symbol}. New ID: {new_sl_order['orderId']}")
+                        with active_trades_lock: # Lock to update shared active_trades
+                             if symbol in active_trades_ref: # Check again as it might have been removed by another thread
+                                active_trades_ref[symbol]['sl_order_id'] = new_sl_order['orderId']
+                        # Send Telegram notification for successful re-placement
+                        send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"),
+                                              f"✅ {log_prefix} Re-placed MISSING SL for managed {symbol} @ {target_sl_price:.{s_info_managed['pricePrecision']}f}")
+                    else:
+                        err_msg_sl = f"⚠️ {log_prefix} FAILED to re-place SL for managed {symbol}. Target SL: {target_sl_price:.{s_info_managed['pricePrecision']}f}. Details: {new_sl_order or 'No order object'}"
+                        print(err_msg_sl)
+                        send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"), err_msg_sl)
+
+                if not tp_order_active:
+                    print(f"{log_prefix} TP order for managed trade {symbol} is MISSING or incorrect. Attempting to re-place.")
+                    new_tp_order = place_new_order(client, s_info_managed,
+                                                   "SELL" if side == "LONG" else "BUY",
+                                                   "TAKE_PROFIT_MARKET", qty_for_new_sl_tp_orders,
+                                                   stop_price=target_tp_price, reduce_only=True)
+                    if new_tp_order and new_tp_order.get('orderId'):
+                        print(f"{log_prefix} Successfully re-placed TP order for {symbol}. New ID: {new_tp_order['orderId']}")
+                        with active_trades_lock: # Lock to update shared active_trades
+                            if symbol in active_trades_ref:
+                                active_trades_ref[symbol]['tp_order_id'] = new_tp_order['orderId']
+                        send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"),
+                                              f"✅ {log_prefix} Re-placed MISSING TP for managed {symbol} @ {target_tp_price:.{s_info_managed['pricePrecision']}f}")
+                    else:
+                        err_msg_tp = f"⚠️ {log_prefix} FAILED to re-place TP for managed {symbol}. Target TP: {target_tp_price:.{s_info_managed['pricePrecision']}f}. Details: {new_tp_order or 'No order object'}"
+                        print(err_msg_tp)
+                        send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"), err_msg_tp)
+            else:
+                print(f"{log_prefix} {symbol} is UNMANAGED by the bot. Attempting to calculate and set SL/TP.")
+                
+                # 1. Fetch Symbol Info (use cache)
+                s_info_unmanaged = symbol_info_cache.get(symbol)
+                if not s_info_unmanaged:
+                    s_info_unmanaged = get_symbol_info(client, symbol)
+                    if s_info_unmanaged:
+                        symbol_info_cache[symbol] = s_info_unmanaged
+                    else:
+                        msg = f"⚠️ {log_prefix} Cannot get symbol_info for UNMANAGED {symbol}. Cannot set SL/TP."
+                        print(msg)
+                        send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"), msg)
+                        continue # Skip to next position
+                
+                p_prec_unmanaged = int(s_info_unmanaged['pricePrecision'])
+                # q_prec_unmanaged = int(s_info_unmanaged['quantityPrecision']) # Not strictly needed for placing SL/TP with existing qty
+
+                # 2. Fetch Klines
+                klines_df_unmanaged = get_historical_klines(client, symbol, limit=250) # Sufficient for EMA100/200
+                if klines_df_unmanaged.empty or len(klines_df_unmanaged) < 202: # Need enough for EMA200 + some history
+                    msg = f"⚠️ {log_prefix} Insufficient kline data for UNMANAGED {symbol} (got {len(klines_df_unmanaged)}). Cannot calculate SL/TP."
+                    print(msg)
+                    send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"), msg)
+                    continue
+
+                # 3. Calculate EMAs
+                klines_df_unmanaged['EMA100'] = calculate_ema(klines_df_unmanaged, 100)
+                klines_df_unmanaged['EMA200'] = calculate_ema(klines_df_unmanaged, 200) # Though not directly used by calc_sl_tp_values, good practice
+                
+                if klines_df_unmanaged['EMA100'].isnull().all():
+                    msg = f"⚠️ {log_prefix} Failed to calculate EMA100 for UNMANAGED {symbol}. Cannot determine SL/TP."
+                    print(msg)
+                    send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"), msg)
+                    continue
+                
+                ema100_val_unmanaged = klines_df_unmanaged['EMA100'].iloc[-1]
+
+                # 4. Calculate SL/TP
+                # calculate_sl_tp_values(entry, side, ema100, df_klines, idx=-1)
+                calc_sl_price, calc_tp_price = calculate_sl_tp_values(entry_price, side, ema100_val_unmanaged, klines_df_unmanaged)
+
+                if calc_sl_price is None or calc_tp_price is None:
+                    msg = (f"⚠️ {log_prefix} Failed to calculate SL/TP for UNMANAGED {symbol}. "
+                           f"Entry: {entry_price:.{p_prec_unmanaged}f}, Side: {side}.")
+                    print(msg)
+                    send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"), msg)
+                    continue
+                
+                print(f"{log_prefix} For UNMANAGED {symbol}, calculated SL: {calc_sl_price:.{p_prec_unmanaged}f}, TP: {calc_tp_price:.{p_prec_unmanaged}f}")
+
+                # 5. Perform Sanity Checks on calculated SL/TP
+                # Use current_balance_for_check fetched at the start of the function.
+                # Risk percent for unmanaged trades: use default or a specific "safety_net_risk_percent" from configs if available.
+                # For now, use the main risk_percent. This might be too aggressive for unmanaged.
+                # Consider adding a specific, potentially smaller, risk % for unmanaged trades in future.
+                # The sanity check's risk validation part might be less relevant here if we're just applying SL/TP
+                # to an existing position whose size is fixed. The key is valid SL/TP prices.
+                
+                # For unmanaged trades, the quantity is fixed by the existing position.
+                # The risk % check in pre_order_sanity_checks might not be directly applicable in the same way.
+                # We are not calculating quantity based on risk, but applying SL/TP to an existing quantity.
+                # However, other checks (price validity, SL/TP sides) are still important.
+                # Let's call it, but be mindful of its risk interpretation for this context.
+                # We might need a modified sanity check or interpret its results carefully.
+
+                sanity_passed, sanity_reason = pre_order_sanity_checks(
+                    symbol, side, entry_price, calc_sl_price, calc_tp_price, 
+                    abs_position_qty, # Use actual position quantity
+                    s_info_unmanaged, 
+                    current_balance_for_check if current_balance_for_check is not None else 10000, # Use fetched balance or a placeholder
+                    configs.get('risk_percent'), # This might need adjustment for unmanaged
+                    configs, 
+                    klines_df_unmanaged,
+                    is_unmanaged_check=True # Pass True for unmanaged positions
+                )
+
+                if not sanity_passed:
+                    msg = (f"⚠️ {log_prefix} Sanity check FAILED for calculated SL/TP for UNMANAGED {symbol}. "
+                           f"Entry: {entry_price:.{p_prec_unmanaged}f}, Side: {side}, Qty: {abs_position_qty}. "
+                           f"Attempted SL: {calc_sl_price:.{p_prec_unmanaged}f}, TP: {calc_tp_price:.{p_prec_unmanaged}f}. Reason: {sanity_reason}")
+                    print(msg)
+                    send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"), msg)
+                    continue
+
+                # 6. Place SL & TP orders
+                sl_placed_unmanaged, tp_placed_unmanaged = False, False
+                
+                # Cancel existing SL/TP orders for this symbol before placing new ones for unmanaged position
+                # This is to avoid conflicts if there are manually placed or very old bot orders.
+                print(f"{log_prefix} Cancelling any existing SL/TP orders for unmanaged {symbol} before placing new ones.")
+                open_orders_unmanaged = client.futures_get_open_orders(symbol=symbol)
+                for order in open_orders_unmanaged:
+                    # Check if the order is a conditional order (SL/TP) and is reduceOnly
+                    # The `reduceOnly` field from Binance API is boolean.
+                    if order['type'] in ['STOP_MARKET', 'TAKE_PROFIT_MARKET'] and order.get('reduceOnly') is True:
+                        try:
+                            client.futures_cancel_order(symbol=symbol, orderId=order['orderId'])
+                            print(f"{log_prefix} Cancelled existing conditional order {order['orderId']} for {symbol}.")
+                        except Exception as e_cancel:
+                            print(f"{log_prefix} Failed to cancel existing order {order['orderId']} for {symbol}: {e_cancel}")
+                
+                new_sl_unmanaged = place_new_order(client, s_info_unmanaged,
+                                                   "SELL" if side == "LONG" else "BUY",
+                                                   "STOP_MARKET", abs_position_qty,
+                                                   stop_price=calc_sl_price, reduce_only=True)
+                if new_sl_unmanaged and new_sl_unmanaged.get('orderId'):
+                    sl_placed_unmanaged = True
+                    print(f"{log_prefix} Successfully placed SL for UNMANAGED {symbol} @ {calc_sl_price:.{p_prec_unmanaged}f}")
+                else:
+                    msg = (f"⚠️ {log_prefix} FAILED to place SL for UNMANAGED {symbol}. "
+                           f"Entry: {entry_price:.{p_prec_unmanaged}f}, Target SL: {calc_sl_price:.{p_prec_unmanaged}f}. Details: {new_sl_unmanaged or 'No order object'}")
+                    print(msg)
+                    send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"), msg)
+
+                new_tp_unmanaged = place_new_order(client, s_info_unmanaged,
+                                                   "SELL" if side == "LONG" else "BUY",
+                                                   "TAKE_PROFIT_MARKET", abs_position_qty,
+                                                   stop_price=calc_tp_price, reduce_only=True)
+                if new_tp_unmanaged and new_tp_unmanaged.get('orderId'):
+                    tp_placed_unmanaged = True
+                    print(f"{log_prefix} Successfully placed TP for UNMANAGED {symbol} @ {calc_tp_price:.{p_prec_unmanaged}f}")
+                else:
+                    msg = (f"⚠️ {log_prefix} FAILED to place TP for UNMANAGED {symbol}. "
+                           f"Entry: {entry_price:.{p_prec_unmanaged}f}, Target TP: {calc_tp_price:.{p_prec_unmanaged}f}. Details: {new_tp_unmanaged or 'No order object'}")
+                    print(msg)
+                    send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"), msg)
+                
+                if sl_placed_unmanaged or tp_placed_unmanaged:
+                    final_msg = f"✅ {log_prefix} For UNMANAGED {symbol} (Entry: {entry_price:.{p_prec_unmanaged}f}, Qty: {abs_position_qty}): "
+                    if sl_placed_unmanaged: final_msg += f"SL set @ {calc_sl_price:.{p_prec_unmanaged}f}. "
+                    if tp_placed_unmanaged: final_msg += f"TP set @ {calc_tp_price:.{p_prec_unmanaged}f}."
+                    send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"), final_msg.strip())
+
+
+    except BinanceAPIException as e:
+        print(f"{log_prefix} Binance API Exception while fetching/processing positions: {e}")
+        send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"),
+                              f"⚠️ {log_prefix} Binance API Error: {e}")
+    except Exception as e:
+        print(f"{log_prefix} Unexpected error during SL/TP check: {e}")
+        traceback.print_exc()
+        send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"),
+                              f"🆘 {log_prefix} Unexpected Error: {e}")
+
+    print(f"{log_prefix} Finished SL/TP check for all open positions.")
 
 
 # --- Backtesting Specific Functions ---
@@ -1829,6 +2357,22 @@ def manage_trade_entry_backtest(client_dummy, configs, symbol, klines_df_current
          print(f"[SIM-{backtest_current_time}] Max concurrent positions ({configs['max_concurrent_positions']}) reached. Cannot open for new symbol {symbol}.")
          return
 
+    # --- Symbol Cooldown Check for Backtest ---
+    # No lock needed for backtest symbol_last_trade_time if backtesting is sequential for this part.
+    last_trade_ts_bt = symbol_last_trade_time.get(symbol)
+    if last_trade_ts_bt:
+        time_since_last_trade_seconds_bt = (backtest_current_time - last_trade_ts_bt).total_seconds()
+        COOLDOWN_PERIOD_SECONDS_BT = 3600  # 1 hour
+        if time_since_last_trade_seconds_bt < COOLDOWN_PERIOD_SECONDS_BT:
+            # Don't print excessively in backtest, but log it.
+            # print(f"[SIM-{backtest_current_time}] Symbol {symbol} on cooldown. Last trade {time_since_last_trade_seconds_bt:.0f}s ago. Ignored.")
+            backtest_trade_log.append({
+                "time": backtest_current_time, "symbol": symbol, "type": "COOLDOWN_SKIP",
+                "reason": f"Last trade {time_since_last_trade_seconds_bt:.0f}s ago.",
+                "remaining_cooldown_seconds": COOLDOWN_PERIOD_SECONDS_BT - time_since_last_trade_seconds_bt
+            })
+            return
+
     # --- Calculations (same as live) ---
     klines_df_current_slice['EMA100'] = calculate_ema(klines_df_current_slice, 100)
     klines_df_current_slice['EMA200'] = calculate_ema(klines_df_current_slice, 200)
@@ -1911,6 +2455,45 @@ def manage_trade_entry_backtest(client_dummy, configs, symbol, klines_df_current
     # Log evaluated signal before attempting to place
     backtest_trade_log.append(evaluated_trade_details)
 
+    # --- Perform Pre-Order Sanity Checks for Backtest ---
+    # Note: `current_sim_balance` is used for `current_balance` parameter.
+    # `klines_df_current_slice` is passed for `klines_df_for_debug`.
+    passed_sanity_checks_bt, sanity_check_reason_bt = pre_order_sanity_checks(
+        symbol=symbol,
+        signal=signal,
+        entry_price=entry_p_signal, # entry_p_signal is used as the proposed entry for backtest
+        sl_price=sl_p,
+        tp_price=tp_p,
+        quantity=qty,
+        symbol_info=symbol_info,
+        current_balance=current_sim_balance,
+        risk_percent_config=configs['risk_percent'],
+        configs=configs,
+        klines_df_for_debug=klines_df_current_slice 
+    )
+
+    if not passed_sanity_checks_bt:
+        print(f"[SIM-{backtest_current_time}] Pre-order sanity checks FAILED for {symbol}: {sanity_check_reason_bt}")
+        # Log this failure specifically
+        backtest_trade_log.append({
+            "time": backtest_current_time, "symbol": symbol, "type": "SANITY_CHECK_FAILED",
+            "reason": sanity_check_reason_bt, "signal_side": signal, 
+            "calc_entry": entry_p_signal, "calc_sl": sl_p, "calc_tp": tp_p, "calc_qty": qty
+        })
+        # Update the status of the previously logged "SIGNAL_EVALUATED" to "REJECTED_SANITY_CHECK"
+        # Find the last "SIGNAL_EVALUATED" for this symbol and time (should be the one just added)
+        for log_item in reversed(backtest_trade_log):
+            if log_item.get("type") == "SIGNAL_EVALUATED" and \
+               log_item.get("symbol") == symbol and \
+               log_item.get("time") == backtest_current_time:
+                log_item["status"] = "REJECTED_SANITY_CHECK"
+                log_item["reject_reason"] = sanity_check_reason_bt
+                break
+        return # Abort trade entry for backtest
+
+    print(f"[SIM-{backtest_current_time}] Pre-order sanity checks PASSED for {symbol}.")
+    # --- End of Pre-Order Sanity Checks for Backtest ---
+
     print(f"[SIM-{backtest_current_time}] Attempting {signal} {qty} {symbol} @SIM_MARKET (EP_signal:{entry_p_signal:.4f}), SL:{sl_p:.4f}, TP:{tp_p:.4f}, RR:{(f'{rr_ratio:.2f}' if isinstance(rr_ratio, float) else 'N/A')})")
     
     # In backtest, MARKET order fills at current_candle_close (or open of next, configurable)
@@ -1947,6 +2530,11 @@ def manage_trade_entry_backtest(client_dummy, configs, symbol, klines_df_current
             "open_timestamp": backtest_current_time # Use backtest_current_time
         }
         print(f"[SIM-{backtest_current_time}] Trade for {symbol} recorded in active_trades at {active_trades[symbol]['open_timestamp']}.")
+        
+        # Update last trade time for cooldown in backtest
+        # No lock needed for backtest if assuming single-threaded decision making per symbol iteration
+        symbol_last_trade_time[symbol] = active_trades[symbol]['open_timestamp'] # Use the same timestamp
+        print(f"[SIM-{backtest_current_time}] Updated last trade time for {symbol} to {symbol_last_trade_time[symbol]} for backtest cooldown.")
     else:
         print(f"[SIM-{backtest_current_time}] Simulated Market order for {symbol} failed or not filled: {entry_order}")
 
