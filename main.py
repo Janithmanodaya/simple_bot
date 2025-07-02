@@ -31,7 +31,7 @@ DEFAULT_RISK_PERCENT = 1.0       # Default account risk percentage per trade (e.
 DEFAULT_LEVERAGE = 20            # Default leverage (e.g., 20x)
 DEFAULT_MAX_CONCURRENT_POSITIONS = 5 # Default maximum number of concurrent open positions
 DEFAULT_MARGIN_TYPE = "ISOLATED" # Default margin type: "ISOLATED" or "CROSS"
-DEFAULT_MAX_SCAN_THREADS = 10    # Default threads for scanning symbols
+DEFAULT_MAX_SCAN_THREADS = 5     # Default threads for scanning symbols, now fixed to 5
 DEFAULT_ALLOW_EXCEED_RISK_FOR_MIN_NOTIONAL = False # Default for allowing higher risk to meet min notional
 
 # --- Global State Variables ---
@@ -196,8 +196,6 @@ def start_command_listener(bot_token, chat_id, last_message):
 
 def start_command_listener(bot_token, chat_id, last_message_content): # Renamed for clarity
     async def actual_bot_runner():
-        # Create and configure the application within the async function
-        # that will be the entry point for asyncio.run()
         application = Application.builder().token(bot_token).build()
 
         async def command3_handler(update, context: ContextTypes.DEFAULT_TYPE):
@@ -209,33 +207,16 @@ def start_command_listener(bot_token, chat_id, last_message_content): # Renamed 
         application.add_handler(CommandHandler("help", help_handler))
 
         try:
-            # Initialize the application
-            if hasattr(application, 'initialize') and callable(application.initialize):
-                 print("Initializing Telegram application...")
-                 await application.initialize()
-                 print("Telegram application initialized.")
-
-            # For PTB v20+, run_polling() is an async function.
-            # It starts the polling and will block here (because it's awaited)
-            # until application.stop() is called or an error occurs.
-            print("Starting Telegram bot polling...")
-            await application.run_polling() # Ensure run_polling is awaited as it's async in PTB v20+
-            print("Telegram bot polling stopped.")
-
+            async with application: # Handles initialize and shutdown automatically
+                print("Starting Telegram bot polling (via async with application)...")
+                await application.run_polling()
+                print("Telegram bot polling stopped.")
         except Exception as e:
             print(f"Exception in Telegram actual_bot_runner: {e}")
+            # Traceback will be printed by the main thread exception handler if error propagates
+            # or can be printed here if preferred for thread-specific logging.
             traceback.print_exc()
-        finally:
-            # Attempt to gracefully shutdown the application
-            if hasattr(application, 'shutdown') and callable(application.shutdown):
-                if hasattr(application, 'initialized') and application.initialized:
-                    print("Attempting to shutdown Telegram application...")
-                    await application.shutdown()
-                    print("Telegram application shutdown completed.")
-                else:
-                    print("Telegram application was not initialized or already shut down, skipping explicit shutdown call.")
-            else:
-                print("Telegram application object does not support shutdown method as expected.")
+        # No explicit finally block needed here for application.shutdown() if using async with
 
 
     def thread_starter():
@@ -261,33 +242,44 @@ def start_command_listener(bot_token, chat_id, last_message_content): # Renamed 
         finally:
             if loop:
                 try:
-                    # Ensure all tasks are cancelled before closing the loop
-                    # This is important if run_until_complete was exited by an exception
-                    # before actual_bot_runner's finally block fully executed PTB shutdown.
-                    all_tasks = asyncio.all_tasks(loop)
-                    if all_tasks:
-                        print(f"Telegram thread: Cancelling {len(all_tasks)} outstanding tasks...")
-                        for task in all_tasks:
-                            task.cancel()
-                        # Allow tasks to process their cancellation
-                        loop.run_until_complete(asyncio.gather(*all_tasks, return_exceptions=True))
-                        print("Telegram thread: Outstanding tasks cancelled.")
+                    # The `async with application` in actual_bot_runner handles PTB's task cleanup.
+                    # We primarily need to ensure the loop object itself is closed.
                     
-                    # PTB's shutdown should ideally be handled within actual_bot_runner's finally.
-                    # If loop.stop() was called or run_polling exited normally, this is fine.
-                    # If an exception occurred, actual_bot_runner's finally might not have run completely.
-                    
-                    if loop.is_running():
-                         print("Telegram thread: Event loop is still running, attempting to stop it.")
-                         loop.stop() # Request loop to stop if it's somehow still marked running
-                    
-                    print("Telegram thread: Closing event loop...")
-                    loop.close()
-                    print("Telegram thread: Event loop closed.")
+                    # If loop is already closed (e.g., by an unexpected PTB behavior, though unlikely with context manager),
+                    # trying to close again will error.
+                    if not loop.is_closed():
+                        # If the loop is still running (should not be if run_until_complete finished),
+                        # attempt to stop it. This is a fallback.
+                        if loop.is_running():
+                            print("Telegram thread: Loop was still running in finally block. Stopping.")
+                            loop.stop()
+                        
+                        # Give a chance for any final tasks from loop.stop() or other cancellations to complete
+                        # This is a bit more involved if we want to be perfectly robust here about pending tasks
+                        # not managed by PTB's shutdown, but for this case, PTB should manage its own.
+                        # For simplicity, we assume PTB's shutdown (via async with) is sufficient.
+                        # A short run_until_complete for pending tasks could be added here if needed,
+                        # e.g., loop.run_until_complete(asyncio.sleep(0.1)) to clear any final event loop queue.
+
+                        print("Telegram thread: Closing event loop...")
+                        loop.close()
+                        print("Telegram thread: Event loop closed.")
+                    else:
+                        print("Telegram thread: Event loop was already closed.")
+                except RuntimeError as e:
+                    print(f"Telegram thread: Runtime error during loop close in finally: {e}")
+                    # If it's "cannot close a running event loop", it implies something kept it running
+                    # despite run_until_complete finishing for actual_bot_runner.
+                    if "Cannot close a running event loop" in str(e) and not loop.is_closed():
+                         print("Telegram thread: Forcing loop stop due to error on close.")
+                         loop.stop() # Try to stop it if close failed because it was running.
                 except Exception as e_close:
-                    print(f"Telegram thread: Exception during event loop cleanup: {e_close}")
+                    print(f"Telegram thread: General exception during event loop cleanup: {e_close}")
                     traceback.print_exc()
-            asyncio.set_event_loop(None) # Clean up the current event loop for the thread
+                finally: # Ensure set_event_loop(None) is always called for this thread
+                    asyncio.set_event_loop(None)
+            else: # loop object itself was None
+                 asyncio.set_event_loop(None) # Still ensure thread-local loop is cleared
 
     thread = threading.Thread(target=thread_starter)
     thread.daemon = True
@@ -430,16 +422,9 @@ def get_user_configurations():
             configs["margin_type"] = margin_type
             break
         print("Invalid margin type. Please enter 'ISOLATED' or 'CROSS'.")
-    while True:
-        try:
-            threads_input = input(f"Enter maximum symbol scan threads (1-50, default: {DEFAULT_MAX_SCAN_THREADS}): ")
-            max_scan_threads = int(threads_input or DEFAULT_MAX_SCAN_THREADS)
-            if 1 <= max_scan_threads <= 50:
-                configs["max_scan_threads"] = max_scan_threads
-                break
-            print("Max scan threads must be an integer between 1 and 50.")
-        except ValueError:
-            print("Invalid input for scan threads. Please enter an integer.")
+    # Removed user input for max_scan_threads, fixing it to 5.
+    configs["max_scan_threads"] = 5
+    print(f"Maximum symbol scan threads fixed to 5.")
     
     while True:
         exceed_risk_input = input(f"Allow exceeding risk % to meet MIN_NOTIONAL? (yes/no, default: {'yes' if DEFAULT_ALLOW_EXCEED_RISK_FOR_MIN_NOTIONAL else 'no'}): ").lower().strip()
@@ -1441,20 +1426,47 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is
                 )
                 send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], telegram_alert_msg)
 
-        with lock: 
-            current_pd_timestamp = pd.Timestamp.now(tz='UTC') 
-            new_trade_data = {
-                "entry_order_id": entry_order['orderId'], 
-                "sl_order_id": sl_ord.get('orderId') if sl_ord else None,
-                "tp_order_id": tp_ord.get('orderId') if tp_ord else None, 
-                "entry_price": actual_ep,
-                "current_sl_price": final_sl_price, "current_tp_price": final_tp_price, 
-                "initial_sl_price": final_sl_price, "initial_tp_price": final_tp_price, # Store the prices used for SL/TP orders
-                "quantity": qty_to_order_final, "side": signal, 
-                "symbol_info": symbol_info, "open_timestamp": current_pd_timestamp
-            }
-            active_trades[symbol] = new_trade_data
-            print(f"{log_prefix} Trade for {symbol} recorded in active_trades at {active_trades[symbol]['open_timestamp']}.")
+        with lock:
+            if symbol in active_trades:
+                existing_trade_data = active_trades[symbol]
+                preserved_open_timestamp = existing_trade_data.get('open_timestamp')
+
+                updated_trade_data = {
+                    "entry_order_id": entry_order['orderId'],
+                    "sl_order_id": sl_ord.get('orderId') if sl_ord else existing_trade_data.get('sl_order_id'),
+                    "tp_order_id": tp_ord.get('orderId') if tp_ord else existing_trade_data.get('tp_order_id'),
+                    "entry_price": actual_ep,
+                    "current_sl_price": final_sl_price,
+                    "current_tp_price": final_tp_price,
+                    "initial_sl_price": final_sl_price,
+                    "initial_tp_price": final_tp_price,
+                    "quantity": qty_to_order_final,
+                    "side": signal,
+                    "symbol_info": symbol_info,
+                    "open_timestamp": preserved_open_timestamp 
+                }
+                active_trades[symbol] = updated_trade_data
+                print(f"{log_prefix} Trade for {symbol} finalized in active_trades. Open time: {preserved_open_timestamp}")
+            else:
+                # This path should ideally not be hit if preliminary recording was successful.
+                # If it is, log a warning and fall back to current timestamp for safety, though it indicates an issue.
+                current_pd_timestamp = pd.Timestamp.now(tz='UTC')
+                print(f"{log_prefix} WARNING: Symbol {symbol} was not in active_trades for final update. Recording with current time {current_pd_timestamp}.")
+                updated_trade_data = {
+                    "entry_order_id": entry_order['orderId'],
+                    "sl_order_id": sl_ord.get('orderId') if sl_ord else None,
+                    "tp_order_id": tp_ord.get('orderId') if tp_ord else None,
+                    "entry_price": actual_ep,
+                    "current_sl_price": final_sl_price,
+                    "current_tp_price": final_tp_price,
+                    "initial_sl_price": final_sl_price,
+                    "initial_tp_price": final_tp_price,
+                    "quantity": qty_to_order_final,
+                    "side": signal,
+                    "symbol_info": symbol_info,
+                    "open_timestamp": current_pd_timestamp 
+                }
+                active_trades[symbol] = updated_trade_data
                 
         if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
             current_balance_for_msg = get_account_balance(client, configs)
