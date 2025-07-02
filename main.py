@@ -215,11 +215,11 @@ def start_command_listener(bot_token, chat_id, last_message_content): # Renamed 
                  await application.initialize()
                  print("Telegram application initialized.")
 
-            # run_polling() is a blocking synchronous call.
-            # It starts the polling and will block until application.stop() is called
-            # or an error occurs.
+            # For PTB v20+, run_polling() is an async function.
+            # It starts the polling and will block here (because it's awaited)
+            # until application.stop() is called or an error occurs.
             print("Starting Telegram bot polling...")
-            application.run_polling()
+            await application.run_polling() # Ensure run_polling is awaited as it's async in PTB v20+
             print("Telegram bot polling stopped.")
 
         except Exception as e:
@@ -239,33 +239,55 @@ def start_command_listener(bot_token, chat_id, last_message_content): # Renamed 
 
 
     def thread_starter():
+        loop = None
         try:
-            # asyncio.run() will create a new event loop for this thread, run actual_bot_runner,
-            # and handle loop closure.
-            asyncio.run(actual_bot_runner())
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            print(f"Telegram thread: Created and set new event loop: {loop}")
+            loop.run_until_complete(actual_bot_runner())
         except RuntimeError as e:
-            # This specific error can sometimes occur on Windows with ProactorEventLoop
-            # during shutdown if the loop PTB tries to close is already being managed/closed.
-            if "Cannot close a running event loop" in str(e) or "Event loop is closed" in str(e):
-                print(f"Known asyncio loop issue during Telegram thread shutdown: {e}")
+            # Handle specific RuntimeErrors that might occur during loop operations
+            if "Cannot close a running event loop" in str(e) or \
+               "Event loop is closed" in str(e) or \
+               "This event loop is already running" in str(e):
+                print(f"Telegram thread: Known asyncio loop issue: {e}")
             else:
-                # Re-raise other RuntimeErrors
-                print(f"Unhandled RuntimeError in Telegram thread: {e}")
+                print(f"Telegram thread: Unhandled RuntimeError: {e}")
                 traceback.print_exc()
-                raise
-        except RuntimeError as e:
-            # This specific error can sometimes occur on Windows with ProactorEventLoop
-            # during shutdown if the loop PTB tries to close is already being managed/closed.
-            if "Cannot close a running event loop" in str(e) or "Event loop is closed" in str(e):
-                print(f"Known asyncio loop issue during Telegram thread shutdown: {e}")
-            else:
-                # Re-raise other RuntimeErrors
-                print(f"Unhandled RuntimeError in Telegram thread: {e}")
-                traceback.print_exc()
-                raise
+                # Optionally re-raise if it's critical and not one of the known quirks
         except Exception as e:
-            print(f"Exception in Telegram thread_starter: {e}")
+            print(f"Telegram thread: Exception in thread_starter: {e}")
             traceback.print_exc()
+        finally:
+            if loop:
+                try:
+                    # Ensure all tasks are cancelled before closing the loop
+                    # This is important if run_until_complete was exited by an exception
+                    # before actual_bot_runner's finally block fully executed PTB shutdown.
+                    all_tasks = asyncio.all_tasks(loop)
+                    if all_tasks:
+                        print(f"Telegram thread: Cancelling {len(all_tasks)} outstanding tasks...")
+                        for task in all_tasks:
+                            task.cancel()
+                        # Allow tasks to process their cancellation
+                        loop.run_until_complete(asyncio.gather(*all_tasks, return_exceptions=True))
+                        print("Telegram thread: Outstanding tasks cancelled.")
+                    
+                    # PTB's shutdown should ideally be handled within actual_bot_runner's finally.
+                    # If loop.stop() was called or run_polling exited normally, this is fine.
+                    # If an exception occurred, actual_bot_runner's finally might not have run completely.
+                    
+                    if loop.is_running():
+                         print("Telegram thread: Event loop is still running, attempting to stop it.")
+                         loop.stop() # Request loop to stop if it's somehow still marked running
+                    
+                    print("Telegram thread: Closing event loop...")
+                    loop.close()
+                    print("Telegram thread: Event loop closed.")
+                except Exception as e_close:
+                    print(f"Telegram thread: Exception during event loop cleanup: {e_close}")
+                    traceback.print_exc()
+            asyncio.set_event_loop(None) # Clean up the current event loop for the thread
 
     thread = threading.Thread(target=thread_starter)
     thread.daemon = True
@@ -1336,8 +1358,30 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is
                 "quantity": qty_to_order_final, "side": signal, 
                 "symbol_info": symbol_info, "open_timestamp": current_pd_timestamp
             }
-            active_trades[symbol] = new_trade_data
-            print(f"{log_prefix} Trade for {symbol} (Entry ID: {entry_order['orderId']}) preliminarily recorded in active_trades. SL/TP placement follows.")
+            try:
+                current_pd_timestamp = pd.Timestamp.now(tz='UTC') 
+                new_trade_data = {
+                    "entry_order_id": entry_order['orderId'], 
+                    "sl_order_id": None, # Initialize as None
+                    "tp_order_id": None, # Initialize as None
+                    "entry_price": actual_ep,
+                    "current_sl_price": final_sl_price, "current_tp_price": final_tp_price, 
+                    "initial_sl_price": final_sl_price, "initial_tp_price": final_tp_price, 
+                    "quantity": qty_to_order_final, "side": signal, 
+                    "symbol_info": symbol_info, "open_timestamp": current_pd_timestamp
+                }
+                active_trades[symbol] = new_trade_data
+                print(f"{log_prefix} Trade for {symbol} (Entry ID: {entry_order['orderId']}) preliminarily recorded in active_trades. SL/TP placement follows.")
+            except Exception as e_rec:
+                critical_error_msg = f"{log_prefix} CRITICAL ERROR: Order {entry_order['orderId']} for {symbol} placed successfully, BUT FAILED TO RECORD IN active_trades. Reason: {e_rec}. This trade may be orphaned and re-attempted. Manual intervention might be needed."
+                print(critical_error_msg)
+                traceback.print_exc()
+                if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+                    send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], f"🆘 {critical_error_msg}")
+                # Do not proceed with SL/TP placement if recording failed, as active_trades[symbol] won't exist or be correct.
+                # The function will eventually release symbols_currently_processing_lock and return.
+                # Next cycle might try again. This alerting is key.
+                return # Explicitly return to avoid SL/TP placement attempts on an unrecorded trade.
 
         # --- SL/TP Placement (occurs outside the immediate active_trades update lock for atomicity of count) ---
         # This means if SL/TP placement fails, the trade is already in active_trades.
@@ -2077,7 +2121,16 @@ def ensure_sl_tp_for_all_open_positions(client, configs, active_trades_ref, symb
                 # q_prec_unmanaged = int(s_info_unmanaged['quantityPrecision']) # Not strictly needed for placing SL/TP with existing qty
 
                 # 2. Fetch Klines
-                klines_df_unmanaged = get_historical_klines(client, symbol, limit=250) # Sufficient for EMA100/200
+                # get_historical_klines returns a tuple (df, error_object)
+                klines_df_unmanaged, klines_error = get_historical_klines(client, symbol, limit=250) # Sufficient for EMA100/200
+                
+                if klines_error:
+                    error_message = f"Error fetching klines for UNMANAGED {symbol}: {klines_error}"
+                    msg = f"⚠️ {log_prefix} {error_message}. Cannot calculate SL/TP."
+                    print(msg)
+                    send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"), msg)
+                    continue
+
                 if klines_df_unmanaged.empty or len(klines_df_unmanaged) < 202: # Need enough for EMA200 + some history
                     msg = f"⚠️ {log_prefix} Insufficient kline data for UNMANAGED {symbol} (got {len(klines_df_unmanaged)}). Cannot calculate SL/TP."
                     print(msg)
