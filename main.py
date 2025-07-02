@@ -208,13 +208,51 @@ def start_command_listener(bot_token, chat_id, last_message_content): # Renamed 
         application.add_handler(CommandHandler("start", start_handler))
         application.add_handler(CommandHandler("help", help_handler))
 
-        # run_polling() will block until the application is stopped.
-        await application.run_polling()
-        application.run_polling()
+        try:
+            # Initialize the application
+            if hasattr(application, 'initialize') and callable(application.initialize):
+                 print("Initializing Telegram application...")
+                 await application.initialize()
+                 print("Telegram application initialized.")
+
+            # run_polling() is a blocking synchronous call.
+            # It starts the polling and will block until application.stop() is called
+            # or an error occurs.
+            print("Starting Telegram bot polling...")
+            application.run_polling()
+            print("Telegram bot polling stopped.")
+
+        except Exception as e:
+            print(f"Exception in Telegram actual_bot_runner: {e}")
+            traceback.print_exc()
+        finally:
+            # Attempt to gracefully shutdown the application
+            if hasattr(application, 'shutdown') and callable(application.shutdown):
+                if hasattr(application, 'initialized') and application.initialized:
+                    print("Attempting to shutdown Telegram application...")
+                    await application.shutdown()
+                    print("Telegram application shutdown completed.")
+                else:
+                    print("Telegram application was not initialized or already shut down, skipping explicit shutdown call.")
+            else:
+                print("Telegram application object does not support shutdown method as expected.")
+
 
     def thread_starter():
         try:
+            # asyncio.run() will create a new event loop for this thread, run actual_bot_runner,
+            # and handle loop closure.
             asyncio.run(actual_bot_runner())
+        except RuntimeError as e:
+            # This specific error can sometimes occur on Windows with ProactorEventLoop
+            # during shutdown if the loop PTB tries to close is already being managed/closed.
+            if "Cannot close a running event loop" in str(e) or "Event loop is closed" in str(e):
+                print(f"Known asyncio loop issue during Telegram thread shutdown: {e}")
+            else:
+                # Re-raise other RuntimeErrors
+                print(f"Unhandled RuntimeError in Telegram thread: {e}")
+                traceback.print_exc()
+                raise
         except RuntimeError as e:
             # This specific error can sometimes occur on Windows with ProactorEventLoop
             # during shutdown if the loop PTB tries to close is already being managed/closed.
@@ -435,57 +473,59 @@ def get_historical_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUT
     Otherwise, it fetches the most recent 'limit' klines.
     """
     start_time = time.time()
-    if backtest_days:
-        # Calculate how many klines are needed based on the interval and days
-        # Binance API limit is 1000-1500 klines per request depending on endpoint (futures vs spot)
-        # For 15min interval: 4 klines/hour * 24 hours/day = 96 klines/day
-        # Let's use a known limit like 1000 for client.get_historical_klines
-        klines_per_day = (24 * 60) // int(interval.replace('m','').replace('h','').replace('d','')) # Approximate
-        if 'h' in interval: klines_per_day = 24 // int(interval.replace('h',''))
-        if 'd' in interval: klines_per_day = 1
+    klines = []
+    api_error = None
 
-        total_klines_needed = klines_per_day * backtest_days
-        print(f"Fetching klines for {symbol}, interval {interval}, for {backtest_days} days (approx {total_klines_needed} klines)...")
-        
-        # get_historical_klines fetches in batches of 1000 (or its internal limit)
-        # The "days ago" string needs to be like "X days ago UTC"
-        # Ensure client.get_historical_klines exists and is the correct method for this.
-        # The standard client.get_historical_klines is what we need.
-        start_str = f"{backtest_days + 1} days ago UTC" # Fetch a bit more to ensure enough data
-        try:
+    try:
+        if backtest_days:
+            klines_per_day = (24 * 60) // int(interval.replace('m','').replace('h','').replace('d',''))
+            if 'h' in interval: klines_per_day = 24 // int(interval.replace('h',''))
+            if 'd' in interval: klines_per_day = 1
+            total_klines_needed = klines_per_day * backtest_days
+            print(f"Fetching klines for {symbol}, interval {interval}, for {backtest_days} days (approx {total_klines_needed} klines)...")
+            start_str = f"{backtest_days + 1} days ago UTC"
             klines = client.get_historical_klines(symbol, interval, start_str)
-        except Exception as e: # Catch if get_historical_klines fails with start_str
-             print(f"Failed to fetch historical klines with start_str: {e}. Trying with limit.")
-             # Fallback or alternative logic if the above fails or is not desired
-             # For simplicity, this example will stick to the intended method
-             # but a real implementation might need robust fetching in chunks if start_str is problematic
-             # or if total_klines_needed > API max per call (which get_historical_klines handles by pagination)
-             klines = [] # Ensure klines is defined
-
-    else: # Original behavior for live mode
-        print(f"Fetching klines for {symbol}, interval {interval}, limit {limit}...")
-        try:
+        else: # Live mode
+            print(f"Fetching klines for {symbol}, interval {interval}, limit {limit}...")
             klines = client.get_klines(symbol=symbol, interval=interval, limit=limit)
-        except BinanceAPIException as e:
-            print(f"API Error fetching klines for {symbol}: {e}"); return pd.DataFrame()
-        except Exception as e:
-            print(f"Error fetching klines for {symbol}: {e}"); return pd.DataFrame()
+    except BinanceAPIException as e:
+        print(f"API Error fetching klines for {symbol}: {e}")
+        api_error = e
+        return pd.DataFrame(), api_error # Return empty DataFrame and the error
+    except Exception as e: # Catch other potential errors during fetch (e.g., network issues)
+        print(f"General error fetching klines for {symbol}: {e}")
+        api_error = e # Store general exception as well
+        return pd.DataFrame(), api_error # Return empty DataFrame and the error
 
     duration = time.time() - start_time
-    try: # Moved common processing into this try block
+    processing_error = None
+    try: 
         if not klines:
+            # This case means no data returned, but not necessarily an API exception caught above (e.g. symbol exists but has no trades)
             print(f"No kline data for {symbol} (fetch duration: {duration:.2f}s).")
-            return pd.DataFrame()
+            # If api_error was already set (e.g. from a specific exception during klines = ...), it will be returned.
+            # Otherwise, this is just an empty kline list.
+            return pd.DataFrame(), api_error # api_error might be None here
+
         df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
         for col in ['open', 'high', 'low', 'close', 'volume']: df[col] = pd.to_numeric(df[col], errors='coerce')
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.set_index('timestamp', inplace=True)
         df.dropna(subset=['open', 'high', 'low', 'close'], inplace=True)
+        
+        if df.empty and not api_error : # If after processing, df is empty, and no prior API error
+             print(f"Kline data for {symbol} resulted in empty DataFrame after processing (fetch duration: {duration:.2f}s).")
+             # Potentially set a generic error or info that processing yielded no usable data
+             # For now, returning api_error (which would be None) is fine.
+
         print(f"Fetched {len(df)} klines for {symbol} (runtime: {duration:.2f}s).")
-        if len(df) < 200: print(f"Warning: Low kline count for {symbol} ({len(df)}), EMA200 may be inaccurate.")
-        return df
-    except BinanceAPIException as e: print(f"API Error fetching klines for {symbol} ({time.time()-start_time:.2f}s): {e}"); return pd.DataFrame()
-    except Exception as e: print(f"Error processing klines for {symbol}: {e}"); return pd.DataFrame()
+        if len(df) < 200 and not df.empty: print(f"Warning: Low kline count for {symbol} ({len(df)}), EMA200 may be inaccurate.")
+        return df, None # Success, no error object to return for this part
+    
+    except Exception as e: # Error during DataFrame processing
+        print(f"Error processing kline data for {symbol}: {e}")
+        processing_error = e
+        return pd.DataFrame(), processing_error # Return empty DataFrame and the processing error
 
 def get_account_balance(client, asset="USDT"):
     try:
@@ -676,8 +716,11 @@ def place_new_order(client, symbol_info, side, order_type, quantity, price=None,
     try:
         order = client.futures_create_order(**params)
         print(f"Order PLACED: {order['symbol']} ID {order['orderId']} {order.get('positionSide','N/A')} {order['side']} {order['type']} {order['origQty']} @ {order.get('price','MARKET')} SP:{order.get('stopPrice','N/A')} CP:{order.get('closePosition','false')} RO:{order.get('reduceOnly','false')} AvgP:{order.get('avgPrice','N/A')} Status:{order['status']}")
-        return order
-    except Exception as e: print(f"ORDER FAILED for {symbol} {side} {quantity} {order_type}: {e}"); return None
+        return order, None  # Return order and None for error message on success
+    except Exception as e:
+        error_msg = f"ORDER FAILED for {symbol} {side} {quantity} {order_type}: {str(e)}"
+        print(error_msg)
+        return None, str(e) # Return None for order and the error message string on failure
 
 # --- Indicator, Strategy, SL/TP, Sizing ---
 def calculate_ema(df, period, column='close'):
@@ -998,23 +1041,24 @@ def pre_order_sanity_checks(symbol, signal, entry_price, sl_price, tp_price, qua
     risk_percentage_actual = risk_amount_abs / current_balance
     
     if not is_unmanaged_check: # Only perform detailed risk % checks for normally managed new trades
-        # Define a small tolerance for float comparisons of percentages
-        strict_risk_tolerance = 0.0001 # Absolute 0.01% deviation from target risk percentage
-        allow_exceed_risk = configs.get('allow_exceed_risk_for_min_notional', DEFAULT_ALLOW_EXCEED_RISK_FOR_MIN_NOTIONAL)
+        allow_exceed_risk_config = configs.get('allow_exceed_risk_for_min_notional', DEFAULT_ALLOW_EXCEED_RISK_FOR_MIN_NOTIONAL)
+        epsilon = 0.00001 # Small value for float comparisons
 
-        if not allow_exceed_risk:
-            # Strict check: actual risk should be very close to configured risk
-            if abs(risk_percentage_actual - risk_percent_config) > strict_risk_tolerance:
-                return False, (f"Actual risk ({risk_percentage_actual*100:.3f}%) deviates "
-                               f"from configured risk ({risk_percent_config*100:.3f}%) by more than "
-                               f"{strict_risk_tolerance*100:.3f}%. Stricter risk adherence is enabled.")
-        else: # allow_exceed_risk is True
-            # More lenient check: actual risk should not exceed a cap (e.g., 1.5x configured risk)
-            max_permissible_risk = risk_percent_config * 1.5 
-            if risk_percentage_actual > (max_permissible_risk + strict_risk_tolerance): 
+        if not allow_exceed_risk_config: # "Stricter risk adherence is enabled" path (allow_exceed_risk_for_min_notional is False)
+            # If actual risk is greater than configured risk (plus epsilon), reject.
+            # Otherwise (actual risk <= configured risk), it's acceptable.
+            if risk_percentage_actual > (risk_percent_config + epsilon):
                 return False, (f"Actual risk ({risk_percentage_actual*100:.3f}%) exceeds "
-                               f"the maximum permissible risk limit ({max_permissible_risk*100:.3f}%) "
+                               f"configured risk ({risk_percent_config*100:.3f}%). Stricter adherence enabled, trade rejected.")
+        
+        else: # allow_exceed_risk_config is True (user explicitly allowed exceeding risk for min_notional)
+            # Actual risk can exceed configured_risk, but not beyond 1.5x configured_risk.
+            max_permissible_risk = risk_percent_config * 1.5
+            if risk_percentage_actual > (max_permissible_risk + epsilon):
+                return False, (f"Actual risk ({risk_percentage_actual*100:.3f}%) exceeds "
+                               f"the maximum permissible limit ({max_permissible_risk*100:.3f}%, which is 1.5x configured risk) "
                                f"even when 'allow_exceed_risk_for_min_notional' is enabled.")
+                               
     else: # For unmanaged checks, just ensure risk is not absurdly high, e.g. > 50% of balance for a single trade SL
         if risk_percentage_actual > 0.5: # Arbitrary high cap for unmanaged safety SL/TP
              return False, (f"Calculated SL for UNMANAGED trade implies extremely high risk ({risk_percentage_actual*100:.2f}% of balance). "
@@ -1057,18 +1101,35 @@ def process_symbol_task(symbol, client, configs, lock):
     cycle_start_ref = configs.get('cycle_start_time_ref', time.time()) # Fallback if not passed
     print(f"[{thread_name}] Processing: {symbol} {format_elapsed_time(cycle_start_ref)}")
     try:
-        klines_df = get_historical_klines(client, symbol) # Uses default limit 500
+        klines_df, klines_error = get_historical_klines(client, symbol) # Uses default limit 500
+        
+        if klines_error:
+            if isinstance(klines_error, BinanceAPIException) and klines_error.code == -1121:
+                # Specific handling for "Invalid symbol"
+                msg = f"Skipped: Invalid symbol reported by API (code -1121)."
+                print(f"[{thread_name}] {symbol}: {msg} {format_elapsed_time(cycle_start_ref)}")
+                # TODO: Consider adding logic here to remove 'symbol' from a shared list of monitored symbols
+                # to prevent repeated checks for persistently invalid symbols. This requires careful synchronization.
+                return f"{symbol}: {msg}"
+            else:
+                # General error during kline fetch
+                msg = f"Skipped: Error fetching klines ({str(klines_error)})."
+                print(f"[{thread_name}] {symbol}: {msg} {format_elapsed_time(cycle_start_ref)}")
+                return f"{symbol}: {msg}"
+
         if klines_df.empty or len(klines_df) < 202:
-            print(f"[{thread_name}] {symbol}: Skipped calling manage_trade_entry - Insufficient klines ({len(klines_df)}) {format_elapsed_time(cycle_start_ref)}")
-            return f"{symbol}: Skipped - Insufficient klines ({len(klines_df)})"
+            msg = f"Skipped: Insufficient klines ({len(klines_df)})."
+            print(f"[{thread_name}] {symbol}: {msg} {format_elapsed_time(cycle_start_ref)}")
+            return f"{symbol}: {msg}"
         
         print(f"[{thread_name}] {symbol}: Sufficient klines ({len(klines_df)}). Calling manage_trade_entry {format_elapsed_time(cycle_start_ref)}")
         manage_trade_entry(client, configs, symbol, klines_df.copy(), lock)
         return f"{symbol}: Processed"
     except Exception as e:
-        print(f"[{thread_name}] ERROR processing {symbol}: {e} {format_elapsed_time(cycle_start_ref)}")
+        error_detail = f"Unhandled error in process_symbol_task: {e}"
+        print(f"[{thread_name}] ERROR processing {symbol}: {error_detail} {format_elapsed_time(cycle_start_ref)}")
         traceback.print_exc() # Print full traceback for thread errors
-        return f"{symbol}: Error - {e}"
+        return f"{symbol}: Error - {error_detail}"
 
 def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is active_trades_lock
     global active_trades, symbols_currently_processing, symbols_currently_processing_lock
@@ -1201,45 +1262,41 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is
         position_side_for_trade = "LONG" if signal == "LONG" else "SHORT"
 
         print(f"{log_prefix} Attempting {signal} ({position_side_for_trade}) {qty_to_order_final} {symbol} @MKT (EP:{entry_p:.{symbol_info['pricePrecision']}f}), SL:{sl_p_calc:.{symbol_info['pricePrecision']}f}, TP:{tp_p_calc:.{symbol_info['pricePrecision']}f}")
-        entry_order = place_new_order(client, 
-                                      symbol_info, 
-                                      "BUY" if signal=="LONG" else "SELL", 
-                                      "MARKET", 
-                                      qty_to_order_final,
-                                      position_side=position_side_for_trade)
+        
+        # Call place_new_order and unpack both order object and potential error message
+        entry_order, entry_order_error_msg = place_new_order(client, 
+                                                              symbol_info, 
+                                                              "BUY" if signal=="LONG" else "SELL", 
+                                                              "MARKET", 
+                                                              qty_to_order_final,
+                                                              position_side=position_side_for_trade)
 
         if not entry_order or entry_order.get('status') != 'FILLED':
-            reason = f"Market entry order failed or not filled. Status: {entry_order.get('status') if entry_order else 'N/A'}."
-            print(f"{log_prefix} {reason} for {symbol}: {entry_order}")
-            send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p_calc, tp_p_calc, qty_to_order_final, symbol_info, configs)
+            base_reason = f"Market entry order failed or not filled. Status: {entry_order.get('status') if entry_order else 'N/A'}"
+            detailed_reason = f"{base_reason}. API Error: {entry_order_error_msg}" if entry_order_error_msg else base_reason
+            print(f"{log_prefix} {detailed_reason} for {symbol}: {entry_order}") # Log includes entry_order object which might be None
+            send_trade_rejection_notification(symbol, signal, detailed_reason, entry_p, sl_p_calc, tp_p_calc, qty_to_order_final, symbol_info, configs)
             return
         
         # --- Final Lock for Order Placement and active_trades update ---
+        # Note: The entry order has already been attempted (and succeeded if we are here)
+        # The original code had a second call to place_new_order within the lock.
+        # This is redundant if the first call succeeds and dangerous if it was meant as a retry without proper state handling.
+        # Assuming the first successful entry_order is the one to use.
+        # The primary purpose of this lock section should be to atomically check max positions and update active_trades.
+
         with lock: # This is active_trades_lock
-            # Perform the final check for max concurrent positions INSIDE the lock,
-            # right before placing the order.
             if len(active_trades) >= configs["max_concurrent_positions"]:
-                print(f"{log_prefix} Final check: Max concurrent positions ({configs['max_concurrent_positions']}) filled by another thread just before placing order for {symbol}. Aborting.")
-                # Optionally, send a specific notification for this scenario
-                # send_trade_rejection_notification(symbol, signal, "Max positions filled (race condition)", entry_p, sl_p_calc, tp_p_calc, qty_to_order_final, symbol_info, configs)
+                print(f"{log_prefix} Max concurrent positions ({configs['max_concurrent_positions']}) reached just before recording trade. Order for {symbol} was placed but will not be managed by bot. This may require manual intervention for order ID {entry_order.get('orderId') if entry_order else 'UNKNOWN'}.")
+                # This is a tricky state: order placed but bot won't manage. 
+                # For now, just notify and don't add to active_trades.
+                # A more robust solution might try to cancel the orphaned market order if possible, but that's complex.
+                # Sending a specific Telegram alert for this "orphaned but filled" scenario:
+                orphan_reason = f"Max positions ({configs['max_concurrent_positions']}) met after order fill. Order ID {entry_order.get('orderId')} for {symbol} is orphaned and needs manual management."
+                send_trade_rejection_notification(symbol, signal, orphan_reason, entry_p, sl_p_calc, tp_p_calc, qty_to_order_final, symbol_info, configs)
                 return
 
-            # If check passes, proceed to place entry order
-            entry_order = place_new_order(client, 
-                                          symbol_info, 
-                                          "BUY" if signal=="LONG" else "SELL", 
-                                          "MARKET", 
-                                          qty_to_order_final,
-                                          position_side=position_side_for_trade)
-
-            if not entry_order or entry_order.get('status') != 'FILLED':
-                reason = f"Market entry order failed or not filled (within final lock). Status: {entry_order.get('status') if entry_order else 'N/A'}."
-                print(f"{log_prefix} {reason} for {symbol}: {entry_order}")
-                # Note: This rejection happens inside the lock. If it's frequent, it might briefly hold up other threads.
-                # However, order placement failures should be relatively rare with prior checks.
-                send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p_calc, tp_p_calc, qty_to_order_final, symbol_info, configs)
-                return # Return from within the lock if entry order fails
-            
+            # If we are here, entry_order is successful and there's space for the trade.
             print(f"{log_prefix} Market entry order FILLED. Details: {entry_order}")
             actual_ep = float(entry_order.get('avgPrice', entry_p))
             
@@ -1958,45 +2015,47 @@ def ensure_sl_tp_for_all_open_positions(client, configs, active_trades_ref, symb
 
                 if not sl_order_active:
                     print(f"{log_prefix} SL order for managed trade {symbol} ({side}) is MISSING or incorrect. Attempting to re-place.")
-                    new_sl_order = place_new_order(client, 
-                                                   s_info_managed, 
-                                                   "SELL" if side == "LONG" else "BUY", 
-                                                   "STOP_MARKET", 
-                                                   qty_for_new_sl_tp_orders, 
-                                                   stop_price=target_sl_price, 
-                                                   position_side=side, # side here is the position's side (LONG/SHORT)
-                                                   is_closing_order=True)
-                    if new_sl_order and new_sl_order.get('orderId'):
-                        print(f"{log_prefix} Successfully re-placed SL order for {symbol}. New ID: {new_sl_order['orderId']}")
+                    sl_order_obj, sl_error_msg = place_new_order(client, 
+                                                                 s_info_managed, 
+                                                                 "SELL" if side == "LONG" else "BUY", 
+                                                                 "STOP_MARKET", 
+                                                                 qty_for_new_sl_tp_orders, 
+                                                                 stop_price=target_sl_price, 
+                                                                 position_side=side, # side here is the position's side (LONG/SHORT)
+                                                                 is_closing_order=True)
+                    if sl_order_obj and sl_order_obj.get('orderId'):
+                        print(f"{log_prefix} Successfully re-placed SL order for {symbol}. New ID: {sl_order_obj['orderId']}")
                         with active_trades_lock: 
                              if symbol in active_trades_ref: 
-                                active_trades_ref[symbol]['sl_order_id'] = new_sl_order['orderId']
+                                active_trades_ref[symbol]['sl_order_id'] = sl_order_obj['orderId']
                         send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"),
                                               f"✅ {log_prefix} Re-placed MISSING SL for managed {symbol} ({side}) @ {target_sl_price:.{s_info_managed['pricePrecision']}f}")
                     else:
-                        err_msg_sl = f"⚠️ {log_prefix} FAILED to re-place SL for managed {symbol} ({side}). Target SL: {target_sl_price:.{s_info_managed['pricePrecision']}f}. Details: {new_sl_order or 'No order object'}"
+                        err_detail = f"API Error: {sl_error_msg}" if sl_error_msg else "Order object missing or no orderId."
+                        err_msg_sl = f"⚠️ {log_prefix} FAILED to re-place SL for managed {symbol} ({side}). Target SL: {target_sl_price:.{s_info_managed['pricePrecision']}f}. Details: {err_detail}"
                         print(err_msg_sl)
                         send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"), err_msg_sl)
 
                 if not tp_order_active:
                     print(f"{log_prefix} TP order for managed trade {symbol} ({side}) is MISSING or incorrect. Attempting to re-place.")
-                    new_tp_order = place_new_order(client, 
-                                                   s_info_managed,
-                                                   "SELL" if side == "LONG" else "BUY",
-                                                   "TAKE_PROFIT_MARKET", 
-                                                   qty_for_new_sl_tp_orders,
-                                                   stop_price=target_tp_price, 
-                                                   position_side=side, # side here is the position's side (LONG/SHORT)
-                                                   is_closing_order=True)
-                    if new_tp_order and new_tp_order.get('orderId'):
-                        print(f"{log_prefix} Successfully re-placed TP order for {symbol}. New ID: {new_tp_order['orderId']}")
+                    tp_order_obj, tp_error_msg = place_new_order(client, 
+                                                                 s_info_managed,
+                                                                 "SELL" if side == "LONG" else "BUY",
+                                                                 "TAKE_PROFIT_MARKET", 
+                                                                 qty_for_new_sl_tp_orders,
+                                                                 stop_price=target_tp_price, 
+                                                                 position_side=side, # side here is the position's side (LONG/SHORT)
+                                                                 is_closing_order=True)
+                    if tp_order_obj and tp_order_obj.get('orderId'):
+                        print(f"{log_prefix} Successfully re-placed TP order for {symbol}. New ID: {tp_order_obj['orderId']}")
                         with active_trades_lock: 
                             if symbol in active_trades_ref:
-                                active_trades_ref[symbol]['tp_order_id'] = new_tp_order['orderId']
+                                active_trades_ref[symbol]['tp_order_id'] = tp_order_obj['orderId']
                         send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"),
                                               f"✅ {log_prefix} Re-placed MISSING TP for managed {symbol} ({side}) @ {target_tp_price:.{s_info_managed['pricePrecision']}f}")
                     else:
-                        err_msg_tp = f"⚠️ {log_prefix} FAILED to re-place TP for managed {symbol} ({side}). Target TP: {target_tp_price:.{s_info_managed['pricePrecision']}f}. Details: {new_tp_order or 'No order object'}"
+                        err_detail = f"API Error: {tp_error_msg}" if tp_error_msg else "Order object missing or no orderId."
+                        err_msg_tp = f"⚠️ {log_prefix} FAILED to re-place TP for managed {symbol} ({side}). Target TP: {target_tp_price:.{s_info_managed['pricePrecision']}f}. Details: {err_detail}"
                         print(err_msg_tp)
                         send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"), err_msg_tp)
             else: # UNMANAGED TRADE
@@ -2101,29 +2160,35 @@ def ensure_sl_tp_for_all_open_positions(client, configs, active_trades_ref, symb
                         except Exception as e_cancel:
                             print(f"{log_prefix} Failed to cancel existing order {order['orderId']} for {symbol}: {e_cancel}")
                 
-                new_sl_unmanaged = place_new_order(client, s_info_unmanaged,
-                                                   "SELL" if side == "LONG" else "BUY",
-                                                   "STOP_MARKET", abs_position_qty,
-                                                   stop_price=calc_sl_price, reduce_only=True)
-                if new_sl_unmanaged and new_sl_unmanaged.get('orderId'):
+                sl_order_obj, sl_error_msg = place_new_order(client, s_info_unmanaged,
+                                                             "SELL" if side == "LONG" else "BUY",
+                                                             "STOP_MARKET", abs_position_qty,
+                                                             stop_price=calc_sl_price,
+                                                             position_side=side, # Pass the determined side of the unmanaged position
+                                                             is_closing_order=True) # Use is_closing_order instead of reduce_only
+                if sl_order_obj and sl_order_obj.get('orderId'):
                     sl_placed_unmanaged = True
-                    print(f"{log_prefix} Successfully placed SL for UNMANAGED {symbol} @ {calc_sl_price:.{p_prec_unmanaged}f}")
+                    print(f"{log_prefix} Successfully placed SL for UNMANAGED {symbol} ({side}) @ {calc_sl_price:.{p_prec_unmanaged}f}")
                 else:
-                    msg = (f"⚠️ {log_prefix} FAILED to place SL for UNMANAGED {symbol}. "
-                           f"Entry: {entry_price:.{p_prec_unmanaged}f}, Target SL: {calc_sl_price:.{p_prec_unmanaged}f}. Details: {new_sl_unmanaged or 'No order object'}")
+                    err_detail = f"API Error: {sl_error_msg}" if sl_error_msg else "Order object missing or no orderId."
+                    msg = (f"⚠️ {log_prefix} FAILED to place SL for UNMANAGED {symbol} ({side}). "
+                           f"Entry: {entry_price:.{p_prec_unmanaged}f}, Target SL: {calc_sl_price:.{p_prec_unmanaged}f}. Details: {err_detail}")
                     print(msg)
                     send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"), msg)
 
-                new_tp_unmanaged = place_new_order(client, s_info_unmanaged,
-                                                   "SELL" if side == "LONG" else "BUY",
-                                                   "TAKE_PROFIT_MARKET", abs_position_qty,
-                                                   stop_price=calc_tp_price, reduce_only=True)
-                if new_tp_unmanaged and new_tp_unmanaged.get('orderId'):
+                tp_order_obj, tp_error_msg = place_new_order(client, s_info_unmanaged,
+                                                             "SELL" if side == "LONG" else "BUY",
+                                                             "TAKE_PROFIT_MARKET", abs_position_qty,
+                                                             stop_price=calc_tp_price,
+                                                             position_side=side, # Pass the determined side of the unmanaged position
+                                                             is_closing_order=True) # Use is_closing_order instead of reduce_only
+                if tp_order_obj and tp_order_obj.get('orderId'):
                     tp_placed_unmanaged = True
-                    print(f"{log_prefix} Successfully placed TP for UNMANAGED {symbol} @ {calc_tp_price:.{p_prec_unmanaged}f}")
+                    print(f"{log_prefix} Successfully placed TP for UNMANAGED {symbol} ({side}) @ {calc_tp_price:.{p_prec_unmanaged}f}")
                 else:
-                    msg = (f"⚠️ {log_prefix} FAILED to place TP for UNMANAGED {symbol}. "
-                           f"Entry: {entry_price:.{p_prec_unmanaged}f}, Target TP: {calc_tp_price:.{p_prec_unmanaged}f}. Details: {new_tp_unmanaged or 'No order object'}")
+                    err_detail = f"API Error: {tp_error_msg}" if tp_error_msg else "Order object missing or no orderId."
+                    msg = (f"⚠️ {log_prefix} FAILED to place TP for UNMANAGED {symbol} ({side}). "
+                           f"Entry: {entry_price:.{p_prec_unmanaged}f}, Target TP: {calc_tp_price:.{p_prec_unmanaged}f}. Details: {err_detail}")
                     print(msg)
                     send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"), msg)
                 
