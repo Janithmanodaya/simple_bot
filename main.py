@@ -1505,7 +1505,7 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     # Clean up temporary columns from the input DataFrame
     df.drop(columns=['prev_close', 'tr0', 'tr1', 'tr2', 'tr'], inplace=True)
     
-    return atr_series
+    return atr_series.astype(float) # Ensure the output series is of float type
 
 def calculate_realized_volatility(klines_df: pd.DataFrame, period: int, candles_per_year: int) -> float | None:
     """
@@ -1680,14 +1680,23 @@ def calculate_sl_tp_values(entry_price: float, side: str, atr_value: float, conf
 
 
     sl_distance = atr_value * atr_multiplier_sl
-    if sl_distance <= 0: # Should not happen if atr_value > 0 and multiplier > 0
-        print(f"Warning: SL distance calculation resulted in zero or negative ({sl_distance}). Check ATR ({atr_value}) and SL Multiplier ({atr_multiplier_sl}). Adjusting to a minimal distance.")
-        # Fallback to a tiny fraction of entry price if ATR logic fails critically, to avoid zero distance.
-        # This is an emergency fallback, ideally inputs are sane.
-        min_meaningful_distance = entry_price * 0.0001 # 0.01% of entry price as a fallback
-        sl_distance = max(min_meaningful_distance, 1 / (10**p_prec)) # Ensure it's at least one price tick if possible
+    
+    # Ensure sl_distance is positive. This is crucial.
+    # atr_value is checked > 0, atr_multiplier_sl is validated > 0 during config.
+    # However, an explicit check here is a good safeguard.
+    if sl_distance <= 0:
+        print(f"Critical Error: SL distance calculation resulted in zero or negative value ({sl_distance}). "
+              f"ATR: {atr_value}, ATR Multiplier SL: {atr_multiplier_sl}. "
+              f"Cannot reliably set SL. Returning None, None.")
+        return None, None
 
     tp_distance = sl_distance * tp_rr_ratio
+    # Also ensure tp_distance is positive, which it should be if sl_distance and tp_rr_ratio are positive.
+    if tp_distance <= 0:
+        print(f"Critical Error: TP distance calculation resulted in zero or negative value ({tp_distance}). "
+              f"SL Distance: {sl_distance}, TP R:R Ratio: {tp_rr_ratio}. "
+              f"Cannot reliably set TP. Returning None, None.")
+        return None, None
 
     if side == "LONG":
         sl_price = entry_price - sl_distance
@@ -3537,12 +3546,44 @@ def ensure_sl_tp_for_all_open_positions(client, configs, active_trades_ref, symb
                 ema100_val_unmanaged = klines_df_unmanaged['EMA100'].iloc[-1]
 
                 # 4. Calculate SL/TP
-                # calculate_sl_tp_values(entry, side, ema100, df_klines, idx=-1)
-                calc_sl_price, calc_tp_price = calculate_sl_tp_values(entry_price, side, ema100_val_unmanaged, klines_df_unmanaged)
+                # Calculate ATR for unmanaged trade
+                klines_df_unmanaged['atr'] = calculate_atr(klines_df_unmanaged, period=configs.get('atr_period', DEFAULT_ATR_PERIOD))
+                raw_atr_value = klines_df_unmanaged['atr'].iloc[-1]
+                
+                current_atr_unmanaged = None
+                try:
+                    current_atr_unmanaged = float(raw_atr_value)
+                except (ValueError, TypeError) as e:
+                    msg = (f"⚠️ {log_prefix} ATR value '{raw_atr_value}' for UNMANAGED {symbol} is not a valid number. Error: {e}. "
+                           f"Cannot calculate SL/TP.")
+                    print(msg)
+                    send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"), msg)
+                    if 'atr' in klines_df_unmanaged.columns: klines_df_unmanaged.drop(columns=['atr'], inplace=True)
+                    continue # Skip to next position
+
+                if pd.isna(current_atr_unmanaged) or current_atr_unmanaged <= 0:
+                    msg = (f"⚠️ {log_prefix} Invalid or non-positive ATR value ({current_atr_unmanaged}) for UNMANAGED {symbol}. "
+                           f"Cannot calculate SL/TP.")
+                    print(msg)
+                    send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"), msg)
+                    if 'atr' in klines_df_unmanaged.columns: klines_df_unmanaged.drop(columns=['atr'], inplace=True)
+                    continue
+
+                print(f"{log_prefix} ATR for UNMANAGED {symbol}: {current_atr_unmanaged:.{p_prec_unmanaged}f}")
+
+                # Correctly call calculate_sl_tp_values with ATR, configs, and symbol_info
+                calc_sl_price, calc_tp_price = calculate_sl_tp_values(
+                    entry_price, 
+                    side, 
+                    current_atr_unmanaged,  # Pass calculated ATR value
+                    configs,                # Pass the main configs dictionary
+                    s_info_unmanaged        # Pass the symbol_info for this unmanaged symbol
+                )
+                if 'atr' in klines_df_unmanaged.columns: klines_df_unmanaged.drop(columns=['atr'], inplace=True) # Clean up ATR column
 
                 if calc_sl_price is None or calc_tp_price is None:
-                    msg = (f"⚠️ {log_prefix} Failed to calculate SL/TP for UNMANAGED {symbol}. "
-                           f"Entry: {entry_price:.{p_prec_unmanaged}f}, Side: {side}.")
+                    msg = (f"⚠️ {log_prefix} Failed to calculate SL/TP for UNMANAGED {symbol} using ATR. "
+                           f"Entry: {entry_price:.{p_prec_unmanaged}f}, Side: {side}, ATR: {current_atr_unmanaged:.{p_prec_unmanaged}f}.")
                     print(msg)
                     send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"), msg)
                     continue
@@ -3564,15 +3605,22 @@ def ensure_sl_tp_for_all_open_positions(client, configs, active_trades_ref, symb
                 # Let's call it, but be mindful of its risk interpretation for this context.
                 # We might need a modified sanity check or interpret its results carefully.
 
+                # leverage variable is already calculated as int:
+                # leverage = int(pos.get('leverage', configs.get('leverage')))
                 sanity_passed, sanity_reason = pre_order_sanity_checks(
-                    symbol, side, entry_price, calc_sl_price, calc_tp_price, 
-                    abs_position_qty, # Use actual position quantity
-                    s_info_unmanaged, 
-                    current_balance_for_check if current_balance_for_check is not None else 10000, # Use fetched balance or a placeholder
-                    configs.get('risk_percent'), # This might need adjustment for unmanaged
-                    configs, 
-                    klines_df_unmanaged,
-                    is_unmanaged_check=True # Pass True for unmanaged positions
+                    symbol=symbol, 
+                    signal=side, 
+                    entry_price=entry_price, 
+                    sl_price=calc_sl_price, 
+                    tp_price=calc_tp_price, 
+                    quantity=abs_position_qty,
+                    symbol_info=s_info_unmanaged, 
+                    current_balance=(current_balance_for_check if current_balance_for_check is not None else 10000),
+                    risk_percent_config=configs.get('risk_percent'), 
+                    configs=configs, 
+                    specific_leverage_for_trade=leverage, # Pass the integer leverage here
+                    klines_df_for_debug=klines_df_unmanaged, # Pass klines_df here
+                    is_unmanaged_check=True
                 )
 
                 if not sanity_passed:
