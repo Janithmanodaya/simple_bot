@@ -25,6 +25,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram import Update
 from telegram.ext import CallbackContext
 import requests # For fetching public IP address
+import numpy as np # For numerical operations like log and sqrt
 
 # --- Configuration Defaults ---
 DEFAULT_RISK_PERCENT = 1.0       # Default account risk percentage per trade (e.g., 1.0 for 1%)
@@ -33,6 +34,17 @@ DEFAULT_MAX_CONCURRENT_POSITIONS = 5 # Default maximum number of concurrent open
 DEFAULT_MARGIN_TYPE = "ISOLATED" # Default margin type: "ISOLATED" or "CROSS"
 DEFAULT_MAX_SCAN_THREADS = 5     # Default threads for scanning symbols, now fixed to 5
 DEFAULT_ALLOW_EXCEED_RISK_FOR_MIN_NOTIONAL = False # Default for allowing higher risk to meet min notional
+DEFAULT_PORTFOLIO_RISK_CAP = 5.0 # Default maximum portfolio risk percentage (e.g., 5.0 for 5%)
+DEFAULT_ATR_PERIOD = 14          # Default ATR period
+DEFAULT_ATR_MULTIPLIER_SL = 2.0  # Default ATR multiplier for Stop Loss
+DEFAULT_TP_RR_RATIO = 1.5        # Default Take Profit Risk:Reward Ratio
+DEFAULT_MAX_DRAWDOWN_PERCENT = 5.0 # Default max daily drawdown from high equity (e.g., 5.0 for 5%)
+DEFAULT_DAILY_STOP_LOSS_PERCENT = 2.0 # Default daily stop loss based on start equity (e.g., 2.0 for 2%)
+DEFAULT_TARGET_ANNUALIZED_VOLATILITY = 0.80 # Target annualized volatility for leverage adjustment (80%)
+DEFAULT_REALIZED_VOLATILITY_PERIOD = 30   # Period in candles for calculating realized volatility
+DEFAULT_MIN_LEVERAGE = 1                  # Minimum leverage to use
+DEFAULT_MAX_LEVERAGE = 20                 # Maximum leverage to use (user preference, also check exchange limits)
+
 
 # --- Global State Variables ---
 # Stores details of active trades. Key: symbol (e.g., "BTCUSDT")
@@ -41,10 +53,261 @@ active_trades = {}
 active_trades_lock = threading.Lock() # Lock for synchronizing access to active_trades
 
 # Set to keep track of symbols currently being processed by manage_trade_entry to prevent race conditions.
+import datetime # Added for last_trading_day
+
 symbols_currently_processing = set()
 symbols_currently_processing_lock = threading.Lock()
 
+# Daily performance and halt status variables
+daily_high_equity = 0.0
+day_start_equity = 0.0
+last_trading_day = None # Stores datetime.date object
+trading_halted_drawdown = False
+trading_halted_daily_loss = False
+daily_realized_pnl = 0.0
+daily_state_lock = threading.Lock() # Lock for synchronizing access to daily state variables
+
 # --- Utility and Configuration Functions ---
+
+def get_current_market_price(client, symbol: str) -> float | None:
+    """Fetches the current market price for a symbol."""
+    try:
+        ticker = client.futures_ticker(symbol=symbol)
+        return float(ticker['lastPrice'])
+    except Exception as e:
+        print(f"Error fetching market price for {symbol}: {e}")
+        return None
+
+def calculate_unrealized_pnl(trade_details: dict, current_market_price: float) -> float:
+    """Calculates unrealized P&L for a single active trade."""
+    if not all(k in trade_details for k in ['entry_price', 'quantity', 'side']) or current_market_price is None:
+        return 0.0
+    
+    entry_price = trade_details['entry_price']
+    quantity = trade_details['quantity']
+    side = trade_details['side']
+    
+    if side == "LONG":
+        pnl = (current_market_price - entry_price) * quantity
+    elif side == "SHORT":
+        pnl = (entry_price - current_market_price) * quantity
+    else:
+        pnl = 0.0
+    return pnl
+
+def get_current_equity(client, configs: dict, current_balance: float, active_trades_dict: dict, active_trades_lock_ref: threading.Lock) -> float | None:
+    """
+    Calculates the current total equity (balance + total unrealized P&L).
+    Returns None if balance cannot be fetched or a critical error occurs.
+    """
+    if current_balance is None: # Ensure balance is valid first
+        print("Cannot calculate current equity because current_balance is None.")
+        # Attempt to fetch balance again as a fallback, though it might indicate a larger issue
+        fetched_balance = get_account_balance(client, configs)
+        if fetched_balance is None:
+            print("Critical: Failed to fetch balance for equity calculation. Returning None for equity.")
+            return None
+        current_balance = fetched_balance
+
+    total_unrealized_pnl = 0.0
+    
+    # Iterate over a copy of items for thread safety if active_trades_dict can be modified elsewhere,
+    # although lock protection should make direct iteration safe if modifications are also locked.
+    with active_trades_lock_ref:
+        trades_to_evaluate = list(active_trades_dict.items()) # Create a list of items to iterate over
+
+    for symbol, trade_details in trades_to_evaluate:
+        market_price = get_current_market_price(client, symbol)
+        if market_price is not None:
+            total_unrealized_pnl += calculate_unrealized_pnl(trade_details, market_price)
+        else:
+            print(f"Warning: Could not fetch market price for {symbol} to calculate its UPNL. Assuming 0 UPNL for this trade in equity calculation.")
+            # Optionally, could return None here to indicate equity is uncertain,
+            # or proceed with known UPNL. For now, proceeding with 0 for this symbol.
+
+    return current_balance + total_unrealized_pnl
+
+def manage_daily_state(client, configs: dict, active_trades_dict_ref: dict, active_trades_lock_ref: threading.Lock):
+    """
+    Manages daily state variables like start equity, high equity, P&L, and halt flags.
+    Should be called at the start of each trading cycle.
+    Returns the current equity.
+    """
+    global day_start_equity, daily_high_equity, daily_realized_pnl
+    global trading_halted_drawdown, trading_halted_daily_loss, last_trading_day
+    global daily_state_lock
+
+    today = datetime.date.today()
+    current_balance = get_account_balance(client, configs) # Fetch fresh balance
+
+    if current_balance is None:
+        print("CRITICAL: Could not fetch account balance in manage_daily_state. Daily state cannot be reliably updated.")
+        # Potentially return a special value or raise an exception if this is critical for operation
+        # For now, it will try to use the last known equity values if it's not a new day,
+        # or might fail to initialize properly on a new day.
+        # Let get_current_equity handle the None balance and return None for equity.
+        
+    # Calculate current equity *before* acquiring the daily_state_lock for new day check,
+    # as get_current_equity might take time (API calls) and uses active_trades_lock.
+    # We need a consistent view of active_trades for equity calculation.
+    calculated_current_equity = get_current_equity(client, configs, current_balance, active_trades_dict_ref, active_trades_lock_ref)
+
+    if calculated_current_equity is None:
+        print("CRITICAL: Equity calculation failed in manage_daily_state. Daily limits might not function correctly.")
+        # If equity cannot be determined, we cannot reliably manage daily state.
+        # Keep existing halt flags, do not reset. This is a degraded state.
+        return None # Indicate failure to get equity
+
+    with daily_state_lock:
+        if last_trading_day != today:
+            print(f"New trading day ({today}). Resetting daily limits and P&L tracking.")
+            day_start_equity = calculated_current_equity
+            daily_high_equity = calculated_current_equity
+            daily_realized_pnl = 0.0
+            trading_halted_drawdown = False
+            trading_halted_daily_loss = False
+            last_trading_day = today
+            
+            if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+                send_telegram_message(
+                    configs["telegram_bot_token"], 
+                    configs["telegram_chat_id"],
+                    f"☀️ New Trading Day ({today}) Started.\n"
+                    f"Start Equity: {day_start_equity:.2f} USDT.\n"
+                    f"Daily limits reset."
+                )
+        else:
+            # Same day, just update daily_high_equity
+            daily_high_equity = max(daily_high_equity, calculated_current_equity)
+        
+        # For logging current state regardless of new day or not
+        print(f"Daily State Update: Start Equity: {day_start_equity:.2f}, High Equity: {daily_high_equity:.2f}, Current Equity: {calculated_current_equity:.2f}, Realized PNL: {daily_realized_pnl:.2f}")
+        print(f"Halt Status: Drawdown: {trading_halted_drawdown}, Daily Loss: {trading_halted_daily_loss}")
+
+    return calculated_current_equity
+
+def close_all_open_positions(client, configs: dict, active_trades_dict_ref: dict, lock: threading.Lock):
+    """
+    Attempts to close all open positions managed by the bot and cancels their SL/TP orders.
+    Clears the active_trades_dict_ref after attempting closures.
+    """
+    log_prefix = "[CloseAllPositions]"
+    print(f"{log_prefix} Attempting to close all bot-managed open positions...")
+
+    if not active_trades_dict_ref:
+        print(f"{log_prefix} No active trades to close.")
+        return
+
+    # Iterate over a copy of items because we might modify the dict later (though clearing happens at the end)
+    # The primary reason for copy is if active_trades_dict_ref could be modified by another thread during this,
+    # but the lock passed should be active_trades_lock, which protects it.
+    # However, operations inside loop (API calls) are outside the lock.
+    
+    # It's safer to get a list of trades to close first, then operate.
+    trades_to_close_info = []
+    with lock: # Use the passed lock (active_trades_lock)
+        for symbol, details in active_trades_dict_ref.items():
+            trades_to_close_info.append({
+                "symbol": symbol,
+                "sl_order_id": details.get('sl_order_id'),
+                "tp_order_id": details.get('tp_order_id'),
+                "quantity": details.get('quantity'),
+                "side": details.get('side'), # "LONG" or "SHORT"
+                "symbol_info": details.get('symbol_info')
+            })
+
+    closed_successfully_count = 0
+    closed_with_errors_count = 0
+
+    for trade_info in trades_to_close_info:
+        symbol = trade_info['symbol']
+        s_info = trade_info['symbol_info']
+        qty_to_close = trade_info['quantity']
+        original_side = trade_info['side']
+        position_side_to_close = original_side # For Binance, positionSide is LONG or SHORT
+
+        print(f"{log_prefix} Processing closure for {symbol} ({original_side} {qty_to_close})...")
+
+        # 1. Cancel SL order
+        if trade_info['sl_order_id']:
+            try:
+                print(f"{log_prefix} Cancelling SL order {trade_info['sl_order_id']} for {symbol}...")
+                client.futures_cancel_order(symbol=symbol, orderId=trade_info['sl_order_id'])
+                print(f"{log_prefix} SL order {trade_info['sl_order_id']} for {symbol} cancelled.")
+            except BinanceAPIException as e:
+                if e.code == -2011: # Order filled or cancelled / Does not exist
+                    print(f"{log_prefix} SL order {trade_info['sl_order_id']} for {symbol} already filled/cancelled or does not exist (Code: {e.code}).")
+                else:
+                    print(f"{log_prefix} API Error cancelling SL order {trade_info['sl_order_id']} for {symbol}: {e}")
+            except Exception as e:
+                print(f"{log_prefix} Unexpected error cancelling SL order {trade_info['sl_order_id']} for {symbol}: {e}")
+        
+        # 2. Cancel TP order
+        if trade_info['tp_order_id']:
+            try:
+                print(f"{log_prefix} Cancelling TP order {trade_info['tp_order_id']} for {symbol}...")
+                client.futures_cancel_order(symbol=symbol, orderId=trade_info['tp_order_id'])
+                print(f"{log_prefix} TP order {trade_info['tp_order_id']} for {symbol} cancelled.")
+            except BinanceAPIException as e:
+                if e.code == -2011: # Order filled or cancelled / Does not exist
+                    print(f"{log_prefix} TP order {trade_info['tp_order_id']} for {symbol} already filled/cancelled or does not exist (Code: {e.code}).")
+                else:
+                    print(f"{log_prefix} API Error cancelling TP order {trade_info['tp_order_id']} for {symbol}: {e}")
+            except Exception as e:
+                print(f"{log_prefix} Unexpected error cancelling TP order {trade_info['tp_order_id']} for {symbol}: {e}")
+
+        # 3. Place Market Close Order
+        close_side = "SELL" if original_side == "LONG" else "BUY"
+        print(f"{log_prefix} Attempting to place MARKET {close_side} order for {qty_to_close} {symbol} (PositionSide: {position_side_to_close})...")
+        
+        if s_info is None or qty_to_close is None or qty_to_close <= 0:
+            print(f"{log_prefix} Insufficient info to close {symbol} (s_info: {s_info is not None}, qty: {qty_to_close}). Skipping market close.")
+            closed_with_errors_count +=1
+            continue
+
+        close_order_obj, close_error_msg = place_new_order(
+            client, 
+            s_info, 
+            close_side, 
+            "MARKET", 
+            qty_to_close,
+            position_side=position_side_to_close # Important: specify which side of position to close
+            # reduce_only=True should implicitly be handled by MARKET close on a positionSide.
+            # For SL/TP, is_closing_order=True was used, which sets closePosition=true.
+            # For direct market close, just ensuring it reduces the correct positionSide is key.
+            # The `place_new_order` doesn't have a direct `closePosition` toggle for market orders
+            # unless `is_closing_order` is True (which is for STOP_MARKET/TAKE_PROFIT_MARKET).
+            # A simple MARKET order against the positionSide should reduce/close it.
+        )
+
+        if close_order_obj and close_order_obj.get('status') == 'FILLED':
+            print(f"{log_prefix} Successfully placed MARKET close order for {symbol}. Order ID: {close_order_obj.get('orderId')}")
+            closed_successfully_count += 1
+            # P&L for this closure will be handled by monitor_active_trades when it sees the position gone,
+            # or if a more immediate P&L update is needed, it could be estimated here.
+        else:
+            error_detail = f"API Error: {close_error_msg}" if close_error_msg else "Order object missing or status not FILLED."
+            print(f"{log_prefix} FAILED to place MARKET close order for {symbol}. Details: {error_detail}. Order: {close_order_obj}")
+            closed_with_errors_count += 1
+            if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+                send_telegram_message(
+                    configs["telegram_bot_token"], 
+                    configs["telegram_chat_id"],
+                    f"⚠️ {log_prefix} FAILED to market close {symbol} ({original_side} {qty_to_close}). Manual check required. Error: {error_detail}"
+                )
+    
+    print(f"{log_prefix} Closure attempts summary: {closed_successfully_count} closed successfully, {closed_with_errors_count} failed/skipped.")
+
+    # 4. Clear all trades from the bot's management after attempting closure
+    with lock: # Use the passed lock (active_trades_lock)
+        if active_trades_dict_ref: # Check if not already empty
+            print(f"{log_prefix} Clearing all {len(active_trades_dict_ref)} trades from bot's active management list.")
+            active_trades_dict_ref.clear()
+        else:
+            print(f"{log_prefix} Active trades list was already empty before final clear.")
+    
+    print(f"{log_prefix} Finished closing all positions procedure.")
+
 
 def get_public_ip():
     """Fetches the current public IP address of the machine."""
@@ -220,66 +483,22 @@ def start_command_listener(bot_token, chat_id, last_message_content): # Renamed 
 
 
     def thread_starter():
-        loop = None
         try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            print(f"Telegram thread: Created and set new event loop: {loop}")
-            loop.run_until_complete(actual_bot_runner())
-        except RuntimeError as e:
-            # Handle specific RuntimeErrors that might occur during loop operations
-            if "Cannot close a running event loop" in str(e) or \
-               "Event loop is closed" in str(e) or \
-               "This event loop is already running" in str(e):
-                print(f"Telegram thread: Known asyncio loop issue: {e}")
-            else:
-                print(f"Telegram thread: Unhandled RuntimeError: {e}")
-                traceback.print_exc()
-                # Optionally re-raise if it's critical and not one of the known quirks
+            # asyncio.run() creates a new event loop, runs the coroutine,
+            # and handles loop closure.
+            print("Telegram thread: Starting actual_bot_runner with asyncio.run().")
+            asyncio.run(actual_bot_runner())
+            print("Telegram thread: actual_bot_runner completed.")
         except Exception as e:
-            print(f"Telegram thread: Exception in thread_starter: {e}")
+            print(f"Telegram thread: Exception in thread_starter's asyncio.run: {e}")
             traceback.print_exc()
         finally:
-            if loop:
-                try:
-                    # The `async with application` in actual_bot_runner handles PTB's task cleanup.
-                    # We primarily need to ensure the loop object itself is closed.
-                    
-                    # If loop is already closed (e.g., by an unexpected PTB behavior, though unlikely with context manager),
-                    # trying to close again will error.
-                    if not loop.is_closed():
-                        # If the loop is still running (should not be if run_until_complete finished),
-                        # attempt to stop it. This is a fallback.
-                        if loop.is_running():
-                            print("Telegram thread: Loop was still running in finally block. Stopping.")
-                            loop.stop()
-                        
-                        # Give a chance for any final tasks from loop.stop() or other cancellations to complete
-                        # This is a bit more involved if we want to be perfectly robust here about pending tasks
-                        # not managed by PTB's shutdown, but for this case, PTB should manage its own.
-                        # For simplicity, we assume PTB's shutdown (via async with) is sufficient.
-                        # A short run_until_complete for pending tasks could be added here if needed,
-                        # e.g., loop.run_until_complete(asyncio.sleep(0.1)) to clear any final event loop queue.
-
-                        print("Telegram thread: Closing event loop...")
-                        loop.close()
-                        print("Telegram thread: Event loop closed.")
-                    else:
-                        print("Telegram thread: Event loop was already closed.")
-                except RuntimeError as e:
-                    print(f"Telegram thread: Runtime error during loop close in finally: {e}")
-                    # If it's "cannot close a running event loop", it implies something kept it running
-                    # despite run_until_complete finishing for actual_bot_runner.
-                    if "Cannot close a running event loop" in str(e) and not loop.is_closed():
-                         print("Telegram thread: Forcing loop stop due to error on close.")
-                         loop.stop() # Try to stop it if close failed because it was running.
-                except Exception as e_close:
-                    print(f"Telegram thread: General exception during event loop cleanup: {e_close}")
-                    traceback.print_exc()
-                finally: # Ensure set_event_loop(None) is always called for this thread
-                    asyncio.set_event_loop(None)
-            else: # loop object itself was None
-                 asyncio.set_event_loop(None) # Still ensure thread-local loop is cleared
+            # asyncio.run() should handle loop cleanup.
+            # Ensure the thread-local event loop policy is cleared if it was set by this thread.
+            # This might not be strictly necessary if asyncio.run() cleans up perfectly,
+            # but can help avoid issues in some complex scenarios or Python versions.
+            asyncio.set_event_loop(None) 
+            print("Telegram thread: Cleaned up event loop policy for thread.")
 
     thread = threading.Thread(target=thread_starter)
     thread.daemon = True
@@ -425,9 +644,124 @@ def get_user_configurations():
     # Removed user input for max_scan_threads, fixing it to 5.
     configs["max_scan_threads"] = 5
     print(f"Maximum symbol scan threads fixed to 5.")
-    
+
     while True:
-        exceed_risk_input = input(f"Allow exceeding risk % to meet MIN_NOTIONAL? (yes/no, default: {'yes' if DEFAULT_ALLOW_EXCEED_RISK_FOR_MIN_NOTIONAL else 'no'}): ").lower().strip()
+        try:
+            portfolio_risk_input = input(f"Enter max portfolio risk % (aggregate open trades, e.g., {DEFAULT_PORTFOLIO_RISK_CAP} for {DEFAULT_PORTFOLIO_RISK_CAP}%): ")
+            portfolio_risk_cap_percent = float(portfolio_risk_input or DEFAULT_PORTFOLIO_RISK_CAP)
+            if 0 < portfolio_risk_cap_percent <= 100:
+                configs["portfolio_risk_cap"] = portfolio_risk_cap_percent # Store as percentage, e.g., 5.0
+                break
+            print("Portfolio risk percentage must be a positive value (e.g., 3, 5, up to 100).")
+        except ValueError:
+            print("Invalid input for portfolio risk percentage. Please enter a number.")
+
+    while True:
+        try:
+            atr_period_input = input(f"Enter ATR Period for SL/TP (e.g., {DEFAULT_ATR_PERIOD}): ")
+            atr_period = int(atr_period_input or DEFAULT_ATR_PERIOD)
+            if atr_period > 0:
+                configs["atr_period"] = atr_period
+                break
+            print("ATR Period must be a positive integer.")
+        except ValueError:
+            print("Invalid input for ATR Period. Please enter an integer.")
+
+    while True:
+        try:
+            atr_multiplier_sl_input = input(f"Enter ATR Multiplier for Stop Loss (e.g., {DEFAULT_ATR_MULTIPLIER_SL}): ")
+            atr_multiplier_sl = float(atr_multiplier_sl_input or DEFAULT_ATR_MULTIPLIER_SL)
+            if atr_multiplier_sl > 0:
+                configs["atr_multiplier_sl"] = atr_multiplier_sl
+                break
+            print("ATR Multiplier for SL must be a positive number.")
+        except ValueError:
+            print("Invalid input for ATR Multiplier (SL). Please enter a number.")
+
+    while True:
+        try:
+            tp_rr_ratio_input = input(f"Enter Take Profit Risk:Reward Ratio (e.g., {DEFAULT_TP_RR_RATIO}): ")
+            tp_rr_ratio = float(tp_rr_ratio_input or DEFAULT_TP_RR_RATIO)
+            if tp_rr_ratio > 0:
+                configs["tp_rr_ratio"] = tp_rr_ratio
+                break
+            print("Take Profit R:R Ratio must be a positive number.")
+        except ValueError:
+            print("Invalid input for TP R:R Ratio. Please enter a number.")
+
+    while True:
+        try:
+            max_drawdown_input = input(f"Enter Max Daily Drawdown % (from high equity, 0 to disable, default: {DEFAULT_MAX_DRAWDOWN_PERCENT}%): ")
+            max_drawdown_percent = float(max_drawdown_input or DEFAULT_MAX_DRAWDOWN_PERCENT)
+            if 0 <= max_drawdown_percent <= 100:
+                configs["max_drawdown_percent"] = max_drawdown_percent
+                break
+            print("Max Daily Drawdown % must be between 0 (disabled) and 100.")
+        except ValueError:
+            print("Invalid input for Max Daily Drawdown %. Please enter a number.")
+
+    while True:
+        try:
+            daily_stop_loss_input = input(f"Enter Daily Stop Loss % (of start equity, 0 to disable, default: {DEFAULT_DAILY_STOP_LOSS_PERCENT}%): ")
+            daily_stop_loss_percent = float(daily_stop_loss_input or DEFAULT_DAILY_STOP_LOSS_PERCENT)
+            if 0 <= daily_stop_loss_percent <= 100:
+                configs["daily_stop_loss_percent"] = daily_stop_loss_percent
+                break
+            print("Daily Stop Loss % must be between 0 (disabled) and 100.")
+        except ValueError:
+            print("Invalid input for Daily Stop Loss %. Please enter a number.")
+
+    while True:
+        try:
+            target_vol_input = input(f"Enter Target Annualized Volatility (e.g., {DEFAULT_TARGET_ANNUALIZED_VOLATILITY:.2f} for {DEFAULT_TARGET_ANNUALIZED_VOLATILITY*100:.0f}%): ")
+            target_vol = float(target_vol_input or DEFAULT_TARGET_ANNUALIZED_VOLATILITY)
+            if 0 < target_vol <= 5.0: # Assuming target vol is a decimal like 0.8 (80%) up to 500%
+                configs["target_annualized_volatility"] = target_vol
+                break
+            print("Target Annualized Volatility must be a positive number (e.g., 0.8 for 80%). Sensible range up to e.g. 5.0 (500%).")
+        except ValueError:
+            print("Invalid input for Target Annualized Volatility. Please enter a number.")
+            
+    while True:
+        try:
+            vol_period_input = input(f"Enter Realized Volatility Period (candles, e.g., {DEFAULT_REALIZED_VOLATILITY_PERIOD}): ")
+            vol_period = int(vol_period_input or DEFAULT_REALIZED_VOLATILITY_PERIOD)
+            if vol_period > 0:
+                configs["realized_volatility_period"] = vol_period
+                break
+            print("Realized Volatility Period must be a positive integer.")
+        except ValueError:
+            print("Invalid input for Realized Volatility Period. Please enter an integer.")
+
+    while True:
+        try:
+            min_lev_input = input(f"Enter Minimum Leverage for dynamic adjustment (e.g., {DEFAULT_MIN_LEVERAGE}): ")
+            min_lev = int(min_lev_input or DEFAULT_MIN_LEVERAGE)
+            if 1 <= min_lev <= 125: # Binance absolute min is 1
+                configs["min_leverage"] = min_lev
+                break
+            print("Minimum Leverage must be an integer between 1 and 125.")
+        except ValueError:
+            print("Invalid input for Minimum Leverage. Please enter an integer.")
+
+    while True:
+        try:
+            max_lev_input = input(f"Enter Maximum Leverage for dynamic adjustment (e.g., {DEFAULT_MAX_LEVERAGE}): ")
+            max_lev = int(max_lev_input or DEFAULT_MAX_LEVERAGE)
+            # We'll compare max_lev with min_lev after min_lev is set
+            if configs.get("min_leverage", DEFAULT_MIN_LEVERAGE) <= max_lev <= 125:
+                configs["max_leverage"] = max_lev
+                break
+            print(f"Maximum Leverage must be an integer between {configs.get('min_leverage', DEFAULT_MIN_LEVERAGE)} and 125.")
+        except ValueError:
+            print("Invalid input for Maximum Leverage. Please enter an integer.")
+        except KeyError: # Should not happen if min_leverage is set before this loop
+            print("Error: min_leverage not set. Please restart configuration.") # Fallback
+            configs["min_leverage"] = DEFAULT_MIN_LEVERAGE # Set a default to prevent loop error
+            # This case indicates a logic flow error if min_leverage isn't in configs.
+
+    while True:
+        exceed_risk_input = input(f"Allow exceeding individual trade risk % to meet MIN_NOTIONAL? (yes/no, default: {'yes' if DEFAULT_ALLOW_EXCEED_RISK_FOR_MIN_NOTIONAL else 'no'}): ").lower().strip()
         if not exceed_risk_input: # User pressed Enter, use default
             configs["allow_exceed_risk_for_min_notional"] = DEFAULT_ALLOW_EXCEED_RISK_FOR_MIN_NOTIONAL
             break
@@ -688,9 +1022,33 @@ def set_leverage_on_symbol(client, symbol, leverage):
 def set_margin_type_on_symbol(client, symbol, margin_type):
     try: client.futures_change_margin_type(symbol=symbol, marginType=margin_type.upper()); print(f"Margin for {symbol} set to {margin_type}."); return True
     except BinanceAPIException as e:
-        if e.code == -4046: print(f"Margin for {symbol} already {margin_type}."); return True
-        print(f"API Error setting margin for {symbol}: {e}"); return False
-    except Exception as e: print(f"Error setting margin for {symbol}: {e}"); return False
+        if e.code == -4046: # (-4046, 'No need to change margin type.')
+            print(f"Margin for {symbol} already {margin_type}. No change needed.")
+            return True
+        print(f"API Error setting margin for {symbol} to {margin_type}: {e}"); return False
+    except Exception as e: print(f"Error setting margin for {symbol} to {margin_type}: {e}"); return False
+
+# Modified to accept configs for Telegram alerting
+def set_margin_type_on_symbol(client, symbol: str, margin_type: str, configs: dict = None): # Added configs as optional
+    try:
+        client.futures_change_margin_type(symbol=symbol, marginType=margin_type.upper())
+        msg = f"Margin type for {symbol} successfully set to {margin_type}."
+        print(msg)
+        if configs and configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+            send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], f"ℹ️ {msg}")
+        return True
+    except BinanceAPIException as e:
+        if e.code == -4046:  # (-4046, 'No need to change margin type.')
+            print(f"Margin for {symbol} already {margin_type}. No change needed.")
+            return True
+        print(f"API Error setting margin for {symbol} to {margin_type}: {e}")
+        # Optionally send Telegram for failure too, if critical enough
+        # if configs and configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+        #     send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], f"⚠️ Failed to set margin type for {symbol} to {margin_type}. Error: {e}")
+        return False
+    except Exception as e:
+        print(f"Error setting margin for {symbol} to {margin_type}: {e}")
+        return False
 
 def place_new_order(client, symbol_info, side, order_type, quantity, price=None, stop_price=None, reduce_only=None, position_side=None, is_closing_order=False): # Added position_side and is_closing_order
     symbol, p_prec, q_prec = symbol_info['symbol'], int(symbol_info['pricePrecision']), int(symbol_info['quantityPrecision'])
@@ -733,6 +1091,121 @@ def place_new_order(client, symbol_info, side, order_type, quantity, price=None,
 def calculate_ema(df, period, column='close'):
     if column not in df or len(df) < period: return None # Basic checks
     return df[column].ewm(span=period, adjust=False).mean()
+
+def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """
+    Calculates the Average True Range (ATR) using Wilder's smoothing.
+
+    Args:
+        df (pd.DataFrame): DataFrame with 'high', 'low', 'close' columns.
+        period (int): The period for ATR calculation.
+
+    Returns:
+        pd.Series: A pandas Series containing the ATR values.
+                   Returns an empty Series if input conditions are not met.
+    """
+    if not all(col in df.columns for col in ['high', 'low', 'close']):
+        print("Error: DataFrame must contain 'high', 'low', 'close' columns for ATR calculation.")
+        return pd.Series(dtype='float64')
+    if len(df) < period:
+        print(f"Error: Data length ({len(df)}) is less than ATR period ({period}). Cannot calculate ATR.")
+        return pd.Series(dtype='float64')
+
+    # Calculate True Range (TR)
+    df['prev_close'] = df['close'].shift(1)
+    df['tr0'] = abs(df['high'] - df['low'])
+    df['tr1'] = abs(df['high'] - df['prev_close'])
+    df['tr2'] = abs(df['low'] - df['prev_close'])
+    df['tr'] = df[['tr0', 'tr1', 'tr2']].max(axis=1)
+
+    # Calculate ATR using Wilder's smoothing
+    # The first ATR is the simple average of the TR for the first 'period' values.
+    # Subsequent ATRs are calculated as: ATR = (ATR_prev * (period - 1) + TR_current) / period
+    # This is equivalent to an EMA with alpha = 1/period.
+    # pandas.Series.ewm with alpha=1/period and adjust=False directly implements Wilder's smoothing.
+    atr_series = df['tr'].ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+    
+    # Clean up temporary columns from the input DataFrame
+    df.drop(columns=['prev_close', 'tr0', 'tr1', 'tr2', 'tr'], inplace=True)
+    
+    return atr_series
+
+def calculate_realized_volatility(klines_df: pd.DataFrame, period: int, candles_per_year: int) -> float | None:
+    """
+    Calculates the annualized realized volatility.
+
+    Args:
+        klines_df (pd.DataFrame): DataFrame with 'close' prices.
+        period (int): Lookback period for standard deviation of log returns.
+        candles_per_year (int): Number of candles in a year for annualization.
+
+    Returns:
+        float | None: Annualized volatility, or None if calculation is not possible.
+    """
+    if 'close' not in klines_df.columns:
+        print("Error: DataFrame must contain 'close' column for volatility calculation.")
+        return None
+    if len(klines_df) < period + 1: # Need period + 1 for one log return at the start of the window
+        print(f"Error: Data length ({len(klines_df)}) is insufficient for volatility period ({period}). Needs at least {period + 1} candles.")
+        return None
+
+    # Calculate log returns
+    # Using a temporary Series to avoid SettingWithCopyWarning if klines_df is a slice
+    log_returns = np.log(klines_df['close'] / klines_df['close'].shift(1))
+    
+    # Calculate rolling standard deviation of log returns
+    # The result of rolling().std() will have NaNs for the first `period-1` rows after log_returns start (which is 1 row after klines_df starts)
+    stdev_log_returns = log_returns.rolling(window=period).std()
+    
+    last_stdev = stdev_log_returns.iloc[-1]
+
+    if pd.isna(last_stdev) or last_stdev == 0: # Also check for zero stdev to avoid issues
+        print(f"Warning: Standard deviation of log returns is NaN or zero for period {period}. Cannot calculate volatility.")
+        return None
+        
+    # Annualize the standard deviation
+    annualized_volatility = last_stdev * np.sqrt(candles_per_year)
+    
+    return annualized_volatility
+
+def calculate_dynamic_leverage(realized_vol: float | None, target_vol: float, min_lev: int, max_lev: int, default_fallback_lev: int) -> int:
+    """
+    Calculates dynamic leverage based on realized and target volatility.
+
+    Args:
+        realized_vol (float | None): Calculated annualized realized volatility of the asset.
+        target_vol (float): User-defined target annualized volatility.
+        min_lev (int): Minimum permissible leverage.
+        max_lev (int): Maximum permissible leverage.
+        default_fallback_lev (int): Leverage to use if realized_vol is invalid.
+
+    Returns:
+        int: Calculated and clamped dynamic leverage.
+    """
+    if realized_vol is None or realized_vol <= 0:
+        print(f"Warning: Invalid realized volatility ({realized_vol}). Falling back to default leverage: {default_fallback_lev}x.")
+        # Ensure fallback is also clamped, though it should be configured within min/max.
+        return max(min_lev, min(default_fallback_lev, max_lev))
+
+    # Ensure target_vol is positive, though input validation should handle this.
+    if target_vol <= 0:
+        print(f"Warning: Target volatility ({target_vol}) is not positive. Falling back to default leverage: {default_fallback_lev}x.")
+        return max(min_lev, min(default_fallback_lev, max_lev))
+        
+    # Calculate raw leverage
+    raw_leverage = target_vol / realized_vol
+    
+    # Clamp the leverage
+    clamped_leverage = max(float(min_lev), min(raw_leverage, float(max_lev)))
+    
+    # Round to nearest integer for setting leverage
+    final_leverage = int(round(clamped_leverage))
+    
+    # Ensure final_leverage is at least 1 after rounding, and still respects min_lev (e.g. if min_lev was 1 but rounding made it 0)
+    final_leverage = max(min_lev, final_leverage) 
+
+    print(f"Dynamic Leverage Calculation: RealizedVol={realized_vol:.4f}, TargetVol={target_vol:.4f}, RawLev={raw_leverage:.2f}, ClampedLev={clamped_leverage:.2f}, FinalIntLev={final_leverage}x")
+    return final_leverage
 
 def check_ema_crossover_conditions(df, short_ema_col='EMA100', long_ema_col='EMA200', validation_candles=20, symbol_for_logging=""):
     log_prefix = f"[{threading.current_thread().name}] {symbol_for_logging} check_ema_crossover_conditions:"
@@ -796,24 +1269,89 @@ def calculate_swing_high_low(df, window=20, idx=-1):
     if chunk.empty: return (df['high'].iloc[idx-1], df['low'].iloc[idx-1]) if len(df) >= abs(idx)+1 else (None,None)
     return chunk['high'].max(), chunk['low'].min()
 
-def calculate_sl_tp_values(entry, side, ema100, df_klines, idx=-1):
-    tp_pct, sl_max_pct = 0.01, 0.01
-    tp = entry * (1 + tp_pct if side == "LONG" else 1 - tp_pct)
-    sl_ema = ema100 * (1 - 0.0005 if side == "LONG" else 1 + 0.0005)
-    if abs(entry - sl_ema) / entry <= sl_max_pct: final_sl = sl_ema
+def calculate_sl_tp_values(entry_price: float, side: str, atr_value: float, configs: dict, symbol_info: dict = None):
+    """
+    Calculates Stop Loss (SL) and Take Profit (TP) prices based on ATR.
+    SL is defined by ATR * multiplier.
+    TP is defined by SL_distance * Risk:Reward ratio.
+
+    Args:
+        entry_price (float): The entry price of the trade.
+        side (str): "LONG" or "SHORT".
+        atr_value (float): The current ATR value for the symbol.
+        configs (dict): Dictionary containing 'atr_multiplier_sl' and 'tp_rr_ratio'.
+        symbol_info (dict, optional): Symbol information for price precision. Used for logging.
+
+
+    Returns:
+        tuple: (float, float) - (sl_price, tp_price)
+               Returns (None, None) if inputs are invalid (e.g., ATR <= 0).
+    """
+    atr_multiplier_sl = configs.get('atr_multiplier_sl', DEFAULT_ATR_MULTIPLIER_SL)
+    tp_rr_ratio = configs.get('tp_rr_ratio', DEFAULT_TP_RR_RATIO)
+    
+    p_prec = 2 # Default precision for logging if symbol_info not provided
+    if symbol_info:
+        p_prec = int(symbol_info.get('pricePrecision', 2))
+
+    if atr_value <= 0:
+        print(f"Warning: ATR value ({atr_value}) is zero or negative. Cannot calculate ATR-based SL/TP. Returning None, None.")
+        return None, None
+    if entry_price <= 0:
+        print(f"Warning: Entry price ({entry_price}) is zero or negative. Cannot calculate SL/TP. Returning None, None.")
+        return None, None
+
+
+    sl_distance = atr_value * atr_multiplier_sl
+    if sl_distance <= 0: # Should not happen if atr_value > 0 and multiplier > 0
+        print(f"Warning: SL distance calculation resulted in zero or negative ({sl_distance}). Check ATR ({atr_value}) and SL Multiplier ({atr_multiplier_sl}). Adjusting to a minimal distance.")
+        # Fallback to a tiny fraction of entry price if ATR logic fails critically, to avoid zero distance.
+        # This is an emergency fallback, ideally inputs are sane.
+        min_meaningful_distance = entry_price * 0.0001 # 0.01% of entry price as a fallback
+        sl_distance = max(min_meaningful_distance, 1 / (10**p_prec)) # Ensure it's at least one price tick if possible
+
+    tp_distance = sl_distance * tp_rr_ratio
+
+    if side == "LONG":
+        sl_price = entry_price - sl_distance
+        tp_price = entry_price + tp_distance
+    elif side == "SHORT":
+        sl_price = entry_price + sl_distance
+        tp_price = entry_price - tp_distance
     else:
-        print(f"SL from EMA >{sl_max_pct*100}%. Using swing point.")
-        sw_h, sw_l = calculate_swing_high_low(df_klines, 20, idx)
-        if side == "LONG": final_sl = (sw_l * (1 - 0.0005)) if sw_l else entry * (1 - sl_max_pct)
-        else: final_sl = (sw_h * (1 + 0.0005)) if sw_h else entry * (1 + sl_max_pct)
-        if abs(entry - final_sl) / entry > sl_max_pct * 1.5: # Cap swing SL
-            final_sl = entry * (1 - sl_max_pct*1.5 if side == "LONG" else 1 + sl_max_pct*1.5)
-            print(f"Swing SL too far, capped to: {final_sl:.4f}")
-    if (side=="LONG" and final_sl >= entry) or (side=="SHORT" and final_sl <= entry): # Validate SL
-        final_sl = entry * (1 - sl_max_pct if side == "LONG" else 1 + sl_max_pct)
-        print(f"Invalid SL, adjusted to: {final_sl:.4f}")
-    print(f"Initial SL: {final_sl:.4f}, TP: {tp:.4f} for {side} from {entry:.4f}")
-    return final_sl, tp
+        print(f"Error: Invalid side '{side}' in calculate_sl_tp_values. Returning None, None.")
+        return None, None
+
+    # Validation: SL/TP should not be equal to entry and should be on the correct side.
+    # If SL calculation results in SL >= entry for LONG, or SL <= entry for SHORT, it's invalid.
+    # This can happen if sl_distance is extremely small or negative (though guarded above).
+    min_tick_size = 1 / (10**p_prec) if p_prec > 0 else 0.01 # Estimate based on precision
+
+    if side == "LONG":
+        if sl_price >= entry_price:
+            print(f"Warning: Calculated SL ({sl_price:.{p_prec}f}) for LONG is not below entry ({entry_price:.{p_prec}f}). Adjusting SL to entry - min_tick.")
+            sl_price = entry_price - min_tick_size
+        if tp_price <= entry_price: # TP must be above entry for LONG
+            print(f"Warning: Calculated TP ({tp_price:.{p_prec}f}) for LONG is not above entry ({entry_price:.{p_prec}f}). Adjusting TP to entry + min_tick.")
+            tp_price = entry_price + min_tick_size
+    elif side == "SHORT":
+        if sl_price <= entry_price:
+            print(f"Warning: Calculated SL ({sl_price:.{p_prec}f}) for SHORT is not above entry ({entry_price:.{p_prec}f}). Adjusting SL to entry + min_tick.")
+            sl_price = entry_price + min_tick_size
+        if tp_price >= entry_price: # TP must be below entry for SHORT
+            print(f"Warning: Calculated TP ({tp_price:.{p_prec}f}) for SHORT is not below entry ({entry_price:.{p_prec}f}). Adjusting TP to entry - min_tick.")
+            tp_price = entry_price - min_tick_size
+            
+    # Ensure SL and TP are not equal after adjustments (highly unlikely but possible if entry_price is extremely small and min_tick_size dominates)
+    if abs(sl_price - tp_price) < min_tick_size / 2 : # Check if they are too close
+        print(f"Warning: SL and TP are too close or equal after validation. SL: {sl_price:.{p_prec}f}, TP: {tp_price:.{p_prec}f}. Re-adjusting TP.")
+        if side == "LONG":
+            tp_price = sl_price + min_tick_size # Ensure TP is at least one tick away from SL
+        else: # SHORT
+            tp_price = sl_price - min_tick_size
+
+    print(f"ATR-based SL: {sl_price:.{p_prec}f}, TP: {tp_price:.{p_prec}f} for {side} from Entry: {entry_price:.{p_prec}f} (ATR: {atr_value:.{p_prec}f}, SL Mult: {atr_multiplier_sl}, TP R:R: {tp_rr_ratio})")
+    return sl_price, tp_price
 
 def check_and_adjust_sl_tp_dynamic(cur_price, entry, _, __, cur_sl, cur_tp, side): # initial_sl, initial_tp unused for now
     if entry == 0: return None, None, None
@@ -856,6 +1394,45 @@ def get_symbol_info(client, symbol):
             if s['symbol'] == symbol: return s
         print(f"No info for {symbol}."); return None
     except Exception as e: print(f"Error getting info for {symbol}: {e}"); return None
+
+def calculate_aggregate_open_risk(active_trades_dict, current_balance):
+    """
+    Calculates the aggregate risk of all open trades as a percentage of the current balance.
+
+    Args:
+        active_trades_dict (dict): A dictionary of active trades.
+                                   Expected structure: {symbol: {"quantity": float, "entry_price": float, "current_sl_price": float}}
+        current_balance (float): The current account balance.
+
+    Returns:
+        float: The aggregate risk percentage (e.g., 3.5 for 3.5%), or 0.0 if balance is zero or no trades.
+    """
+    if not active_trades_dict or current_balance <= 0:
+        return 0.0
+
+    total_absolute_risk = 0.0
+    for symbol, trade_details in active_trades_dict.items():
+        quantity = trade_details.get('quantity')
+        entry_price = trade_details.get('entry_price')
+        current_sl_price = trade_details.get('current_sl_price')
+
+        if quantity is None or entry_price is None or current_sl_price is None:
+            print(f"Warning: Incomplete trade details for {symbol} in calculate_aggregate_open_risk. Skipping this trade for risk calculation.")
+            continue
+        
+        if entry_price == current_sl_price: # Should ideally not happen with valid SL
+            print(f"Warning: Entry price and SL price are the same for {symbol} ({entry_price}). Risk for this trade considered zero.")
+            individual_risk = 0.0
+        else:
+            individual_risk = quantity * abs(entry_price - current_sl_price)
+        
+        total_absolute_risk += individual_risk
+
+    if total_absolute_risk == 0:
+        return 0.0
+        
+    aggregate_risk_percentage = (total_absolute_risk / current_balance) * 100
+    return aggregate_risk_percentage
 
 # This is the old definition, which has been replaced by the modified one below.
 # def get_account_balance(client, asset="USDT"):
@@ -959,7 +1536,8 @@ def calculate_position_size(balance, risk_pct, entry, sl, symbol_info, configs=N
 # --- Pre-Order Sanity Checks ---
 def pre_order_sanity_checks(symbol, signal, entry_price, sl_price, tp_price, quantity, 
                             symbol_info, current_balance, risk_percent_config, configs, 
-                            klines_df_for_debug=None, is_unmanaged_check=False): # Added is_unmanaged_check
+                            specific_leverage_for_trade: int, # Added specific leverage for this trade
+                            klines_df_for_debug=None, is_unmanaged_check=False):
     """
     Performs a series of checks before placing an order to ensure parameters are valid
     and risk is managed according to configuration.
@@ -1076,14 +1654,14 @@ def pre_order_sanity_checks(symbol, signal, entry_price, sl_price, tp_price, qua
     # For unmanaged trades, this check is against current balance for an existing position's margin,
     # which is implicitly covered as the position exists.
     # For new trades, it's a pre-check.
-    leverage = configs.get('leverage', DEFAULT_LEVERAGE) # This might be different from actual position leverage for unmanaged
-    if leverage <= 0:
-        return False, f"Leverage ({leverage}) must be positive."
+    # Use the specific leverage intended for this trade for margin calculation
+    if specific_leverage_for_trade <= 0:
+        return False, f"Leverage for trade ({specific_leverage_for_trade}) must be positive."
     
-    required_margin = (quantity * entry_price) / leverage
+    required_margin = (quantity * entry_price) / specific_leverage_for_trade
     if required_margin > current_balance: # This is a simplified check. Binance actual margin req might differ.
         return False, (f"Estimated required margin ({required_margin:.2f} USDT) exceeds "
-                       f"current balance ({current_balance:.2f} USDT) for quantity {quantity:.{q_prec}f} at {entry_price:.{p_prec}f} with {leverage}x leverage.")
+                       f"current balance ({current_balance:.2f} USDT) for quantity {quantity:.{q_prec}f} at {entry_price:.{p_prec}f} with {specific_leverage_for_trade}x leverage.")
 
     return True, "Checks passed"
 
@@ -1140,8 +1718,19 @@ def process_symbol_task(symbol, client, configs, lock):
 
 def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is active_trades_lock
     global active_trades, symbols_currently_processing, symbols_currently_processing_lock
+    global trading_halted_drawdown, trading_halted_daily_loss, daily_state_lock # For checking halt status
 
     log_prefix = f"[{threading.current_thread().name}] {symbol} manage_trade_entry:"
+
+    # --- Check overall trading halt status ---
+    with daily_state_lock:
+        if trading_halted_drawdown:
+            print(f"{log_prefix} Trade entry BLOCKED for {symbol}. Reason: Max Drawdown trading halt is active.")
+            return
+        if trading_halted_daily_loss:
+            print(f"{log_prefix} Trade entry BLOCKED for {symbol}. Reason: Daily Stop Loss trading halt is active.")
+            return
+    # --- End trading halt status check ---
 
     # Attempt to mark this symbol as being processed by this thread.
     # If another thread has already marked it, this thread will skip.
@@ -1203,24 +1792,89 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is
         sl_p_calc, tp_p_calc, qty_calc_val = None, None, None 
         
         print(f"{log_prefix} Entry price (last close): {entry_p} for {symbol}")
-        ema100_val = klines_df['EMA100'].iloc[-1]
         
-        if not (set_leverage_on_symbol(client, symbol, configs['leverage']) and \
-                set_margin_type_on_symbol(client, symbol, configs['margin_type'])):
-            reason = "Failed to set leverage or margin type."
-            print(f"{log_prefix} {reason} for {symbol}. Abort.")
-            send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p_calc, tp_p_calc, qty_calc_val, symbol_info, configs)
-            return
+        # --- Dynamic Leverage Calculation and Setting ---
+        target_leverage = configs['leverage'] # Start with configured fixed leverage as default/fallback
+        
+        # Determine candles_per_year based on a fixed assumption or a config.
+        # Assuming 15-minute klines as per get_historical_klines default.
+        # KLINE_INTERVAL_1MINUTE, KLINE_INTERVAL_3MINUTE, KLINE_INTERVAL_5MINUTE, KLINE_INTERVAL_15MINUTE, KLINE_INTERVAL_30MINUTE, 
+        # KLINE_INTERVAL_1HOUR, KLINE_INTERVAL_2HOUR, KLINE_INTERVAL_4HOUR, KLINE_INTERVAL_6HOUR, KLINE_INTERVAL_8HOUR, KLINE_INTERVAL_12HOUR, 
+        # KLINE_INTERVAL_1DAY, KLINE_INTERVAL_3DAY, KLINE_INTERVAL_1WEEK, KLINE_INTERVAL_1MONTH
+        # For simplicity, let's assume 15 min interval for now for candles_per_year calc. This should ideally be more robust.
+        # A more robust way would be to parse configs['kline_interval'] if that was a setting.
+        # For now, hardcoding for 15min interval:
+        candles_per_day_approx = 24 * (60 / 15) # 96 candles per day for 15min
+        candles_per_year_approx = int(candles_per_day_approx * 365)
 
-        print(f"{log_prefix} Leverage and margin type set for {symbol}.")
-        sl_p_calc, tp_p_calc = calculate_sl_tp_values(entry_p, signal, ema100_val, klines_df)
-        if sl_p_calc is None or tp_p_calc is None:
-            reason = "Stop Loss / Take Profit calculation failed."
+        realized_vol = calculate_realized_volatility(
+            klines_df, 
+            configs.get('realized_volatility_period', DEFAULT_REALIZED_VOLATILITY_PERIOD),
+            candles_per_year_approx
+        )
+
+        if realized_vol is not None and realized_vol > 0:
+            dynamic_lev = calculate_dynamic_leverage(
+                realized_vol,
+                configs.get('target_annualized_volatility', DEFAULT_TARGET_ANNUALIZED_VOLATILITY),
+                configs.get('min_leverage', DEFAULT_MIN_LEVERAGE),
+                configs.get('max_leverage', DEFAULT_MAX_LEVERAGE),
+                configs['leverage'] # Fallback to user's initially configured fixed leverage
+            )
+            target_leverage = dynamic_lev
+            print(f"{log_prefix} Dynamic leverage calculated: {target_leverage}x (Realized Vol: {realized_vol:.4f})")
+            # Alert if dynamic leverage is different from the fixed configuration
+            if target_leverage != configs['leverage']:
+                if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+                    leverage_alert_msg = (
+                        f"ℹ️ Dynamic Leverage Update for `{symbol}`\n"
+                        f"Set to: `{target_leverage}x` (from fixed config: `{configs['leverage']}x`)\n"
+                        f"Basis: Realized Vol: `{realized_vol:.3f}`, Target Vol: `{configs.get('target_annualized_volatility', DEFAULT_TARGET_ANNUALIZED_VOLATILITY):.3f}`"
+                    )
+                    send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], leverage_alert_msg)
+        else:
+            print(f"{log_prefix} Could not calculate valid dynamic leverage (Realized Vol: {realized_vol}). Using fixed leverage: {target_leverage}x.")
+            # target_leverage already holds configs['leverage']
+        
+        # Set leverage (either dynamic or fixed if dynamic failed)
+        # Pass configs to set_margin_type_on_symbol for potential alerts there
+        if not (set_leverage_on_symbol(client, symbol, target_leverage) and \
+                set_margin_type_on_symbol(client, symbol, configs['margin_type'], configs)): # Pass configs
+            reason = f"Failed to set leverage ({target_leverage}x) or margin type."
             print(f"{log_prefix} {reason} for {symbol}. Abort.")
             send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p_calc, tp_p_calc, qty_calc_val, symbol_info, configs)
             return
-        print(f"{log_prefix} Calculated SL: {sl_p_calc}, TP: {tp_p_calc} for {symbol}.")
+        # If successful, print the leverage that was actually set.
+        print(f"{log_prefix} Leverage for {symbol} set to {target_leverage}x and margin type to {configs['margin_type']}.")
+        # --- End Dynamic Leverage ---
+
+
+        # --- ATR and SL/TP Calculation ---
+        klines_df['atr'] = calculate_atr(klines_df, period=configs.get('atr_period', DEFAULT_ATR_PERIOD))
+        current_atr_value = klines_df['atr'].iloc[-1]
+
+        if pd.isna(current_atr_value) or current_atr_value <= 0:
+            reason = f"Invalid ATR value ({current_atr_value:.4f}) for {symbol}. Cannot proceed with trade."
+            print(f"{log_prefix} {reason}")
+            send_trade_rejection_notification(symbol, signal, reason, entry_p, None, None, qty_calc_val, symbol_info, configs)
+            # Clean up ATR column from DataFrame if it was added temporarily
+            if 'atr' in klines_df.columns: klines_df.drop(columns=['atr'], inplace=True)
+            return
         
+        print(f"{log_prefix} Current ATR for {symbol} (period {configs.get('atr_period', DEFAULT_ATR_PERIOD)}): {current_atr_value:.{symbol_info.get('pricePrecision', 2)}f}")
+
+        sl_p_calc, tp_p_calc = calculate_sl_tp_values(entry_p, signal, current_atr_value, configs, symbol_info)
+        if sl_p_calc is None or tp_p_calc is None:
+            reason = "ATR-based Stop Loss / Take Profit calculation failed."
+            print(f"{log_prefix} {reason} for {symbol}. Abort.")
+            send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p_calc, tp_p_calc, qty_calc_val, symbol_info, configs)
+            if 'atr' in klines_df.columns: klines_df.drop(columns=['atr'], inplace=True) # Cleanup
+            return
+        print(f"{log_prefix} Calculated ATR-based SL: {sl_p_calc:.{symbol_info.get('pricePrecision',2)}f}, TP: {tp_p_calc:.{symbol_info.get('pricePrecision',2)}f} for {symbol}.")
+        # Cleanup ATR column if added
+        if 'atr' in klines_df.columns: klines_df.drop(columns=['atr'], inplace=True)
+        # --- End ATR and SL/TP Calculation ---
+
         acc_bal = get_account_balance(client, configs) 
         if acc_bal is None:
             reason = "Critical error fetching account balance."
@@ -1234,14 +1888,56 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is
             return
         print(f"{log_prefix} Account balance: {acc_bal} for position sizing.")
 
-        qty_to_order_val = calculate_position_size(acc_bal, configs['risk_percent'], entry_p, sl_p_calc, symbol_info, configs) 
+        # --- Calculate Position Size (Per-Trade Risk is inherently handled here) ---
+        qty_to_order_val = calculate_position_size(acc_bal, configs['risk_percent'], entry_p, sl_p_calc, symbol_info, configs)
         if qty_to_order_val is None or qty_to_order_val <= 0:
-            reason = f"Invalid position size calculated (Qty: {qty_to_order_val}). Check logs."
+            reason = f"Invalid position size calculated (Qty: {qty_to_order_val}). Check logs for per-trade risk details."
             print(f"{log_prefix} {reason} for {symbol}. Abort.")
             send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p_calc, tp_p_calc, qty_to_order_val, symbol_info, configs)
             return
-        print(f"{log_prefix} Calculated position size: {qty_to_order_val} for {symbol}.")
+        print(f"{log_prefix} Calculated position size (per-trade risk considered): {qty_to_order_val} for {symbol}.")
+
+        # --- Portfolio Risk Check ---
+        # Ensure sl_p_calc is valid before using it for new_trade_risk_abs calculation
+        if sl_p_calc == entry_p: # Should be caught by sanity checks later, but good to be safe
+            reason = "Stop loss price is equal to entry price before portfolio risk check."
+            print(f"{log_prefix} {reason} Aborting before portfolio risk check.")
+            send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p_calc, tp_p_calc, qty_to_order_val, symbol_info, configs)
+            return
+
+        new_trade_risk_abs = qty_to_order_val * abs(entry_p - sl_p_calc)
         
+        current_portfolio_risk_abs = 0
+        current_portfolio_risk_pct = 0.0
+        with lock: # active_trades_lock
+            # Make a deep copy if calculate_aggregate_open_risk modifies, but it shouldn't
+            # For now, direct pass is fine as it only reads.
+            current_portfolio_risk_pct = calculate_aggregate_open_risk(active_trades, acc_bal)
+            if acc_bal > 0 : # Avoid division by zero if somehow balance is zero but passed initial checks
+                 current_portfolio_risk_abs = (current_portfolio_risk_pct / 100) * acc_bal
+
+        potential_total_absolute_risk = current_portfolio_risk_abs + new_trade_risk_abs
+        potential_portfolio_risk_pct = (potential_total_absolute_risk / acc_bal) * 100 if acc_bal > 0 else float('inf')
+        
+        portfolio_risk_cap_config_pct = configs.get("portfolio_risk_cap", DEFAULT_PORTFOLIO_RISK_CAP) # e.g., 5.0 for 5%
+
+        print(f"{log_prefix} Portfolio Risk Check for {symbol}:")
+        print(f"  Current Aggregate Portfolio Risk: {current_portfolio_risk_pct:.2f}% ({current_portfolio_risk_abs:.2f} USDT)")
+        print(f"  Potential New Trade Risk ({symbol}): {(new_trade_risk_abs / acc_bal * 100):.2f}% ({new_trade_risk_abs:.2f} USDT)")
+        print(f"  Projected Total Portfolio Risk: {potential_portfolio_risk_pct:.2f}%")
+        print(f"  Portfolio Risk Cap: {portfolio_risk_cap_config_pct:.2f}%")
+
+        if potential_portfolio_risk_pct > portfolio_risk_cap_config_pct:
+            reason = (f"Portfolio risk limit exceeded. Current: {current_portfolio_risk_pct:.2f}%, "
+                      f"New Trade: {(new_trade_risk_abs / acc_bal * 100):.2f}%, "
+                      f"Projected: {potential_portfolio_risk_pct:.2f}%, "
+                      f"Cap: {portfolio_risk_cap_config_pct:.2f}%.")
+            print(f"{log_prefix} {reason} Trade for {symbol} rejected.")
+            send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p_calc, tp_p_calc, qty_to_order_val, symbol_info, configs)
+            return
+        print(f"{log_prefix} Portfolio risk check PASSED for {symbol}.")
+        # --- End Portfolio Risk Check ---
+
         # Use rounded quantity for all further steps including sanity checks and order placement
         qty_to_order_final = round(qty_to_order_val, int(symbol_info['quantityPrecision']))
         if qty_to_order_final == 0.0:
@@ -1254,7 +1950,9 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is
         passed_sanity_checks, sanity_check_reason = pre_order_sanity_checks(
             symbol=symbol, signal=signal, entry_price=entry_p, sl_price=sl_p_calc, tp_price=tp_p_calc,
             quantity=qty_to_order_final, symbol_info=symbol_info, current_balance=acc_bal, 
-            risk_percent_config=configs['risk_percent'], configs=configs, klines_df_for_debug=klines_df 
+            risk_percent_config=configs['risk_percent'], configs=configs, 
+            specific_leverage_for_trade=target_leverage, # Pass the actual leverage being used
+            klines_df_for_debug=klines_df 
         )
 
         if not passed_sanity_checks:
@@ -1566,6 +2264,74 @@ def monitor_active_trades(client, configs): # Needs lock for active_trades acces
                 except Exception as e:
                     print(f"Unexpected error cancelling TP order {tp_order_id_to_cancel} for {symbol} (OCO): {e}")
             
+            # --- Realized P&L Calculation on Closure ---
+            # This part is tricky as we need to know the exit price.
+            # We assume if a position is gone, it was closed by SL, TP, or manually.
+            # The OCO cancellation logic below attempts to cancel remaining SL/TP.
+            # If one was filled, its cancellation will fail with error -2011.
+            realized_pnl_for_trade = 0.0
+            exit_price_assumed = None
+            closure_reason = "Unknown (external or liquidation)"
+
+            # Try to determine if SL or TP was hit by checking cancellation status
+            sl_order_id_to_cancel = trade_details.get('sl_order_id')
+            tp_order_id_to_cancel = trade_details.get('tp_order_id')
+            sl_filled, tp_filled = False, False
+
+            if sl_order_id_to_cancel:
+                try:
+                    client.futures_cancel_order(symbol=symbol, orderId=sl_order_id_to_cancel)
+                    print(f"Successfully cancelled SL order {sl_order_id_to_cancel} for {symbol} as part of OCO (position closed).")
+                except BinanceAPIException as e:
+                    if e.code == -2011: # Order filled or cancelled / Does not exist
+                        sl_filled = True # Assume it was filled
+                        print(f"SL order {sl_order_id_to_cancel} for {symbol} likely FILLED (or already cancelled). Code: {e.code}")
+                    else:
+                        print(f"API Error cancelling SL order {sl_order_id_to_cancel} for {symbol} (OCO): {e}")
+                except Exception as e:
+                    print(f"Unexpected error cancelling SL order {sl_order_id_to_cancel} for {symbol} (OCO): {e}")
+            
+            if tp_order_id_to_cancel:
+                try:
+                    client.futures_cancel_order(symbol=symbol, orderId=tp_order_id_to_cancel)
+                    print(f"Successfully cancelled TP order {tp_order_id_to_cancel} for {symbol} as part of OCO (position closed).")
+                except BinanceAPIException as e:
+                    if e.code == -2011: # Order filled or cancelled / Does not exist
+                        tp_filled = True # Assume it was filled
+                        print(f"TP order {tp_order_id_to_cancel} for {symbol} likely FILLED (or already cancelled). Code: {e.code}")
+                    else:
+                        print(f"API Error cancelling TP order {tp_order_id_to_cancel} for {symbol} (OCO): {e}")
+                except Exception as e:
+                    print(f"Unexpected error cancelling TP order {tp_order_id_to_cancel} for {symbol} (OCO): {e}")
+
+            entry_p = trade_details['entry_price']
+            qty = trade_details['quantity']
+            trade_side = trade_details['side']
+
+            if sl_filled:
+                exit_price_assumed = trade_details['current_sl_price']
+                closure_reason = "Stop-Loss Hit"
+            elif tp_filled:
+                exit_price_assumed = trade_details['current_tp_price']
+                closure_reason = "Take-Profit Hit"
+            # If neither SL nor TP seems to have filled but position is gone, it's harder to determine P&L accurately here.
+            # For daily P&L tracking, this estimation is a compromise.
+            
+            if exit_price_assumed is not None:
+                if trade_side == "LONG":
+                    realized_pnl_for_trade = (exit_price_assumed - entry_p) * qty
+                elif trade_side == "SHORT":
+                    realized_pnl_for_trade = (entry_p - exit_price_assumed) * qty
+                
+                print(f"Position {symbol} closed. Reason: {closure_reason}. Entry: {entry_p}, Exit: {exit_price_assumed}, Qty: {qty}, PNL: {realized_pnl_for_trade:.2f}")
+                
+                with daily_state_lock:
+                    global daily_realized_pnl
+                    daily_realized_pnl += realized_pnl_for_trade
+                    print(f"Updated daily realized PNL: {daily_realized_pnl:.2f}")
+            else:
+                print(f"Position {symbol} closed, but exact exit (SL/TP hit) could not be determined from order cancellations. PNL not added to daily total from this event.")
+
             symbols_to_remove.append(symbol)
             continue
 
@@ -1633,13 +2399,35 @@ def monitor_active_trades(client, configs): # Needs lock for active_trades acces
         if updated_orders: get_open_orders(client, symbol) # Show updated orders
 
     if symbols_to_remove:
-        with active_trades_lock: # Lock for deleting from shared dict
-            for sym_to_remove in symbols_to_remove: # Iterate over the list of symbols marked for removal
-                if sym_to_remove in active_trades: # Check if it's still in active_trades (it should be)
-                    closed_trade_details = active_trades[sym_to_remove] # Get details before deleting
+        # First, gather all details for notifications outside the main active_trades_lock if possible,
+        # to minimize lock duration, though PNL calculation might need some details from active_trades.
+        # The current structure calculates PNL and determines reason inside the loop for each trade.
+        # Let's refine it slightly: Store the calculated PNL and reason with the details to be removed.
+        
+        processed_closures_for_notification = []
 
-                    # Send Telegram notification for closed trade
-                    if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+        for sym_to_remove_candidate_info in symbols_to_remove: # This list now contains dicts with {symbol, pnl, reason}
+            symbol_name = sym_to_remove_candidate_info["symbol"]
+            realized_pnl = sym_to_remove_candidate_info["pnl"]
+            determined_closure_reason = sym_to_remove_candidate_info["reason"]
+
+            with active_trades_lock: # Lock for reading and then deleting
+                if symbol_name in active_trades:
+                    trade_details_for_notification = active_trades[symbol_name].copy() # Get a copy of details
+                    trade_details_for_notification['realized_pnl'] = realized_pnl
+                    trade_details_for_notification['closure_reason'] = determined_closure_reason
+                    
+                    processed_closures_for_notification.append(trade_details_for_notification)
+                    # Actual deletion will happen after notifications or in a separate locked block
+                else:
+                    print(f"Warning: Symbol {symbol_name} intended for removal was not found in active_trades. Might have been removed by another process.")
+        
+        # Now send notifications and delete from active_trades
+        for closed_trade_details in processed_closures_for_notification:
+            sym_to_remove = closed_trade_details['symbol'] # Get symbol from the copied details
+
+            # Send Telegram notification for closed trade
+            if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
                         current_balance_for_msg = get_account_balance(client, configs)
                         if current_balance_for_msg is None: current_balance_for_msg = "N/A (Error)"
                         else: current_balance_for_msg = f"{current_balance_for_msg:.2f}"
@@ -1663,20 +2451,36 @@ def monitor_active_trades(client, configs): # Needs lock for active_trades acces
                             f"Side: {closed_trade_details['side']}\n"
                             f"Quantity: {closed_trade_details['quantity']:.{qty_precision}f}\n"
                             f"Entry Price: {closed_trade_details['entry_price']:.{price_precision}f}\n"
-                            f"(Reason: SL/TP hit or external closure detected)\n\n"
+                            f"Reason: {closed_trade_details.get('closure_reason', 'SL/TP hit or external closure detected')}\n" # Use determined reason
+                            f"Realized PNL for trade: {closed_trade_details.get('realized_pnl', 'N/A'):.2f} USDT\n\n" # Add PNL
                             f"💰 Account Balance: {current_balance_for_msg} USDT\n"
                             f"📊 Current Open Positions:\n{open_positions_str}"
                         )
                         send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], closed_trade_message)
                         print(f"Trade closure Telegram notification sent for {sym_to_remove}.")
-                    
-                    del active_trades[sym_to_remove]
-                    print(f"Removed {sym_to_remove} from bot's active trades.")
+            
+        # After notifications, remove the trades from the main active_trades dictionary
+        if processed_closures_for_notification:
+            symbols_to_delete_from_active = [item['symbol'] for item in processed_closures_for_notification]
+            if symbols_to_delete_from_active:
+                with active_trades_lock:
+                    for sym_to_del in symbols_to_delete_from_active:
+                        if sym_to_del in active_trades:
+                            del active_trades[sym_to_del]
+                            print(f"Removed {sym_to_del} from bot's active trades.")
+                        # else: (already warned if not found during processing_closures_for_notification population)
+                            
 
 def trading_loop(client, configs, monitored_symbols):
     print("\n--- Starting Trading Loop ---")
     if not monitored_symbols: print("No symbols to monitor. Exiting."); return
     print(f"Monitoring {len(monitored_symbols)} symbols. Examples: {monitored_symbols[:5]}")
+
+    # Declare globals used and modified within this loop
+    global daily_high_equity, day_start_equity, last_trading_day
+    global trading_halted_drawdown, trading_halted_daily_loss, daily_realized_pnl
+    # daily_state_lock and active_trades_lock are used with 'with' or passed, not assigned directly in this scope.
+    # active_trades is modified via helpers or within locks.
 
     current_cycle_number = 0
     executor = ThreadPoolExecutor(max_workers=configs.get('max_scan_threads', DEFAULT_MAX_SCAN_THREADS))
@@ -1689,59 +2493,115 @@ def trading_loop(client, configs, monitored_symbols):
             iter_ts = pd.Timestamp.now(tz='UTC').strftime('%Y-%m-%d %H:%M:%S UTC')
             print(f"\n--- Starting Scan Cycle #{current_cycle_number}: {iter_ts} {format_elapsed_time(cycle_start_time)} ---")
 
+            # --- Manage Daily State and Get Current Equity ---
+            # Note: current_balance is fetched inside manage_daily_state and used for equity calculation.
+            # active_trades (global) and active_trades_lock (global) are passed directly.
+            current_equity = manage_daily_state(client, configs, active_trades, active_trades_lock)
+
+            if current_equity is None:
+                print("CRITICAL: Failed to determine current equity. Skipping risk checks for this cycle. Bot may not operate safely.")
+                # Decide on behavior: sleep and retry, or continue cautiously.
+                # For now, let it proceed to monitoring, but new trades will be blocked by manage_trade_entry if balance is None there.
+                # This path implies a severe issue like persistent API failure for balance/prices.
+            else:
+                # --- Max Drawdown Check (on current equity) ---
+                # This check happens regardless of trading_halted_daily_loss, as drawdown is based on equity movement.
+                max_dd_config = configs.get('max_drawdown_percent', 0.0)
+                if max_dd_config > 0: # Only if drawdown limit is enabled
+                    with daily_state_lock: # Protect access to daily_high_equity and trading_halted_drawdown
+                        if not trading_halted_drawdown and daily_high_equity > 0: # Avoid division by zero
+                            drawdown_pct = (daily_high_equity - current_equity) / daily_high_equity * 100
+                            print(f"Max Drawdown Check: Current Equity: {current_equity:.2f}, Daily High Equity: {daily_high_equity:.2f}, Drawdown: {drawdown_pct:.2f}% (Limit: {max_dd_config:.2f}%)")
+                            if drawdown_pct >= max_dd_config:
+                                trading_halted_drawdown = True # Set halt flag under lock
+                                # Unlock before potentially long operation like close_all_open_positions and Telegram msg
+                                print(f"!!! MAX DRAWDOWN LIMIT HIT ({drawdown_pct:.2f}% >= {max_dd_config:.2f}%) !!!")
+                                if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+                                    send_telegram_message(
+                                        configs["telegram_bot_token"], configs["telegram_chat_id"],
+                                        f"🚨 MAX DRAWDOWN LIMIT HIT! 🚨\n"
+                                        f"Drawdown: {drawdown_pct:.2f}% (Limit: {max_dd_config:.2f}%)\n"
+                                        f"Daily High Equity: {daily_high_equity:.2f}\n"
+                                        f"Current Equity: {current_equity:.2f}\n"
+                                        f"Closing all positions and halting trading for the day."
+                                    )
+                                # Call close_all_open_positions (passes active_trades and active_trades_lock)
+                                close_all_open_positions(client, configs, active_trades, active_trades_lock)
+                        elif trading_halted_drawdown:
+                             print("Trading remains halted due to Max Drawdown limit previously hit.")
+
+
+                # --- Daily Stop Loss Check (on realized P&L) ---
+                # This check also happens regardless of trading_halted_drawdown, as it's a separate limit.
+                # However, if trading_halted_drawdown is true, new trades are already blocked.
+                daily_sl_config = configs.get('daily_stop_loss_percent', 0.0)
+                if daily_sl_config > 0: # Only if daily SL is enabled
+                    with daily_state_lock: # Protect daily_realized_pnl, day_start_equity, trading_halted_daily_loss
+                        if not trading_halted_daily_loss and day_start_equity > 0: # Avoid division by zero
+                            # daily_realized_pnl is negative for a loss
+                            current_loss_pct = (daily_realized_pnl / day_start_equity) * 100 
+                            print(f"Daily Stop Loss Check: Realized PNL: {daily_realized_pnl:.2f}, Start Equity: {day_start_equity:.2f}, Loss Pct: {current_loss_pct:.2f}% (Limit: -{daily_sl_config:.2f}%)")
+                            if current_loss_pct <= -daily_sl_config:
+                                trading_halted_daily_loss = True # Set halt flag under lock
+                                print(f"!!! DAILY STOP LOSS LIMIT HIT ({current_loss_pct:.2f}% <= -{daily_sl_config:.2f}%) !!!")
+                                if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+                                     send_telegram_message(
+                                        configs["telegram_bot_token"], configs["telegram_chat_id"],
+                                        f"📛 DAILY STOP LOSS LIMIT HIT! 📛\n"
+                                        f"Realized Daily PNL: {daily_realized_pnl:.2f} ({current_loss_pct:.2f}% of start equity)\n"
+                                        f"Limit: -{daily_sl_config:.2f}%\n"
+                                        f"Halting new trades for the day. Existing positions will be managed."
+                                    )
+                        elif trading_halted_daily_loss:
+                            print("New trades remain halted due to Daily Stop Loss limit previously hit.")
+            
+            # --- Main Trading Operations ---
             try:
-                print(f"Fetching account status... {format_elapsed_time(cycle_start_time)}")
-                # Ensure client_obj is used here if that's the correct variable name passed to trading_loop
-                # Assuming 'client' is the parameter name for trading_loop, which holds client_obj from main()
-                current_cycle_balance = get_account_balance(client, configs) # Pass configs
+                # Fetch current balance for this cycle if not done or if needed separately
+                # current_cycle_balance = get_account_balance(client, configs) # This is already done in manage_daily_state
+                # For clarity, let's assume current_equity from manage_daily_state is what we need for display/checks here.
+                # If manage_daily_state returned None for current_equity, some operations might be skipped.
+                
+                # Display general status
+                if current_equity is not None: # Only if equity was determined
+                    get_open_positions(client) # Shows current positions from API
+                    # The print below was for current_cycle_balance, let's use current_equity
+                    print(f"Account status: Current Equity: {current_equity:.2f} USDT {format_elapsed_time(cycle_start_time)}")
+                else:
+                    print(f"Account status: Equity could not be determined this cycle. {format_elapsed_time(cycle_start_time)}")
 
-                if configs['mode'] == 'live' and current_cycle_balance is None:
-                    # Message already sent by get_account_balance if it was -2015 (IP issue)
-                    print("WARNING: Account balance could not be fetched in this cycle due to an API error (potentially IP whitelist).")
-                    print("The bot will continue and retry in the next cycle. Check Telegram for IP alert if this was error -2015.")
-                    # No break here, allowing the loop to continue to the next cycle.
-                    # We might want to skip further processing for *this* cycle if balance is None.
-                    # For now, it will proceed to try and process symbols, which might be okay as individual
-                    # trade entries also check balance via manage_trade_entry->get_account_balance.
-                    # If manage_trade_entry's get_account_balance also returns None, it will abort that trade.
-                    # This seems like a reasonable approach: log cycle-level issue, continue, let symbol-level logic handle individual trades.
-                else: # Only get positions and print status if balance fetch was successful or not critical
-                    get_open_positions(client)
-                    print(f"Account status updated. Current Balance: {current_cycle_balance} {format_elapsed_time(cycle_start_time)}")
 
-                # The rest of the loop (symbol processing, monitoring) will still run.
-                # manage_trade_entry has its own balance check.
-
-                # --- Check for max concurrent positions ---
-                with active_trades_lock: # Ensure thread-safe reading of active_trades length
+                # --- Check for Halts or Max Concurrent Positions BEFORE attempting new trades ---
+                halt_dd_flag, halt_dsl_flag = False, False
+                with daily_state_lock: # Read halt flags safely
+                    halt_dd_flag = trading_halted_drawdown
+                    halt_dsl_flag = trading_halted_daily_loss
+                
+                num_active_trades = 0
+                with active_trades_lock:
                     num_active_trades = len(active_trades)
 
-                if num_active_trades >= configs["max_concurrent_positions"]:
-                    print(f"Max concurrent positions ({configs['max_concurrent_positions']}) reached. Pausing new trade scanning. Monitoring existing trades. {format_elapsed_time(cycle_start_time)}")
-                    
-                    # Still monitor existing trades and ensure SL/TP
-                    monitor_active_trades(client, configs)
-                    print(f"Active trades monitoring complete (while paused). {format_elapsed_time(cycle_start_time)}")
+                max_pos_limit = configs["max_concurrent_positions"]
 
-                    symbol_info_cache_for_safety_net = {}
-                    print(f"Running SL/TP safety net check (while paused)... {format_elapsed_time(cycle_start_time)}")
-                    ensure_sl_tp_for_all_open_positions(client, configs, active_trades, symbol_info_cache_for_safety_net)
-                    print(f"SL/TP safety net check complete (while paused). {format_elapsed_time(cycle_start_time)}")
-                    
-                    # Shorter wait time when paused, to quickly pick up when a slot frees up
-                    paused_wait_time_seconds = 60 
-                    print(f"Waiting for {paused_wait_time_seconds} seconds before re-checking position availability...")
-                    time.sleep(paused_wait_time_seconds)
-                    # End of this cycle's operations when paused
-                    cycle_dur_s_paused = time.time() - cycle_start_time
-                    print(f"\n--- Paused Scan Cycle #{current_cycle_number} Completed (Runtime: {cycle_dur_s_paused:.2f}s). Re-evaluating positions. ---")
-                    continue # Skip to the next iteration of the while loop to re-check conditions
+                proceed_with_new_trades = True
+                if halt_dd_flag:
+                    print(f"Trading HALTED for the day (Max Drawdown). No new trades will be initiated. {format_elapsed_time(cycle_start_time)}")
+                    proceed_with_new_trades = False
+                elif halt_dsl_flag:
+                    print(f"New trades HALTED for the day (Daily Stop Loss). No new trades will be initiated. {format_elapsed_time(cycle_start_time)}")
+                    proceed_with_new_trades = False
+                
+                if proceed_with_new_trades and num_active_trades >= max_pos_limit:
+                    print(f"Max concurrent positions ({max_pos_limit}) reached. Pausing new trade scanning. {format_elapsed_time(cycle_start_time)}")
+                    proceed_with_new_trades = False
 
-                else: # Space available for new trades
-                    print(f"Space available for new trades ({num_active_trades}/{configs['max_concurrent_positions']}). Proceeding with symbol scan. {format_elapsed_time(cycle_start_time)}")
+                # --- Symbol Processing for New Trades (if not halted/paused) ---
+                if proceed_with_new_trades:
+                    print(f"Space available for new trades ({num_active_trades}/{max_pos_limit}). Proceeding with symbol scan. {format_elapsed_time(cycle_start_time)}")
                     futures = []
                     print(f"Submitting {len(monitored_symbols)} symbol tasks to {configs.get('max_scan_threads')} threads... {format_elapsed_time(cycle_start_time)}")
                     for symbol in monitored_symbols:
+                        # manage_trade_entry will internally check halt flags again before processing
                         futures.append(executor.submit(process_symbol_task, symbol, client, configs, active_trades_lock))
                     
                     processed_count = 0
@@ -1751,21 +2611,51 @@ def trading_loop(client, configs, monitored_symbols):
                         processed_count += 1
                         if processed_count % (len(monitored_symbols)//5 or 1) == 0 or processed_count == len(monitored_symbols): # Log progress periodically
                              print(f"Symbol tasks progress: {processed_count}/{len(monitored_symbols)} completed. {format_elapsed_time(cycle_start_time)}")
-                    print(f"All symbol tasks completed for cycle. {format_elapsed_time(cycle_start_time)}")
+                    print(f"All symbol tasks completed for new trade scanning. {format_elapsed_time(cycle_start_time)}")
+                
+                # --- Operations for when new trades are paused/halted but monitoring continues ---
+                else: # Not proceeding with new trades (halted, or max positions)
+                    if halt_dd_flag: # Max drawdown halt implies all positions should have been closed
+                        print(f"Max Drawdown Halt is active. All positions should be closed. Waiting for next trading day. {format_elapsed_time(cycle_start_time)}")
+                        # No monitoring needed if all positions are intended to be closed.
+                        # The ensure_sl_tp_for_all_open_positions might run if there were closure errors, which is fine.
+                    elif halt_dsl_flag:
+                        print(f"Daily Stop Loss Halt for new trades is active. Monitoring existing positions. {format_elapsed_time(cycle_start_time)}")
+                    elif num_active_trades >= max_pos_limit:
+                         print(f"Max concurrent positions limit reached. Monitoring existing positions. {format_elapsed_time(cycle_start_time)}")
+                    # If none of the above, it implies proceed_with_new_trades was true, so this 'else' shouldn't be hit without a reason.
+                    # This block primarily serves to articulate actions when new trades are *not* sought.
 
-                    monitor_active_trades(client, configs) # Monitor after scan
+                # --- Monitor Existing Trades (Always run, unless specific conditions prevent it) ---
+                # If max drawdown occurred and positions were closed, active_trades should be empty.
+                # If daily SL hit, existing trades are still managed.
+                if not halt_dd_flag: # If not in max drawdown hard stop (where positions are closed)
+                    monitor_active_trades(client, configs) # Monitor after scan or if scan was skipped
                     print(f"Active trades monitoring complete. {format_elapsed_time(cycle_start_time)}")
+                else:
+                    print(f"Skipping active trade monitoring as Max Drawdown halt is active and positions should be closed. {format_elapsed_time(cycle_start_time)}")
 
-                    # --- SL/TP Safety Net Check for All Open Positions ---
-                    symbol_info_cache_for_safety_net = {} 
-                    print(f"Running SL/TP safety net check for all open positions... {format_elapsed_time(cycle_start_time)}")
-                    ensure_sl_tp_for_all_open_positions(client, configs, active_trades, symbol_info_cache_for_safety_net)
-                    print(f"SL/TP safety net check complete. {format_elapsed_time(cycle_start_time)}")
-                    # --- End SL/TP Safety Net Check ---
-                    
-                    # Standard loop delay when not paused
-                    print(f"Waiting for {configs['loop_delay_minutes']} m...")
-                    time.sleep(configs['loop_delay_minutes'] * 24 ) # Convert minutes to seconds
+
+                # --- SL/TP Safety Net Check for All Open Positions (Always run) ---
+                # This is important even if halted, to manage any stragglers or manually opened positions,
+                # or if close_all_open_positions had issues.
+                symbol_info_cache_for_safety_net = {} 
+                print(f"Running SL/TP safety net check for all open positions... {format_elapsed_time(cycle_start_time)}")
+                ensure_sl_tp_for_all_open_positions(client, configs, active_trades, symbol_info_cache_for_safety_net)
+                print(f"SL/TP safety net check complete. {format_elapsed_time(cycle_start_time)}")
+                # --- End SL/TP Safety Net Check ---
+                
+                # --- Loop Delay ---
+                # Determine appropriate sleep time
+                # If any halt is active, or max positions, might use a shorter delay to check for new day or slot availability sooner.
+                current_loop_delay_seconds = configs['loop_delay_minutes'] * 60 # Default delay
+                if halt_dd_flag or halt_dsl_flag or (num_active_trades >= max_pos_limit and proceed_with_new_trades == False) :
+                    # Using a shorter delay if halted or at max positions, to check for day reset or position closure sooner
+                    current_loop_delay_seconds = 60 
+                    print(f"Using shorter loop delay ({current_loop_delay_seconds}s) due to trading halt or max positions.")
+                
+                print(f"Waiting for {current_loop_delay_seconds / 60:.1f} m...")
+                time.sleep(current_loop_delay_seconds)
 
             except Exception as loop_err: # Catch errors within the try block of the loop
                 print(f"ERROR in trading loop cycle: {loop_err} {format_elapsed_time(cycle_start_time)}")
@@ -1928,8 +2818,18 @@ def main():
     if configs["mode"] == "live":
         try:
             trading_loop(client_obj, configs, monitored_symbols) # Use client_obj
-        except KeyboardInterrupt: print("\nBot stopped by user (Ctrl+C).")
-        except Exception as e: print(f"\nCRITICAL UNEXPECTED ERROR IN LIVE TRADING: {e}"); traceback.print_exc()
+        except KeyboardInterrupt: 
+            print("\nBot stopped by user (Ctrl+C).")
+            # Send a notification for graceful shutdown by user
+            if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+                send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], "ℹ️ Bot stopped by user (Ctrl+C).")
+        except Exception as e: 
+            print(f"\nCRITICAL UNEXPECTED ERROR IN LIVE TRADING: {e}")
+            traceback.print_exc()
+            # Send a notification for critical error
+            if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+                error_message_for_telegram = f"🆘 CRITICAL BOT ERROR 🆘\nBot encountered an unhandled exception and may have stopped.\nError: {str(e)[:1000]}\nCheck logs immediately!"
+                send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], error_message_for_telegram)
         finally:
             print("\n--- Live Trading Bot Shutting Down ---")
 
@@ -2286,13 +3186,117 @@ backtest_simulated_orders = {} # symbol -> list of order dicts
 backtest_simulated_positions = {} # symbol -> position dict
 backtest_trade_log = [] # Log of all simulated trade actions
 
+# Backtesting specific daily state and halt flags
+day_start_equity_bt = 0.0
+daily_high_equity_bt = 0.0
+daily_realized_pnl_bt = 0.0
+last_trading_day_bt = None # Stores datetime.date object
+trading_halted_drawdown_bt = False
+trading_halted_daily_loss_bt = False
+# No separate lock needed for backtest globals as it's single-threaded per simulation run
+
+def get_current_equity_backtest(current_sim_balance: float, sim_positions: dict, candle_data_map: dict) -> float:
+    """Calculates current equity for backtesting (sim_balance + unrealized P&L)."""
+    total_unrealized_pnl = 0.0
+    for symbol, pos_details in sim_positions.items():
+        current_candle = candle_data_map.get(symbol)
+        if current_candle is not None:
+            market_price = current_candle['close'] # Use current candle's close for UPNL
+            # Calculate UPNL for this position (re-using live logic structure)
+            entry_price = pos_details['entryPrice']
+            position_amount = pos_details['positionAmt'] # This is signed (positive for long, negative for short)
+            
+            # Universal formula for P&L: (market_price - entry_price) * position_amount
+            # For LONG: (market_price - entry_price) * (+qty)
+            # For SHORT: (market_price - entry_price) * (-qty) which is (entry_price - market_price) * (+qty)
+            pnl = (market_price - entry_price) * position_amount
+            total_unrealized_pnl += pnl
+        else:
+            # If no candle data for an open position's symbol, UPNL for it is unknown.
+            # This shouldn't happen if candle_data_map is updated correctly each step for all symbols with positions.
+            print(f"[SIM_ EQUITY_WARNING] No current candle data for symbol {symbol} with an open position. UPNL for it assumed 0.")
+            
+    return current_sim_balance + total_unrealized_pnl
+
+def close_all_open_positions_backtest(configs: dict, current_candle_data_map: dict):
+    """
+    Simulates closing all open positions in backtesting at current candle's close.
+    Updates daily_realized_pnl_bt and logs closures.
+    Clears simulated positions, orders, and the bot's active_trades.
+    """
+    global backtest_simulated_positions, backtest_simulated_orders, backtest_trade_log
+    global daily_realized_pnl_bt, active_trades, backtest_simulated_balance
+
+    log_prefix_bt_close = f"[SIM-{backtest_current_time} CloseAllBT]"
+    print(f"{log_prefix_bt_close} Max Drawdown triggered. Simulating closure of all open positions.")
+
+    if not backtest_simulated_positions:
+        print(f"{log_prefix_bt_close} No simulated positions to close.")
+    else:
+        for symbol, pos_details in list(backtest_simulated_positions.items()):
+            current_candle = current_candle_data_map.get(symbol)
+            if current_candle is None:
+                print(f"{log_prefix_bt_close} CRITICAL: No candle data for {symbol} to simulate closure. Position may remain open in simulation state.")
+                continue
+
+            close_price = current_candle['close']
+            entry_price = pos_details['entryPrice']
+            quantity_abs = abs(pos_details['positionAmt']) # Absolute quantity
+            side = pos_details['side']
+            
+            pnl_trade = 0
+            if side == "LONG":
+                pnl_trade = (close_price - entry_price) * quantity_abs
+            elif side == "SHORT":
+                pnl_trade = (entry_price - close_price) * quantity_abs
+            
+            print(f"{log_prefix_bt_close} Closing {symbol} ({side} {quantity_abs} @ {entry_price:.4f}) at {close_price:.4f}. PNL: {pnl_trade:.2f}")
+            
+            backtest_simulated_balance += pnl_trade # Update balance first
+            daily_realized_pnl_bt += pnl_trade # Add to daily P&L
+
+            backtest_trade_log.append({
+                "time": backtest_current_time, "symbol": symbol, "type": "MARKET_CLOSE_DRAWDOWN_HALT", 
+                "side": "SELL" if side == "LONG" else "BUY", # Action taken
+                "qty": quantity_abs, "price": close_price, "pnl": pnl_trade, 
+                "balance": backtest_simulated_balance,
+                "reason": "Max Drawdown Halt"
+            })
+            del backtest_simulated_positions[symbol]
+
+    # Clear all pending SL/TP orders for all symbols
+    if backtest_simulated_orders:
+        print(f"{log_prefix_bt_close} Clearing all ({len(backtest_simulated_orders)}) pending simulated SL/TP orders.")
+        backtest_simulated_orders.clear()
+    
+    # Clear the bot's active_trades tracking
+    if active_trades:
+        print(f"{log_prefix_bt_close} Clearing bot's active_trades list ({len(active_trades)} items).")
+        active_trades.clear()
+    
+    print(f"{log_prefix_bt_close} All positions closed/cleared due to Max Drawdown. Daily Realized PNL: {daily_realized_pnl_bt:.2f}")
+
+
 def initialize_backtest_environment(client, configs):
     global backtest_simulated_balance, active_trades, backtest_trade_log, backtest_simulated_orders, backtest_simulated_positions
+    # Also initialize backtest daily state variables here
+    global day_start_equity_bt, daily_high_equity_bt, daily_realized_pnl_bt
+    global last_trading_day_bt, trading_halted_drawdown_bt, trading_halted_daily_loss_bt
+
     active_trades.clear()
     backtest_trade_log = []
     backtest_simulated_orders = {}
     backtest_simulated_positions = {}
     
+    # Reset backtest-specific daily state variables
+    day_start_equity_bt = 0.0
+    daily_high_equity_bt = 0.0
+    daily_realized_pnl_bt = 0.0
+    last_trading_day_bt = None
+    trading_halted_drawdown_bt = False
+    trading_halted_daily_loss_bt = False
+    print("Backtest daily state variables reset.")
+
     start_balance_type = configs.get("backtest_start_balance_type", "current") # Default to current if not set
     
     if start_balance_type == "custom":
@@ -2308,6 +3312,10 @@ def initialize_backtest_environment(client, configs):
         else:
             backtest_simulated_balance = live_balance if live_balance > 0 else 10000 # Default to 10k if no live balance
         print(f"Backtest initialized with starting balance: {backtest_simulated_balance:.2f} USDT")
+    
+    # Initialize day_start_equity_bt and daily_high_equity_bt with the starting balance
+    day_start_equity_bt = backtest_simulated_balance
+    daily_high_equity_bt = backtest_simulated_balance
 
 
 def get_simulated_account_balance(asset="USDT"): # Overrides live version for backtest
@@ -2359,16 +3367,19 @@ def place_simulated_order(symbol_info, side, order_type, quantity, price=None, s
                 pnl = (fill_price - current_pos['entryPrice']) * actual_reduce_qty if current_pos['side'] == "LONG" else \
                       (current_pos['entryPrice'] - fill_price) * actual_reduce_qty
                 
+                global daily_realized_pnl_bt # Ensure it's accessible
                 backtest_simulated_balance += pnl # Add PnL to balance
+                daily_realized_pnl_bt += pnl # Update daily realized P&L for backtest
                 current_pos['positionAmt'] += actual_reduce_qty if side == "BUY" else -actual_reduce_qty # Reduce position
                 
                 sim_order.update({"status": "FILLED", "executedQty": actual_reduce_qty, "avgPrice": fill_price})
                 backtest_trade_log.append({
                     "time": backtest_current_time, "symbol": symbol, "type": "MARKET_CLOSE", "side": side,
                     "qty": actual_reduce_qty, "price": fill_price, "pnl": pnl, "balance": backtest_simulated_balance,
+                    "daily_realized_pnl_bt_after_trade": daily_realized_pnl_bt, # Log current daily PNL
                     "order_id": order_id
                 })
-                print(f"[SIM-{backtest_current_time}] {side} {actual_reduce_qty} {symbol} CLOSED @ {fill_price:.4f}. PnL: {pnl:.2f}. New Bal: {backtest_simulated_balance:.2f}")
+                print(f"[SIM-{backtest_current_time}] {side} {actual_reduce_qty} {symbol} CLOSED @ {fill_price:.4f}. PnL: {pnl:.2f}. New Bal: {backtest_simulated_balance:.2f}. Daily Realized PNL_BT: {daily_realized_pnl_bt:.2f}")
 
                 if abs(current_pos['positionAmt']) < 1e-9: # Position fully closed
                     del backtest_simulated_positions[symbol]
@@ -2486,17 +3497,19 @@ def process_pending_simulated_orders(symbol, current_candle_high, current_candle
                 pnl = (trigger_price - current_pos['entryPrice']) * actual_filled_qty if current_pos['side'] == "LONG" else \
                       (current_pos['entryPrice'] - trigger_price) * actual_filled_qty
                 
-                global backtest_simulated_balance
+                global backtest_simulated_balance, daily_realized_pnl_bt # Added daily_realized_pnl_bt
                 backtest_simulated_balance += pnl
+                daily_realized_pnl_bt += pnl # Update daily realized P&L for backtest
                 current_pos['positionAmt'] += actual_filled_qty if order['side'] == "BUY" else -actual_filled_qty
                 
                 order.update({"status": "FILLED", "executedQty": actual_filled_qty, "avgPrice": trigger_price})
                 backtest_trade_log.append({
                     "time": backtest_current_time, "symbol": symbol, "type": f"{order['type']}_FILL", "side": order['side'],
                     "qty": actual_filled_qty, "price": trigger_price, "pnl": pnl, "balance": backtest_simulated_balance,
+                    "daily_realized_pnl_bt_after_trade": daily_realized_pnl_bt, # Log current daily PNL
                     "triggered_order_id": order['orderId']
                 })
-                print(f"[SIM-{backtest_current_time}] {order['side']} {actual_filled_qty} {symbol} (from {order['type']}) FILLED @ {trigger_price:.4f}. PnL: {pnl:.2f}. New Bal: {backtest_simulated_balance:.2f}")
+                print(f"[SIM-{backtest_current_time}] {order['side']} {actual_filled_qty} {symbol} (from {order['type']}) FILLED @ {trigger_price:.4f}. PnL: {pnl:.2f}. New Bal: {backtest_simulated_balance:.2f}. Daily Realized PNL_BT: {daily_realized_pnl_bt:.2f}")
 
                 if abs(current_pos['positionAmt']) < 1e-9: # Position fully closed
                     del backtest_simulated_positions[symbol]
@@ -2521,6 +3534,24 @@ def manage_trade_entry_backtest(client_dummy, configs, symbol, klines_df_current
     # It uses simulated order placement and state management.
     # `current_active_trades_bt` is passed in, representing the state of active_trades for the backtest.
     global backtest_current_time, backtest_simulated_positions # backtest_simulated_positions is the ground truth for positions
+    # Assuming these flags are managed by the backtesting_loop and passed or globally accessible for backtest context
+    global trading_halted_drawdown_bt, trading_halted_daily_loss_bt 
+
+    log_prefix_bt = f"[SIM-{backtest_current_time}] {symbol} manage_trade_entry_backtest:"
+
+    # --- Check overall trading halt status for backtest ---
+    # These flags (trading_halted_drawdown_bt, trading_halted_daily_loss_bt)
+    # will need to be set appropriately within the backtesting_loop.
+    if trading_halted_drawdown_bt:
+        print(f"{log_prefix_bt} Trade entry BLOCKED. Reason: Max Drawdown trading halt is active (Backtest).")
+        # Optionally log this to backtest_trade_log if desired
+        # backtest_trade_log.append({"time": backtest_current_time, "symbol": symbol, "type": "REJECTED_HALT_DRAWDOWN"})
+        return
+    if trading_halted_daily_loss_bt:
+        print(f"{log_prefix_bt} Trade entry BLOCKED. Reason: Daily Stop Loss trading halt is active (Backtest).")
+        # backtest_trade_log.append({"time": backtest_current_time, "symbol": symbol, "type": "REJECTED_HALT_DAILY_LOSS"})
+        return
+    # --- End trading halt status check for backtest ---
 
     # The lock (`active_trades_lock`) is not used here as backtesting is typically single-threaded per candle loop.
     
@@ -2566,31 +3597,88 @@ def manage_trade_entry_backtest(client_dummy, configs, symbol, klines_df_current
         print(f"[SIM-{backtest_current_time}] No symbol info for {symbol}. Abort signal processing."); return
 
     entry_p_signal = klines_df_for_calc['close'].iloc[-1] 
-    ema100_val = klines_df_for_calc['EMA100'].iloc[-1]
-    sl_p, tp_p = calculate_sl_tp_values(entry_p_signal, signal, ema100_val, klines_df_for_calc)
-    
-    current_sim_balance = get_simulated_account_balance()
-    # Pass configs to calculate_position_size for backtesting as well
-    qty = calculate_position_size(current_sim_balance, configs['risk_percent'], entry_p_signal, sl_p, symbol_info, configs) 
-    
-    # Calculate Risk:Reward Ratio
-    rr_ratio = None
-    if sl_p is not None and tp_p is not None and entry_p_signal != sl_p:
-        reward_abs = abs(tp_p - entry_p_signal)
-        risk_abs = abs(entry_p_signal - sl_p)
-        if risk_abs > 1e-9 : rr_ratio = reward_abs / risk_abs
 
+    # --- Dynamic Leverage Calculation for Backtest ---
+    leverage_for_trade_bt = configs['leverage'] # Default to fixed leverage
+    # Assuming 15-minute klines for backtest as well for candles_per_year
+    candles_per_day_approx_bt = 24 * (60 / 15) 
+    candles_per_year_approx_bt = int(candles_per_day_approx_bt * 365)
+
+    realized_vol_bt = calculate_realized_volatility(
+        klines_df_for_calc, # This is the slice for the current backtest candle
+        configs.get('realized_volatility_period', DEFAULT_REALIZED_VOLATILITY_PERIOD),
+        candles_per_year_approx_bt
+    )
+
+    if realized_vol_bt is not None and realized_vol_bt > 0:
+        dynamic_lev_bt = calculate_dynamic_leverage(
+            realized_vol_bt,
+            configs.get('target_annualized_volatility', DEFAULT_TARGET_ANNUALIZED_VOLATILITY),
+            configs.get('min_leverage', DEFAULT_MIN_LEVERAGE),
+            configs.get('max_leverage', DEFAULT_MAX_LEVERAGE),
+            configs['leverage'] 
+        )
+        leverage_for_trade_bt = dynamic_lev_bt
+        print(f"[SIM-{backtest_current_time}] Dynamic leverage for {symbol} (Backtest): {leverage_for_trade_bt}x (Realized Vol: {realized_vol_bt:.4f})")
+    else:
+        print(f"[SIM-{backtest_current_time}] Could not calculate dynamic leverage for {symbol} (Backtest Realized Vol: {realized_vol_bt}). Using fixed leverage: {leverage_for_trade_bt}x.")
+    # --- End Dynamic Leverage Calculation for Backtest ---
+
+    # --- ATR and SL/TP Calculation for Backtest ---
+    klines_df_for_calc['atr'] = calculate_atr(klines_df_for_calc, period=configs.get('atr_period', DEFAULT_ATR_PERIOD))
+    current_atr_value_bt = klines_df_for_calc['atr'].iloc[-1]
+
+    # Initial evaluated_trade_details for logging, may be updated with rejection reasons
     evaluated_trade_details = {
         "time": backtest_current_time, "symbol": symbol, "type": "SIGNAL_EVALUATED",
-        "signal_side": signal, "calc_entry": entry_p_signal, "calc_sl": sl_p, "calc_tp": tp_p,
-        "calc_qty": qty if qty is not None else 0.0, "initial_rr_ratio": rr_ratio
+        "signal_side": signal, "calc_entry": entry_p_signal, 
+        "atr_value": current_atr_value_bt if pd.notna(current_atr_value_bt) else None,
+        "realized_vol_bt": realized_vol_bt if pd.notna(realized_vol_bt) else None,
+        "leverage_used_bt": leverage_for_trade_bt
+        # SL, TP, Qty, RR will be added after calculation
     }
 
+    if pd.isna(current_atr_value_bt) or current_atr_value_bt <= 0:
+        reason_atr_bt = f"Invalid ATR value ({current_atr_value_bt}) for {symbol} in backtest."
+        print(f"[SIM-{backtest_current_time}] {reason_atr_bt} Cannot proceed.")
+        evaluated_trade_details.update({
+            "status": "REJECTED_INVALID_ATR", "reason": reason_atr_bt,
+            "calc_sl": None, "calc_tp": None, "calc_qty": None, "initial_rr_ratio": None
+        })
+        backtest_trade_log.append(evaluated_trade_details)
+        if 'atr' in klines_df_for_calc.columns: klines_df_for_calc.drop(columns=['atr'], inplace=True)
+        return
+    
+    print(f"[SIM-{backtest_current_time}] Current ATR for {symbol} (Backtest): {current_atr_value_bt:.{symbol_info.get('pricePrecision', 2)}f}")
+    
+    sl_p, tp_p = calculate_sl_tp_values(entry_p_signal, signal, current_atr_value_bt, configs, symbol_info)
+    if 'atr' in klines_df_for_calc.columns: klines_df_for_calc.drop(columns=['atr'], inplace=True) # Cleanup ATR column
+
+    evaluated_trade_details.update({"calc_sl": sl_p, "calc_tp": tp_p})
+
     if sl_p is None or tp_p is None:
-        print(f"[SIM-{backtest_current_time}] SL/TP calc failed for {symbol}. Abort."); 
-        evaluated_trade_details.update({"status": "REJECTED", "reason": "SL_TP_CALC_FAILED"})
+        reason_sltp_bt = "ATR-based SL/TP calculation failed in backtest."
+        print(f"[SIM-{backtest_current_time}] {reason_sltp_bt} for {symbol}. Abort.")
+        evaluated_trade_details.update({
+            "status": "REJECTED_SLTP_CALC_FAIL_BT", "reason": reason_sltp_bt,
+            "calc_qty": None, "initial_rr_ratio": None
+        })
         backtest_trade_log.append(evaluated_trade_details)
         return
+    # --- End ATR and SL/TP Calculation for Backtest ---
+    
+    current_sim_balance = get_simulated_account_balance()
+    qty = calculate_position_size(current_sim_balance, configs['risk_percent'], entry_p_signal, sl_p, symbol_info, configs) 
+    
+    evaluated_trade_details.update({"calc_qty": qty if qty is not None else 0.0})
+
+    # Calculate Risk:Reward Ratio
+    rr_ratio = None
+    if sl_p is not None and tp_p is not None and entry_p_signal != sl_p and abs(entry_p_signal - sl_p) > 1e-9:
+        reward_abs = abs(tp_p - entry_p_signal)
+        risk_abs = abs(entry_p_signal - sl_p)
+        rr_ratio = reward_abs / risk_abs
+    evaluated_trade_details.update({"initial_rr_ratio": rr_ratio})
     
     if current_sim_balance <= 0:
         print(f"[SIM-{backtest_current_time}] Zero/unavailable simulated balance. Abort."); 
@@ -2600,7 +3688,7 @@ def manage_trade_entry_backtest(client_dummy, configs, symbol, klines_df_current
 
     if qty is None or qty <= 0: 
         print(f"[SIM-{backtest_current_time}] Invalid position size for {symbol}. Abort."); 
-        evaluated_trade_details.update({"status": "REJECTED", "reason": "INVALID_POS_SIZE", "calc_qty": qty if qty is not None else 0.0})
+        evaluated_trade_details.update({"status": "REJECTED", "reason": "INVALID_POS_SIZE"}) # calc_qty already updated
         backtest_trade_log.append(evaluated_trade_details)
         return
         
@@ -2610,8 +3698,47 @@ def manage_trade_entry_backtest(client_dummy, configs, symbol, klines_df_current
         backtest_trade_log.append(evaluated_trade_details)
         return
 
-    # Log evaluated signal before attempting to place
-    backtest_trade_log.append(evaluated_trade_details)
+    # --- Portfolio Risk Check for Backtest ---
+    # Ensure sl_p is valid (not None, not equal to entry) before proceeding
+    if sl_p is None or sl_p == entry_p_signal: 
+        reason_portfolio_bt = f"Invalid SL price ({sl_p}) before portfolio risk check (Backtest)."
+        print(f"[SIM-{backtest_current_time}] {reason_portfolio_bt} for {symbol}. Abort.")
+        evaluated_trade_details.update({"status": "REJECTED_INVALID_SL_FOR_PORTFOLIO_CHECK", "reason": reason_portfolio_bt})
+        backtest_trade_log.append(evaluated_trade_details)
+        return
+
+    new_trade_risk_abs_bt = qty * abs(entry_p_signal - sl_p)
+    current_portfolio_risk_abs_bt = 0
+    current_portfolio_risk_pct_bt = 0.0
+
+    # `current_active_trades_bt` is the backtester's equivalent of live `active_trades`
+    # No lock needed in backtest as it's single-threaded per candle
+    current_portfolio_risk_pct_bt = calculate_aggregate_open_risk(current_active_trades_bt, current_sim_balance)
+    if current_sim_balance > 0:
+        current_portfolio_risk_abs_bt = (current_portfolio_risk_pct_bt / 100) * current_sim_balance
+
+    potential_total_absolute_risk_bt = current_portfolio_risk_abs_bt + new_trade_risk_abs_bt
+    potential_portfolio_risk_pct_bt = (potential_total_absolute_risk_bt / current_sim_balance) * 100 if current_sim_balance > 0 else float('inf')
+
+    portfolio_risk_cap_config_pct_bt = configs.get("portfolio_risk_cap", DEFAULT_PORTFOLIO_RISK_CAP)
+
+    print(f"[SIM-{backtest_current_time}] Portfolio Risk Check (Backtest) for {symbol}:")
+    print(f"  Current Aggregate Portfolio Risk: {current_portfolio_risk_pct_bt:.2f}% ({current_portfolio_risk_abs_bt:.2f} USDT)")
+    print(f"  Potential New Trade Risk ({symbol}): {(new_trade_risk_abs_bt / current_sim_balance * 100 if current_sim_balance > 0 else 0):.2f}% ({new_trade_risk_abs_bt:.2f} USDT)")
+    print(f"  Projected Total Portfolio Risk: {potential_portfolio_risk_pct_bt:.2f}%")
+    print(f"  Portfolio Risk Cap: {portfolio_risk_cap_config_pct_bt:.2f}%")
+
+    if potential_portfolio_risk_pct_bt > portfolio_risk_cap_config_pct_bt:
+        reason_portfolio_bt = (f"Portfolio risk limit exceeded (Backtest). Current: {current_portfolio_risk_pct_bt:.2f}%, "
+                               f"New: {(new_trade_risk_abs_bt / current_sim_balance * 100 if current_sim_balance > 0 else 0):.2f}%, "
+                               f"Projected: {potential_portfolio_risk_pct_bt:.2f}%, "
+                               f"Cap: {portfolio_risk_cap_config_pct_bt:.2f}%.")
+        print(f"[SIM-{backtest_current_time}] {reason_portfolio_bt} Trade for {symbol} rejected.")
+        evaluated_trade_details.update({"status": "REJECTED_PORTFOLIO_RISK", "reason": reason_portfolio_bt})
+        backtest_trade_log.append(evaluated_trade_details) # Log the initial evaluation then the rejection reason
+        return
+    print(f"[SIM-{backtest_current_time}] Portfolio risk check PASSED (Backtest) for {symbol}.")
+    # --- End Portfolio Risk Check for Backtest ---
 
     # --- Perform Pre-Order Sanity Checks for Backtest ---
     # Note: `current_sim_balance` is used for `current_balance` parameter.
@@ -2627,30 +3754,24 @@ def manage_trade_entry_backtest(client_dummy, configs, symbol, klines_df_current
         current_balance=current_sim_balance,
         risk_percent_config=configs['risk_percent'],
         configs=configs,
+        specific_leverage_for_trade=leverage_for_trade_bt, # Pass the dynamic/fallback leverage for backtest
         klines_df_for_debug=klines_df_for_calc # Use the df with EMAs
     )
 
     if not passed_sanity_checks_bt:
         print(f"[SIM-{backtest_current_time}] Pre-order sanity checks FAILED for {symbol}: {sanity_check_reason_bt}")
-        # Log this failure specifically
-        backtest_trade_log.append({
-            "time": backtest_current_time, "symbol": symbol, "type": "SANITY_CHECK_FAILED",
-            "reason": sanity_check_reason_bt, "signal_side": signal, 
-            "calc_entry": entry_p_signal, "calc_sl": sl_p, "calc_tp": tp_p, "calc_qty": qty
-        })
-        # Update the status of the previously logged "SIGNAL_EVALUATED" to "REJECTED_SANITY_CHECK"
-        # Find the last "SIGNAL_EVALUATED" for this symbol and time (should be the one just added)
-        for log_item in reversed(backtest_trade_log):
-            if log_item.get("type") == "SIGNAL_EVALUATED" and \
-               log_item.get("symbol") == symbol and \
-               log_item.get("time") == backtest_current_time:
-                log_item["status"] = "REJECTED_SANITY_CHECK"
-                log_item["reject_reason"] = sanity_check_reason_bt
-                break
+        evaluated_trade_details.update({"status": "REJECTED_SANITY_CHECK", "reason": sanity_check_reason_bt})
+        backtest_trade_log.append(evaluated_trade_details)
         return # Abort trade entry for backtest
 
     print(f"[SIM-{backtest_current_time}] Pre-order sanity checks PASSED for {symbol}.")
     # --- End of Pre-Order Sanity Checks for Backtest ---
+
+    # If all checks passed, log the initial signal evaluation details
+    # (status will implicitly be "Passed all checks up to order placement")
+    # or we can add an explicit status like "CHECKS_PASSED_PROCEEDING_TO_ORDER"
+    evaluated_trade_details.update({"status": "CHECKS_PASSED_ATTEMPTING_ORDER"})
+    backtest_trade_log.append(evaluated_trade_details)
 
     print(f"[SIM-{backtest_current_time}] Attempting {signal} {qty} {symbol} @SIM_MARKET (EP_signal:{entry_p_signal:.4f}), SL:{sl_p:.4f}, TP:{tp_p:.4f}, RR:{(f'{rr_ratio:.2f}' if isinstance(rr_ratio, float) else 'N/A')})")
     
@@ -2991,7 +4112,10 @@ def fetch_initial_backtest_data_for_symbol(symbol, client, backtest_days_config,
 
 def backtesting_loop(client, configs, monitored_symbols):
     global backtest_current_time, active_trades, backtest_simulated_balance, backtest_trade_log, current_candle_data_map
-    
+    global day_start_equity_bt, daily_high_equity_bt, daily_realized_pnl_bt, last_trading_day_bt # Added
+    global trading_halted_drawdown_bt, trading_halted_daily_loss_bt # Added
+    global backtest_simulated_positions, backtest_simulated_orders # Added for clarity, though modified via helpers mostly
+
     print("\n--- Starting Backtesting Loop ---")
     if not monitored_symbols: print("No symbols to monitor for backtest. Exiting."); return
 
@@ -3141,9 +4265,70 @@ def backtesting_loop(client, configs, monitored_symbols):
     for i in range(simulation_start_index, len(master_klines_df)):
         backtest_current_time = master_klines_df.index[i]
         current_candle_data_map.clear() # Clear for the new candle
+        
+        # --- Backtest Daily State Management ---
+        # Global declarations for these variables are now at the top of the function.
+        
+        current_date_bt = backtest_current_time.date()
+        # First, populate current_candle_data_map for equity calculation for *this specific candle*
+        for symbol_for_candle_map in all_symbol_historical_data.keys():
+            if symbol_for_candle_map in all_symbol_historical_data:
+                 symbol_klines_for_map = all_symbol_historical_data[symbol_for_candle_map].iloc[:i+1]
+                 if not symbol_klines_for_map.empty:
+                      current_candle_data_map[symbol_for_candle_map] = symbol_klines_for_map.iloc[-1]
 
-        if i % 100 == 0 : # Log progress
-            print(f"\n[SIM] Processing Candle {i - simulation_start_index + 1} / {len(master_klines_df) - simulation_start_index} | Time: {backtest_current_time} | Balance: {backtest_simulated_balance:.2f} USDT")
+        current_equity_bt = get_current_equity_backtest(backtest_simulated_balance, backtest_simulated_positions, current_candle_data_map)
+
+        if last_trading_day_bt != current_date_bt:
+            print(f"[SIM-{backtest_current_time}] New trading day ({current_date_bt}). Resetting daily limits for backtest.")
+            day_start_equity_bt = current_equity_bt
+            daily_high_equity_bt = current_equity_bt
+            daily_realized_pnl_bt = 0.0 # Realized PNL resets daily
+            trading_halted_drawdown_bt = False
+            trading_halted_daily_loss_bt = False
+            last_trading_day_bt = current_date_bt
+            backtest_trade_log.append({
+                "time": backtest_current_time, "type": "NEW_DAY_STATE_RESET_BT",
+                "day_start_equity_bt": day_start_equity_bt, "daily_high_equity_bt": daily_high_equity_bt
+            })
+        else:
+            daily_high_equity_bt = max(daily_high_equity_bt, current_equity_bt)
+        
+        if i % 100 == 0 or last_trading_day_bt != current_date_bt : # Log progress and key daily stats
+            print(f"\n[SIM] Candle {i - simulation_start_index + 1}/{len(master_klines_df) - simulation_start_index} | Time: {backtest_current_time}")
+            print(f"  Sim Balance: {backtest_simulated_balance:.2f}, Current Equity_BT: {current_equity_bt:.2f}")
+            print(f"  Day Start Equity_BT: {day_start_equity_bt:.2f}, Daily High Equity_BT: {daily_high_equity_bt:.2f}, Daily Realized PNL_BT: {daily_realized_pnl_bt:.2f}")
+            print(f"  Halt Status_BT: Drawdown: {trading_halted_drawdown_bt}, Daily Loss: {trading_halted_daily_loss_bt}")
+
+        # --- Backtest Max Drawdown Check ---
+        max_dd_config_bt = configs.get('max_drawdown_percent', 0.0)
+        if max_dd_config_bt > 0 and not trading_halted_drawdown_bt and daily_high_equity_bt > 0:
+            drawdown_pct_bt = (daily_high_equity_bt - current_equity_bt) / daily_high_equity_bt * 100
+            if drawdown_pct_bt >= max_dd_config_bt:
+                trading_halted_drawdown_bt = True
+                print(f"[SIM-{backtest_current_time}] !!! MAX DRAWDOWN LIMIT HIT (Backtest) {drawdown_pct_bt:.2f}% >= {max_dd_config_bt:.2f}% !!!")
+                backtest_trade_log.append({
+                    "time": backtest_current_time, "type": "HALT_MAX_DRAWDOWN_BT",
+                    "daily_high_equity_bt": daily_high_equity_bt, "current_equity_bt": current_equity_bt,
+                    "drawdown_pct_bt": drawdown_pct_bt, "limit_pct": max_dd_config_bt
+                })
+                close_all_open_positions_backtest(configs, current_candle_data_map) # Pass map for close prices
+
+        # --- Backtest Daily Stop Loss Check (on realized P&L) ---
+        # This check is based on daily_realized_pnl_bt which is updated when trades close.
+        daily_sl_config_bt = configs.get('daily_stop_loss_percent', 0.0)
+        if daily_sl_config_bt > 0 and not trading_halted_daily_loss_bt and not trading_halted_drawdown_bt and day_start_equity_bt > 0:
+            current_loss_pct_bt = (daily_realized_pnl_bt / day_start_equity_bt) * 100
+            if current_loss_pct_bt <= -daily_sl_config_bt:
+                trading_halted_daily_loss_bt = True
+                print(f"[SIM-{backtest_current_time}] !!! DAILY STOP LOSS LIMIT HIT (Backtest) {current_loss_pct_bt:.2f}% <= -{daily_sl_config_bt:.2f}% !!!")
+                backtest_trade_log.append({
+                    "time": backtest_current_time, "type": "HALT_DAILY_STOP_LOSS_BT",
+                    "daily_realized_pnl_bt": daily_realized_pnl_bt, "day_start_equity_bt": day_start_equity_bt,
+                    "loss_pct_bt": current_loss_pct_bt, "limit_pct": -daily_sl_config_bt,
+                    "reason": "Halting new trades for the day."
+                })
+        # --- End Backtest Daily State and Halt Checks ---
 
         # For each symbol:
         # A. Process pending orders (SL/TP triggers) based on current candle's H/L
