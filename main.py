@@ -618,87 +618,64 @@ def start_command_listener(bot_token, chat_id, last_message):
             await context.bot.send_message(chat_id=chat_id, text=last_message, parse_mode="Markdown")
 
 def start_command_listener(bot_token, chat_id, last_message_content): # Renamed for clarity
-    async def actual_bot_runner():
+    async def actual_bot_runner_async(): # Renamed to indicate it's async
         application = Application.builder().token(bot_token).build()
 
-        async def command3_handler(update, context: ContextTypes.DEFAULT_TYPE):
+        async def command3_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if str(update.effective_chat.id) == str(chat_id):
+                # Make sure last_message_content is accessible here.
+                # It is, due to closure over start_command_listener's scope.
                 await context.bot.send_message(chat_id=chat_id, text=last_message_content, parse_mode="Markdown")
         
         application.add_handler(CommandHandler("command3", command3_handler))
-        application.add_handler(CommandHandler("start", start_handler))
-        application.add_handler(CommandHandler("help", help_handler))
+        application.add_handler(CommandHandler("start", start_handler)) # Assuming start_handler is defined
+        application.add_handler(CommandHandler("help", help_handler))   # Assuming help_handler is defined
 
+        initialized_successfully = False
         try:
             await application.initialize()
+            initialized_successfully = True
             print("Starting Telegram bot polling...")
-            await application.run_polling() # This is the main long-running task
+            # run_polling() is blocking and handles its own loop management when run this way.
+            # It will run until application.stop() is called or an error occurs.
+            await application.run_polling() 
             print("Telegram bot polling stopped.")
+        except telegram.error.TelegramError as te:
+            print(f"TelegramError in actual_bot_runner_async: {te}")
+            traceback.print_exc()
         except Exception as e:
-            print(f"Exception in Telegram actual_bot_runner: {e}")
+            print(f"General exception in Telegram actual_bot_runner_async: {e}")
             traceback.print_exc()
         finally:
-            if application.initialized: # Check if it was initialized before trying to shut down
-                print("Telegram bot: Shutting down application...")
-                await application.shutdown()
-                print("Telegram bot: Application shut down.")
+            if initialized_successfully: # Only try to shutdown if initialize was successful
+                print("Telegram bot: Attempting to shut down application...")
+                try:
+                    await application.shutdown()
+                    print("Telegram bot: Application shut down successfully.")
+                except Exception as e_shutdown:
+                    print(f"Telegram bot: Exception during application shutdown: {e_shutdown}")
+                    traceback.print_exc()
+            else:
+                print("Telegram bot: Application was not initialized successfully, skipping shutdown.")
 
     def thread_starter():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        print(f"Telegram thread: New event loop {loop} created and set for this thread.")
+        # `asyncio.run()` creates a new event loop, runs the coroutine, 
+        # and handles loop closing and setting/resetting the event loop for the thread.
+        print("Telegram thread: Starting actual_bot_runner_async with asyncio.run()...")
         try:
-            print("Telegram thread: Running actual_bot_runner until complete...")
-            loop.run_until_complete(actual_bot_runner())
-            print("Telegram thread: actual_bot_runner finished.")
+            asyncio.run(actual_bot_runner_async())
+            print("Telegram thread: actual_bot_runner_async finished.")
         except Exception as e:
-            print(f"Telegram thread: Exception in thread_starter loop: {e}")
+            # This might catch errors from asyncio.run() itself, though errors within
+            # actual_bot_runner_async should be handled inside it.
+            print(f"Telegram thread: Exception in thread_starter from asyncio.run(): {e}")
             traceback.print_exc()
         finally:
-            try:
-                print("Telegram thread: Attempting to close the event loop...")
-                # Ensure all tasks are cancelled before closing the loop
-                # This is important to prevent "Cannot close a running event loop"
-                # Get all tasks for this loop
-                if not loop.is_closed():
-                    tasks = asyncio.all_tasks(loop=loop)
-                    if tasks:
-                        print(f"Telegram thread: Cancelling {len(tasks)} outstanding tasks...")
-                        for task in tasks:
-                            task.cancel()
-                        # Wait for all tasks to be cancelled
-                        # loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True)) # This can cause issues if loop is already stopping
-                        # A simpler way if run_polling is the main task and it exits gracefully via async with
-                    
-                    # If run_polling was the main task and exited via `async with application`,
-                    # it should have handled its own cleanup.
-                    # The loop might still have some pending system tasks.
-                    # Give a moment for tasks to complete cancellation
-                    if hasattr(loop, "shutdown_asyncgens"): # Python 3.6+
-                         loop.run_until_complete(loop.shutdown_asyncgens())
+            print("Telegram thread: Exiting thread_starter.")
+            # No explicit loop closing needed here, asyncio.run() handles it.
+            # asyncio.set_event_loop(None) is also handled by asyncio.run().
 
-                    if loop.is_running(): # Should not be running if run_until_complete finished
-                        print("Telegram thread: Loop was unexpectedly still running in finally. Stopping.")
-                        loop.stop() # Attempt to stop it
-                    
-                    loop.close()
-                    print("Telegram thread: Event loop closed successfully.")
-                else:
-                    print("Telegram thread: Event loop was already closed.")
-            except RuntimeError as e:
-                print(f"Telegram thread: Runtime error during loop close: {e}")
-                if "Cannot close a running event loop" in str(e) and not loop.is_closed(): # Defensive
-                    print("Telegram thread: Forcing loop stop due to error on close.")
-                    loop.stop()
-                    # Try closing again after stopping, though it might still fail if tasks are stuck
-                    # loop.close() # This might still error
-            except Exception as e_close:
-                print(f"Telegram thread: General error during loop close: {e_close}")
-            finally:
-                asyncio.set_event_loop(None) # Clear the event loop for this thread
-                print("Telegram thread: Thread-local event loop cleared.")
-
-    thread = threading.Thread(target=thread_starter)
+    thread = threading.Thread(target=thread_starter, name="TelegramBotThread") # Added name
     thread.daemon = True
     thread.start()
 
