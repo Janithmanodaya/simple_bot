@@ -612,85 +612,41 @@ def send_telegram_message(bot_token, chat_id, message):
 
     return asyncio.run(_send())
 
-# Removed the first, simpler definition of start_command_listener as it was a duplicate stub.
-# The definition below is the one that is actually used.
+def start_telegram_polling(bot_token: str, app_configs: dict):
+    # Create and set a new event loop for this thread
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
-def start_command_listener(bot_token, chat_id, last_message_content): # Renamed for clarity
-    async def actual_bot_runner_async(): # Renamed to indicate it's async
-        application = Application.builder().token(bot_token).build()
+    # Build the app
+    application = (
+        Application.builder()
+        .token(bot_token)
+        .concurrent_updates(True)    # optional: allow concurrent handler execution
+        .build()
+    )
+    application.bot_data['configs'] = app_configs
 
-        async def command3_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-            if str(update.effective_chat.id) == str(chat_id):
-                # Make sure last_message_content is accessible here.
-                # It is, due to closure over start_command_listener's scope.
-                await context.bot.send_message(chat_id=chat_id, text=last_message_content, parse_mode="Markdown")
-        
-        # Add existing and new command handlers
-        application.add_handler(CommandHandler("start", start_handler))
-        application.add_handler(CommandHandler("help", help_handler))
-        application.add_handler(CommandHandler("command3", command3_handler)) # Example command
+    # Register defined handlers:
+    application.add_handler(CommandHandler("start", start_handler))
+    application.add_handler(CommandHandler("help", help_handler))
+    application.add_handler(CommandHandler("status", status_handler))
+    application.add_handler(CommandHandler("positions", positions_handler))
+    application.add_handler(CommandHandler("orders", orders_handler))
+    application.add_handler(CommandHandler("halt", halt_handler))
+    application.add_handler(CommandHandler("resume", resume_handler))
+    application.add_handler(CommandHandler("closeall", close_all_handler))
+    application.add_handler(CommandHandler("setrisk", set_risk_handler))
+    application.add_handler(CommandHandler("setleverage", set_leverage_handler))
+    application.add_handler(CommandHandler("log", log_handler))
+    application.add_handler(CommandHandler("config", config_handler))
+    application.add_handler(CommandHandler("shutdown", shutdown_handler))
+    # Note: command3_handler is removed as it was tied to the old start_command_listener structure
 
-        application.add_handler(CommandHandler("status", status_handler))
-        application.add_handler(CommandHandler("positions", positions_handler))
-        application.add_handler(CommandHandler("orders", orders_handler))
-        application.add_handler(CommandHandler("halt", halt_handler))
-        application.add_handler(CommandHandler("resume", resume_handler))
-        application.add_handler(CommandHandler("closeall", close_all_handler))
-        application.add_handler(CommandHandler("setrisk", set_risk_handler))
-        application.add_handler(CommandHandler("setleverage", set_leverage_handler))
-        application.add_handler(CommandHandler("log", log_handler))
-        application.add_handler(CommandHandler("config", config_handler)) # For viewing config
-        application.add_handler(CommandHandler("shutdown", shutdown_handler))
-
-        initialized_successfully = False
-        try:
-            await application.initialize()
-            initialized_successfully = True
-            print("Starting Telegram bot polling...")
-            # run_polling() is blocking and handles its own loop management when run this way.
-            # It will run until application.stop() is called or an error occurs.
-            await application.run_polling() 
-            print("Telegram bot polling stopped.")
-        except telegram.error.TelegramError as te:
-            print(f"TelegramError in actual_bot_runner_async: {te}")
-            traceback.print_exc()
-        except Exception as e:
-            print(f"General exception in Telegram actual_bot_runner_async: {e}")
-            traceback.print_exc()
-        finally:
-            if initialized_successfully: # Only try to shutdown if initialize was successful
-                print("Telegram bot: Attempting to shut down application...")
-                try:
-                    await application.shutdown()
-                    print("Telegram bot: Application shut down successfully.")
-                except Exception as e_shutdown:
-                    print(f"Telegram bot: Exception during application shutdown: {e_shutdown}")
-                    traceback.print_exc()
-            else:
-                print("Telegram bot: Application was not initialized successfully, skipping shutdown.")
-
-    def thread_starter():
-        # `asyncio.run()` creates a new event loop, runs the coroutine, 
-        # and handles loop closing and setting/resetting the event loop for the thread.
-        print("Telegram thread: Starting actual_bot_runner_async with asyncio.run()...")
-        try:
-            asyncio.run(actual_bot_runner_async())
-            print("Telegram thread: actual_bot_runner_async finished.")
-        except Exception as e:
-            # This might catch errors from asyncio.run() itself, though errors within
-            # actual_bot_runner_async should be handled inside it.
-            print(f"Telegram thread: Exception in thread_starter from asyncio.run(): {e}")
-            traceback.print_exc()
-        finally:
-            print("Telegram thread: Exiting thread_starter.")
-            # No explicit loop closing needed here, asyncio.run() handles it.
-            # asyncio.set_event_loop(None) is also handled by asyncio.run().
-
-    thread = threading.Thread(target=thread_starter, name="TelegramBotThread") # Added name
-    thread.daemon = True
-    thread.start()
-    print("start_command_listener: Telegram thread kicked off.") # Added debug line
-
+    print("Telegram ▶ run_polling() starting…")
+    # Initialize and run polling within this function
+    # application.initialize() # Included in ApplicationBuilder with .build()
+    application.run_polling()       # blocks here, polling updates forever
+    print("Telegram ▶ run_polling() exited.")
 
 # --- Telegram Notification for Trade Rejection ---
 def send_trade_rejection_notification(symbol, signal_type, reason, entry_price, sl_price, tp_price, quantity, symbol_info, configs):
@@ -3314,8 +3270,15 @@ def main():
         send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], startup_msg)
         configs["last_startup_message"] = startup_msg
 
-        # Start /command3 listener
-        start_command_listener(configs["telegram_bot_token"], configs["telegram_chat_id"], startup_msg)
+        # Start Telegram polling in a new daemon thread
+        thread = threading.Thread(
+            target=start_telegram_polling,
+            args=(configs["telegram_bot_token"], configs),
+            name="TelegramPollingThread",
+            daemon=True
+        )
+        thread.start()
+        print("Main ▶ Telegram polling thread started.")
 
     else:
         print("Telegram notifications disabled (token or chat_id not configured in keys.py or load failed).")
@@ -4963,31 +4926,28 @@ trading_halted_manual = False     # Flag for manual trading halt from Telegram c
 # --- Telegram Command Handlers ---
 
 async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global client, configs, active_trades, active_trades_lock # Removed current_balance from globals here
+    global client, active_trades, active_trades_lock # Removed configs
     global trading_halted_drawdown, trading_halted_daily_loss, trading_halted_manual
     
+    app_configs = context.bot_data.get('configs', {})
     effective_chat_id = str(update.effective_chat.id)
-    # Ensure chat_id is available in configs for comparison
-    expected_chat_id = str(configs.get("telegram_chat_id"))
+    expected_chat_id = str(app_configs.get("telegram_chat_id"))
     if not expected_chat_id:
-        print("Error: telegram_chat_id not found in configs for status_handler.")
+        print("Error: telegram_chat_id not found in app_configs for status_handler.")
         await update.message.reply_text("Bot configuration error: Admin chat ID not set.", parse_mode="Markdown")
         return
     if effective_chat_id != expected_chat_id:
         print(f"Status request from unauthorized chat ID: {effective_chat_id}")
         return
 
-    # Fetch fresh balance for status to ensure accuracy
-    balance_for_status = get_account_balance(client, configs) 
-    if balance_for_status is None: # Indicates a critical error from get_account_balance
+    balance_for_status = get_account_balance(client, app_configs) 
+    if balance_for_status is None:
         await update.message.reply_text("Error: Could not fetch current balance. API connection issue likely.", parse_mode="Markdown")
         return
     
-    # Update global current_balance if needed, or rely on manage_daily_state to do so.
-    # For this handler, using the freshly fetched balance_for_status is best.
-    current_balance = balance_for_status # Update global for consistency if other parts rely on it
+    current_balance = balance_for_status 
 
-    equity = get_current_equity(client, configs, balance_for_status, active_trades, active_trades_lock)
+    equity = get_current_equity(client, app_configs, balance_for_status, active_trades, active_trades_lock)
     if equity is None:
         await update.message.reply_text("Error: Could not calculate current equity.", parse_mode="Markdown")
         return
@@ -5008,9 +4968,10 @@ async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(status_text, parse_mode="Markdown")
 
 async def positions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global client, configs, active_trades, active_trades_lock
+    global client, active_trades, active_trades_lock # Removed configs
+    app_configs = context.bot_data.get('configs', {})
     effective_chat_id = str(update.effective_chat.id)
-    expected_chat_id = str(configs.get("telegram_chat_id"))
+    expected_chat_id = str(app_configs.get("telegram_chat_id"))
     if effective_chat_id != expected_chat_id: return
 
     s_info_map = {}
@@ -5023,9 +4984,10 @@ async def positions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"*Open Positions:*\n{positions_text}", parse_mode="Markdown")
 
 async def orders_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global client, configs
+    global client # Removed configs
+    app_configs = context.bot_data.get('configs', {})
     effective_chat_id = str(update.effective_chat.id)
-    expected_chat_id = str(configs.get("telegram_chat_id"))
+    expected_chat_id = str(app_configs.get("telegram_chat_id"))
     if effective_chat_id != expected_chat_id: return
 
     open_orders = get_open_orders(client) 
@@ -5035,12 +4997,7 @@ async def orders_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     orders_texts = ["*Open Orders:*"]
     for o in open_orders:
-        # Assuming symbol_info is not readily available here to get exact pricePrecision for each order.
-        # Using a general precision or fetching it would be an enhancement. For now, default.
-        price_prec = 2 # Default
-        # symbol_specific_info = get_symbol_info(client, o['symbol']) # Too slow to do for each order in handler
-        # if symbol_specific_info: price_prec = int(symbol_specific_info.get('pricePrecision', 2))
-
+        price_prec = 2 
         price_str = f"{float(o['price']):.{price_prec}f}" if o['type'] != 'MARKET' else 'MARKET'
         stop_price_str = f"{float(o.get('stopPrice',0)):.{price_prec}f}" if o.get('stopPrice') and float(o.get('stopPrice',0)) > 0 else "N/A"
         orders_texts.append(
@@ -5049,9 +5006,10 @@ async def orders_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(orders_texts), parse_mode="Markdown")
 
 async def halt_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global trading_halted_manual, configs
+    global trading_halted_manual # Removed configs
+    app_configs = context.bot_data.get('configs', {})
     effective_chat_id = str(update.effective_chat.id)
-    expected_chat_id = str(configs.get("telegram_chat_id"))
+    expected_chat_id = str(app_configs.get("telegram_chat_id"))
     if effective_chat_id != expected_chat_id: return
     
     trading_halted_manual = True
@@ -5060,9 +5018,10 @@ async def halt_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🛑 {message}", parse_mode="Markdown")
 
 async def resume_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global trading_halted_manual, configs
+    global trading_halted_manual # Removed configs
+    app_configs = context.bot_data.get('configs', {})
     effective_chat_id = str(update.effective_chat.id)
-    expected_chat_id = str(configs.get("telegram_chat_id"))
+    expected_chat_id = str(app_configs.get("telegram_chat_id"))
     if effective_chat_id != expected_chat_id: return
 
     trading_halted_manual = False
@@ -5071,15 +5030,15 @@ async def resume_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ {message}", parse_mode="Markdown")
 
 async def close_all_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global client, configs, active_trades, active_trades_lock
+    global client, active_trades, active_trades_lock # Removed configs
+    app_configs = context.bot_data.get('configs', {})
     effective_chat_id = str(update.effective_chat.id)
-    expected_chat_id = str(configs.get("telegram_chat_id"))
+    expected_chat_id = str(app_configs.get("telegram_chat_id"))
     if effective_chat_id != expected_chat_id: return
 
     await update.message.reply_text("Attempting to close all active positions...", parse_mode="Markdown")
     try:
-        # Run synchronous function in a separate thread to avoid blocking asyncio event loop
-        await asyncio.to_thread(close_all_open_positions, client, configs, active_trades, active_trades_lock)
+        await asyncio.to_thread(close_all_open_positions, client, app_configs, active_trades, active_trades_lock)
         await update.message.reply_text("All positions closure process initiated. Check logs for details.", parse_mode="Markdown")
     except Exception as e:
         detailed_error = f"Error during close_all_positions: {e}\n{traceback.format_exc()}"
@@ -5088,9 +5047,10 @@ async def close_all_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def set_risk_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global configs, config_filepath
+    global config_filepath # Removed configs
+    app_configs = context.bot_data.get('configs', {})
     effective_chat_id = str(update.effective_chat.id)
-    expected_chat_id = str(configs.get("telegram_chat_id"))
+    expected_chat_id = str(app_configs.get("telegram_chat_id"))
     if effective_chat_id != expected_chat_id: return
 
     try:
@@ -5100,12 +5060,11 @@ async def set_risk_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         risk_str = context.args[0]
         new_risk_percent_val = float(risk_str)
 
-        if 0 < new_risk_percent_val <= 100: # User inputs as percentage e.g., 1 for 1%
-            old_risk = configs.get('risk_percent', 0.01) * 100.0 # Default to 0.01 if not found, then *100
-            configs['risk_percent'] = new_risk_percent_val / 100.0 # Store as decimal
+        if 0 < new_risk_percent_val <= 100: 
+            old_risk = app_configs.get('risk_percent', 0.01) * 100.0 
+            app_configs['risk_percent'] = new_risk_percent_val / 100.0 
             
-            configs_to_save = configs.copy()
-            # Remove sensitive keys before saving
+            configs_to_save = app_configs.copy()
             for k_sens in ["api_key", "api_secret", "telegram_bot_token", "telegram_chat_id", "last_startup_message", "cycle_start_time_ref"]:
                 configs_to_save.pop(k_sens, None)
             
@@ -5125,9 +5084,10 @@ async def set_risk_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def set_leverage_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global configs, config_filepath
+    global config_filepath # Removed configs
+    app_configs = context.bot_data.get('configs', {})
     effective_chat_id = str(update.effective_chat.id)
-    expected_chat_id = str(configs.get("telegram_chat_id"))
+    expected_chat_id = str(app_configs.get("telegram_chat_id"))
     if effective_chat_id != expected_chat_id: return
 
     try:
@@ -5137,11 +5097,11 @@ async def set_leverage_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         leverage_str = context.args[0]
         new_leverage = int(leverage_str)
 
-        if 1 <= new_leverage <= 125: # Binance typical limits
-            old_leverage = configs.get('leverage', 20) # Default to 20 if not found
-            configs['leverage'] = new_leverage
+        if 1 <= new_leverage <= 125: 
+            old_leverage = app_configs.get('leverage', 20) 
+            app_configs['leverage'] = new_leverage
             
-            configs_to_save = configs.copy()
+            configs_to_save = app_configs.copy()
             for k_sens in ["api_key", "api_secret", "telegram_bot_token", "telegram_chat_id", "last_startup_message", "cycle_start_time_ref"]:
                 configs_to_save.pop(k_sens, None)
 
@@ -5161,14 +5121,13 @@ async def set_leverage_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(f"An error occurred: {e}", parse_mode="Markdown")
 
 async def log_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global configs
+    # global configs # Removed configs
+    app_configs = context.bot_data.get('configs', {})
     effective_chat_id = str(update.effective_chat.id)
-    expected_chat_id = str(configs.get("telegram_chat_id"))
+    expected_chat_id = str(app_configs.get("telegram_chat_id"))
     if effective_chat_id != expected_chat_id: return
 
-    last_startup_msg = configs.get("last_startup_message", "No recent status summary available.")
-    # In a real scenario, you might fetch last N lines from a log file.
-    # For now, we'll show a placeholder or the last status summary.
+    last_startup_msg = app_configs.get("last_startup_message", "No recent status summary available.")
     log_text = (
         f"📜 *Bot Log/Status Summary*\n\n"
         f"Recent Status Snapshot:\n{last_startup_msg}\n\n"
@@ -5177,19 +5136,20 @@ async def log_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(log_text, parse_mode="Markdown")
 
 async def config_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global configs
+    # global configs # Removed configs
+    app_configs = context.bot_data.get('configs', {})
     effective_chat_id = str(update.effective_chat.id)
-    expected_chat_id = str(configs.get("telegram_chat_id"))
+    expected_chat_id = str(app_configs.get("telegram_chat_id"))
     if effective_chat_id != expected_chat_id: return
 
     config_texts = ["⚙️ *Current Bot Configuration:*"]
-    excluded_keys = ["api_key", "api_secret", "telegram_bot_token", "telegram_chat_id", "last_startup_message", "cycle_start_time_ref", "strategy_id", "strategy_name"] # Also exclude fixed strategy details
+    excluded_keys = ["api_key", "api_secret", "telegram_bot_token", "telegram_chat_id", "last_startup_message", "cycle_start_time_ref", "strategy_id", "strategy_name"] 
     
-    sorted_config_keys = sorted(configs.keys())
+    sorted_config_keys = sorted(app_configs.keys())
 
     for key in sorted_config_keys:
         if key not in excluded_keys:
-            value = configs[key]
+            value = app_configs[key]
             if key == "risk_percent": value_str = f"{value * 100:.2f}%"
             elif key == "portfolio_risk_cap": value_str = f"{value:.2f}%"
             elif key == "max_drawdown_percent": value_str = f"{value:.2f}%"
@@ -5217,9 +5177,10 @@ async def config_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(part, parse_mode="Markdown")
 
 async def shutdown_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global bot_shutdown_requested, configs
+    global bot_shutdown_requested # Removed configs
+    app_configs = context.bot_data.get('configs', {})
     effective_chat_id = str(update.effective_chat.id)
-    expected_chat_id = str(configs.get("telegram_chat_id"))
+    expected_chat_id = str(app_configs.get("telegram_chat_id"))
     if effective_chat_id != expected_chat_id: return
 
     bot_shutdown_requested = True
