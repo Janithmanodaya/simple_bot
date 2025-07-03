@@ -640,7 +640,9 @@ def start_telegram_polling(bot_token: str, app_configs: dict):
     application.add_handler(CommandHandler("log", log_handler))
     application.add_handler(CommandHandler("config", config_handler))
     application.add_handler(CommandHandler("shutdown", shutdown_handler))
-    application.add_handler(CommandHandler("blacklist", blacklist_handler)) # New blacklist command
+    application.add_handler(CommandHandler("blacklist", blacklist_handler)) 
+    application.add_handler(CommandHandler("restart", restart_handler)) 
+    application.add_handler(CommandHandler("set", set_handler)) # Updated command to /set and handler to set_handler
     # Note: command3_handler is removed as it was tied to the old start_command_listener structure
 
     print("Telegram ▶ run_polling() starting…")
@@ -682,11 +684,12 @@ def send_trade_rejection_notification(symbol, signal_type, reason, entry_price, 
     send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], message)
 
 
-def get_user_configurations():
+def get_user_configurations(load_choice_override: str = None, make_changes_override: str = None):
     """
     Prompts the user for various trading configurations and returns them as a dictionary.
     Includes input validation for each configuration item.
     Allows loading from or saving to 'configure.csv'.
+    Overrides for initial prompts can be passed for automated setup.
     """
     print("\n--- Strategy Configuration ---")
     configs = {}
@@ -696,8 +699,14 @@ def get_user_configurations():
 
     # Ask user if they want to load from CSV or do custom setup
     while True:
-        load_choice = input(f"Load from '{config_filepath}' (L) or Custom Setup (C)? [L]: ").strip().lower()
-        if not load_choice or load_choice == 'l':
+        actual_load_choice = None
+        if load_choice_override and load_choice_override.lower() in ['l', 'c']:
+            actual_load_choice = load_choice_override.lower()
+            print(f"Using pre-set load choice: '{actual_load_choice}' ('L' for Load, 'C' for Custom).")
+        else:
+            actual_load_choice = input(f"Load from '{config_filepath}' (L) or Custom Setup (C)? [L]: ").strip().lower()
+
+        if not actual_load_choice or actual_load_choice == 'l':
             loaded_configs_from_csv = load_configuration_from_csv(config_filepath)
             if loaded_configs_from_csv:
                 is_valid, validation_msg, validated_configs_csv = validate_configurations(loaded_configs_from_csv)
@@ -706,8 +715,14 @@ def get_user_configurations():
                     for k, v in validated_configs_csv.items(): print(f"  {k}: {v}")
                     
                     while True:
-                        change_choice = input("Make changes to these settings? (y/N) [N]: ").strip().lower()
-                        if not change_choice or change_choice == 'n':
+                        actual_make_changes_choice = None
+                        if make_changes_override and make_changes_override.lower() in ['y', 'n']:
+                            actual_make_changes_choice = make_changes_override.lower()
+                            print(f"Using pre-set make changes choice: '{actual_make_changes_choice}'.")
+                        else:
+                            actual_make_changes_choice = input("Make changes to these settings? (y/N) [N]: ").strip().lower()
+
+                        if not actual_make_changes_choice or actual_make_changes_choice == 'n':
                             configs = validated_configs_csv # Use loaded and validated configs
                             # Ensure API keys are loaded based on the environment from CSV
                             if "environment" in configs:
@@ -728,10 +743,10 @@ def get_user_configurations():
                             configs["max_scan_threads"] = 5 # Fixed value
                             print("--- Configuration Complete (Loaded from CSV) ---")
                             return configs
-                        elif change_choice == 'y':
+                        elif actual_make_changes_choice == 'y': # Corrected variable name here
                             configs = validated_configs_csv # Start custom setup with these values
                             proceed_to_custom_setup = True
-                            break # Break from change_choice loop
+                            break # Break from this inner while True loop
                         else:
                             print("Invalid choice. Please enter 'y' or 'n'.")
                     if proceed_to_custom_setup: break # Break from load_choice loop to go to custom setup
@@ -743,7 +758,7 @@ def get_user_configurations():
                 print(f"'{config_filepath}' not found or empty/corrupted. Proceeding to custom setup.")
                 proceed_to_custom_setup = True
                 break # Break from load_choice loop
-        elif load_choice == 'c':
+        elif actual_load_choice == 'c': # Corrected variable name here
             proceed_to_custom_setup = True
             break # Break from load_choice loop
         else:
@@ -2999,13 +3014,18 @@ def trading_loop(client, configs, monitored_symbols):
     
     try:
         while True:
-            global bot_shutdown_requested
+            global bot_shutdown_requested, bot_restart_requested # Added bot_restart_requested
             if bot_shutdown_requested:
                 print("Shutdown requested via Telegram command. Exiting trading loop...")
-                # Send a message to Telegram confirming shutdown initiation from loop
                 if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
                      send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], "ℹ️ Bot is shutting down now as requested...")
                 break # Exit the trading loop
+            
+            if bot_restart_requested:
+                print("Restart requested via Telegram command. Exiting trading loop for restart...")
+                if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+                    send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], "⏳ Bot is preparing to restart...")
+                break # Exit the trading loop to allow main to handle restart
 
             current_cycle_number += 1
             cycle_start_time = time.time()
@@ -3232,12 +3252,50 @@ def trading_loop(client, configs, monitored_symbols):
 
 
 # --- Main Execution ---
-def main():
+
+def reset_global_states_for_restart():
+    """Resets critical global states before a bot restart."""
+    global daily_high_equity, day_start_equity, last_trading_day
+    global trading_halted_drawdown, trading_halted_daily_loss, daily_realized_pnl
+    global symbols_currently_processing, last_signal_time, recent_trade_signatures
+    global active_trades, active_trades_lock # Ensure active_trades is cleared too
+
+    print("Resetting global states for bot restart...")
+
+    daily_high_equity = 0.0
+    day_start_equity = 0.0
+    last_trading_day = None
+    trading_halted_drawdown = False
+    trading_halted_daily_loss = False
+    daily_realized_pnl = 0.0
+    
+    symbols_currently_processing.clear()
+    last_signal_time.clear()
+    recent_trade_signatures.clear()
+    
+    with active_trades_lock:
+        active_trades.clear()
+    
+    print("Global states reset complete for restart.")
+
+def main_bot_logic(): # Renamed main to main_bot_logic
+    global telegram_load_choice, telegram_make_changes_choice # Access globals
+
     print("Initializing Binance Trading Bot - Advance EMA Cross Strategy (ID: 8)")
     bot_start_time_utc = pd.Timestamp.now(tz='UTC')
     bot_start_time_str = bot_start_time_utc.strftime('%Y-%m-%d %H:%M:%S %Z')
     
-    configs = get_user_configurations()
+    # Pass Telegram override choices to get_user_configurations
+    configs = get_user_configurations(
+        load_choice_override=telegram_load_choice,
+        make_changes_override=telegram_make_changes_choice
+    )
+    
+    # Reset global override choices after they've been used for this startup sequence
+    telegram_load_choice = None
+    telegram_make_changes_choice = None
+    print("Telegram configuration choice overrides have been applied and reset for the next startup.")
+
     print("\nLoaded Configurations:")
     for k, v in configs.items(): 
         if k not in ["api_key", "api_secret", "telegram_bot_token", "telegram_chat_id"]: # Hide sensitive keys
@@ -3419,6 +3477,7 @@ def main():
         
             active_trades.clear() # Clear trades for a clean slate if re-run or for reporting
             print("Backtest shutdown sequence complete.")
+    return configs # Return configs at the end of the function
 
 
 # --- SL/TP Safety Net Function ---
@@ -4992,7 +5051,12 @@ client = None
 
 config_filepath = "configure.csv" # Path to the configuration CSV file, used by handlers
 bot_shutdown_requested = False    # Flag to signal graceful shutdown from Telegram command
+bot_restart_requested = False     # Flag to signal graceful restart from Telegram command
 trading_halted_manual = False     # Flag for manual trading halt from Telegram command
+
+# Global variables for Telegram-driven configuration choices (will be set by a Telegram command)
+telegram_load_choice: str = None
+telegram_make_changes_choice: str = None
 
 # --- Telegram Command Handlers ---
 
@@ -5319,6 +5383,138 @@ async def blacklist_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await update.message.reply_text("\n".join(reply_messages), parse_mode="Markdown")
 
+async def restart_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the /restart command to gracefully restart the bot."""
+    app_configs = context.bot_data.get('configs', {})
+    effective_chat_id = str(update.effective_chat.id)
+    expected_chat_id = str(app_configs.get("telegram_chat_id"))
+
+    if effective_chat_id != expected_chat_id:
+        print(f"Restart command from unauthorized chat ID: {effective_chat_id}")
+        return
+
+    global bot_restart_requested, bot_shutdown_requested
+    bot_restart_requested = True
+    bot_shutdown_requested = False # Ensure restart takes precedence
+
+    message = "Restart request received. The bot will restart after the current trading cycle completes."
+    print(message)
+    await update.message.reply_text(f"⏳ {message}", parse_mode="Markdown")
+
+async def set_handler(update: Update, context: ContextTypes.DEFAULT_TYPE): # Renamed function
+    """Sets global choices for get_user_configurations via Telegram command /set <L_or_C> [Y_or_N]."""
+    global telegram_load_choice, telegram_make_changes_choice
+    
+    app_configs = context.bot_data.get('configs', {}) # For admin check
+    effective_chat_id = str(update.effective_chat.id)
+    expected_chat_id = str(app_configs.get("telegram_chat_id"))
+
+    if effective_chat_id != expected_chat_id:
+        print(f"setconfigchoice command from unauthorized chat ID: {effective_chat_id}")
+        return
+
+    args = context.args
+    reply_message = ""
+
+    if not args or len(args) == 0:
+        reply_message = "Usage: `/set <L_or_C> [Y_or_N]`\n" \
+                        "Sets initial configuration load choices.\n" \
+                        "L/C: Load from CSV (L) or Custom setup (C).\n" \
+                        "Y/N (optional): Yes/No to making changes after CSV load.\n\n" \
+                        "Example 1: `/set L N` (Load from CSV, No changes)\n" \
+                        "Example 2: `/set C` (Custom setup, Y/N for changes is not applicable here)"
+        await update.message.reply_text(reply_message, parse_mode="Markdown")
+        return
+
+    load_arg = args[0].lower()
+    if load_arg in ['l', 'c']:
+        telegram_load_choice = load_arg
+        reply_message += f"Initial config load choice pre-set to: '{telegram_load_choice.upper()}'."
+    else:
+        reply_message += f"Invalid first argument '{args[0]}'. Must be 'L' or 'C'.\n" \
+                         "Usage: `/set <L_or_C> [Y_or_N]`"
+        await update.message.reply_text(reply_message, parse_mode="Markdown")
+        return
+
+    if load_arg == 'l': # Only process second argument if first was 'L'
+        if len(args) > 1:
+            make_changes_arg = args[1].lower()
+            if make_changes_arg in ['y', 'n']:
+                telegram_make_changes_choice = make_changes_arg
+                reply_message += f"\nMake changes after CSV load choice pre-set to: '{telegram_make_changes_choice.upper()}'."
+            else:
+                reply_message += f"\nInvalid second argument '{args[1]}' for 'L' choice. Must be 'Y' or 'N'. 'Make changes' choice not set."
+                # telegram_make_changes_choice remains as is (or None if not set before)
+        else:
+            # If only 'L' is given, reset make_changes_choice to prompt user or use default
+            telegram_make_changes_choice = None 
+            reply_message += "\n'Make changes after CSV load' choice not specified (will use default 'N' or prompt if applicable)."
+    elif load_arg == 'c':
+        # For 'C' (Custom setup), the second argument Y/N is not applicable. Reset it.
+        telegram_make_changes_choice = None
+        if len(args) > 1:
+            reply_message += "\n(Note: Second argument Y/N is ignored for 'C'ustom setup choice)."
+
+
+    reply_message += "\n\nThese settings will be used on the next bot startup or full restart."
+    print(f"Telegram config choices set: Load='{telegram_load_choice}', Changes='{telegram_make_changes_choice}'")
+    await update.message.reply_text(reply_message, parse_mode="Markdown")
+
 
 if __name__ == "__main__":
-    main()
+    # These globals are directly managed by the main loop or its direct conditions
+    #global bot_shutdown_requested, bot_restart_requested, client 
+    # Other globals like daily_high_equity etc., are modified by functions called from main_bot_logic
+    # or by the new reset_global_states_for_restart function.
+
+    returned_configs = None # Initialize to ensure it exists for the first Telegram message if restart happens early
+
+    while True:
+        active_trades.clear() # Clear active trades at the beginning of each potential run/restart
+        
+        # If this isn't the first iteration (i.e., it's a restart), client might already exist.
+        # main_bot_logic is responsible for initializing/re-initializing it.
+        # If client becomes None due to an error in main_bot_logic, restart might be problematic
+        # for pre-restart order cancellation. This is a complex edge case.
+        # For now, assume main_bot_logic sets client correctly or exits.
+
+        returned_configs = main_bot_logic() # Call the main operational logic
+
+        if bot_restart_requested:
+            print("Bot restart sequence initiated...")
+            
+            # Attempt to cancel any outstanding orders from the previous run if client is available
+            if client: # Check if client was successfully initialized in the previous run
+                print("Performing pre-restart order cancellation check (if any trades still marked active by bot)...")
+                with active_trades_lock: 
+                    # active_trades should ideally be empty here if trading_loop exited cleanly,
+                    # but this is a fallback.
+                    for symbol, trade_details in list(active_trades.items()):
+                        for oid_key in ['sl_order_id', 'tp_order_id']:
+                            oid = trade_details.get(oid_key)
+                            if oid:
+                                try:
+                                    print(f"Pre-restart: Attempting to cancel {oid_key} {oid} for {symbol}...")
+                                    client.futures_cancel_order(symbol=symbol, orderId=oid)
+                                except Exception as e_c:
+                                    print(f"Pre-restart: Failed to cancel {oid_key} {oid} for {symbol}: {e_c}")
+            active_trades.clear() # Ensure it's cleared again after attempted cancellations
+
+            reset_global_states_for_restart() # Call the centralized reset function
+
+            bot_restart_requested = False 
+            bot_shutdown_requested = False # Ensure restart overrides shutdown for the next loop
+
+            print("Global states have been reset. Restarting in 5 seconds...")
+            
+            # Use returned_configs from the *just completed* run of main_bot_logic for the notification
+            if returned_configs and returned_configs.get("telegram_bot_token") and returned_configs.get("telegram_chat_id"):
+                 send_telegram_message(returned_configs["telegram_bot_token"], returned_configs["telegram_chat_id"], "✅ Bot has shut down current operations and is restarting now...")
+            else:
+                print("Telegram details not available from the last run's configs for restart message.")
+            
+            time.sleep(5) 
+            continue 
+        else:
+            print("Bot shutdown sequence complete (not a restart request, or error during execution). Exiting script.")
+            break
