@@ -54,9 +54,20 @@ active_trades_lock = threading.Lock() # Lock for synchronizing access to active_
 
 # Set to keep track of symbols currently being processed by manage_trade_entry to prevent race conditions.
 import datetime # Added for last_trading_day
+from datetime import datetime as dt # Alias for ease of use if datetime.datetime is needed alongside datetime.date
 
 symbols_currently_processing = set()
 symbols_currently_processing_lock = threading.Lock()
+
+# Globals for Cooldown Timer
+last_signal_time = {}
+last_signal_lock = threading.Lock()
+
+# Globals for Trade Signature Check
+recent_trade_signatures = {} # Stores trade_signature: timestamp
+recent_trade_signatures_lock = threading.Lock()
+recent_trade_signature_cleanup_interval = 60 # seconds, how often to check for cleanup
+last_signature_cleanup_time = dt.now() # Initialize last cleanup time
 
 # Daily performance and halt status variables
 daily_high_equity = 0.0
@@ -1922,6 +1933,42 @@ def calculate_position_size(balance, risk_pct, entry, sl, symbol_info, configs=N
     print(f"Calculated Position Size: {adj_size} for {symbol_info['symbol']} (Risk: ${(adj_size*abs(entry-sl)):.2f}, Notional: ${(adj_size*entry):.2f})")
     return adj_size
 
+# --- Trade Signature and Cleanup ---
+def generate_trade_signature(symbol: str, signal_type: str, entry_price: float, sl_price: float, tp_price: float, quantity: float, precision: int = 4) -> str:
+    """Generates a unique signature for a trade to prevent duplicates."""
+    # Round prices and quantity to a consistent precision to avoid minor float differences causing new signatures.
+    # The precision should be reasonable for the asset.
+    return f"{symbol}_{signal_type}_{entry_price:.{precision}f}_{sl_price:.{precision}f}_{tp_price:.{precision}f}_{quantity:.{precision}f}"
+
+def cleanup_recent_trade_signatures():
+    """Cleans up old trade signatures to prevent memory bloat."""
+    global recent_trade_signatures, recent_trade_signatures_lock, last_signature_cleanup_time, recent_trade_signature_cleanup_interval
+    
+    now = dt.now()
+    # Check if it's time to cleanup
+    if (now - last_signature_cleanup_time).total_seconds() < recent_trade_signature_cleanup_interval:
+        return
+
+    with recent_trade_signatures_lock:
+        last_signature_cleanup_time = now # Update last cleanup time inside lock
+        
+        signatures_to_delete = []
+        # Check each signature's timestamp (stored as value in recent_trade_signatures)
+        # Let's define that signatures are kept for, e.g., 2 minutes (120 seconds)
+        # This is longer than the cooldown to catch rapid retries that might bypass cooldown if it's very short.
+        # Or, make it configurable. For now, 120s.
+        max_signature_age_seconds = 120 
+        
+        for sig, timestamp in recent_trade_signatures.items():
+            if (now - timestamp).total_seconds() > max_signature_age_seconds:
+                signatures_to_delete.append(sig)
+        
+        for sig in signatures_to_delete:
+            del recent_trade_signatures[sig]
+            
+        if signatures_to_delete:
+            print(f"Cleaned up {len(signatures_to_delete)} old trade signatures. {len(recent_trade_signatures)} remain.")
+
 # --- Pre-Order Sanity Checks ---
 def pre_order_sanity_checks(symbol, signal, entry_price, sl_price, tp_price, quantity, 
                             symbol_info, current_balance, risk_percent_config, configs, 
@@ -2108,10 +2155,15 @@ def process_symbol_task(symbol, client, configs, lock):
 def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is active_trades_lock
     global active_trades, symbols_currently_processing, symbols_currently_processing_lock
     global trading_halted_drawdown, trading_halted_daily_loss, daily_state_lock # For checking halt status
+    global last_signal_time, last_signal_lock # For Cooldown Timer
+    global recent_trade_signatures, recent_trade_signatures_lock # For Trade Signature Check
 
     log_prefix = f"[{threading.current_thread().name}] {symbol} manage_trade_entry:"
 
-    # --- Check overall trading halt status ---
+    # --- Cleanup old trade signatures (periodically) ---
+    cleanup_recent_trade_signatures()
+
+    # --- Check 1: Overall trading halt status (Daily Drawdown / Daily Loss) ---
     with daily_state_lock:
         if trading_halted_drawdown:
             print(f"{log_prefix} Trade entry BLOCKED for {symbol}. Reason: Max Drawdown trading halt is active.")
@@ -2122,13 +2174,11 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is
     # --- End trading halt status check ---
 
     # Attempt to mark this symbol as being processed by this thread.
-    # If another thread has already marked it, this thread will skip.
     with symbols_currently_processing_lock:
         if symbol in symbols_currently_processing:
             print(f"{log_prefix} Symbol is already being processed by another thread. Skipping this instance.")
             return
         symbols_currently_processing.add(symbol)
-        # print(f"{log_prefix} Acquired processing rights for symbol.") # Less verbose
 
     try:
         # --- All subsequent logic is now within this try block ---
@@ -2138,89 +2188,105 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is
             print(f"{log_prefix} Insufficient kline data ({len(klines_df)}). Aborting.")
             return
 
-        # --- ACTIVE TRADE AND OPEN ORDERS CHECK ---
-        # Check 1: Is there already an active trade managed by the bot for this symbol?
+        # --- Generate trading signal based on strategy (EMAs, etc.) ---
+        # This part calculates EMAs and determines if a raw signal exists.
+        # It does not yet consider cooldowns or other pre-trade checks.
+        klines_df_copy = klines_df.copy() # Work on a copy to avoid modifying original DataFrame if passed around
+        klines_df_copy['EMA100'] = calculate_ema(klines_df_copy, 100)
+        klines_df_copy['EMA200'] = calculate_ema(klines_df_copy, 200)
+
+        if klines_df_copy['EMA100'] is None or klines_df_copy['EMA200'] is None or \
+           klines_df_copy['EMA100'].isnull().all() or klines_df_copy['EMA200'].isnull().all() or \
+           len(klines_df_copy) < 202: 
+            print(f"{log_prefix} EMA calculation failed or insufficient data for signal generation. Aborting.")
+            return
+
+        raw_signal = check_ema_crossover_conditions(klines_df_copy, symbol_for_logging=symbol)
+        if raw_signal not in ["LONG", "SHORT"]:
+            if isinstance(raw_signal, str): # If it's a reason string like "VALIDATION_FAILED"
+                 print(f"{log_prefix} No actionable raw signal for {symbol}. Reason: {raw_signal}")
+            return # No valid raw signal from strategy
+        
+        # --- Pre-Trade Checks (Order is important) ---
+
+        # Check 2: Cooldown Timer
+        with last_signal_lock:
+            cooldown_seconds = configs.get("signal_cooldown_seconds", 30) # Default 30s, make configurable if needed
+            if symbol in last_signal_time and (dt.now() - last_signal_time[symbol]).total_seconds() < cooldown_seconds:
+                print(f"{log_prefix} New signal ({raw_signal}) processing SKIPPED for {symbol}. Cooldown active ({cooldown_seconds}s). Last signal: {last_signal_time[symbol]}")
+                return
+            # No need to update last_signal_time[symbol] here yet, do it only if all checks pass and trade is attempted.
+
+        # Check 3: Bot-Managed Active Trade
         with lock: # active_trades_lock
             if symbol in active_trades:
                 active_trade_details = active_trades[symbol]
-                print(f"{log_prefix} New signal processing SKIPPED. Symbol '{symbol}' already has an active '{active_trade_details.get('side')}' trade @ {active_trade_details.get('entry_price')}.")
-                # Optionally, verify SL/TP status here if needed, but for now, just skip.
-                return # Skip new trade entry
+                print(f"{log_prefix} New signal ({raw_signal}) processing SKIPPED. Symbol '{symbol}' already has an active '{active_trade_details.get('side')}' trade @ {active_trade_details.get('entry_price')}.")
+                return
 
-        # Check 2: Are there any open orders on Binance for this symbol?
-        # This helps prevent duplicate trades if, for example, a limit order from a previous attempt is still pending.
+        # Check 4: Binance Live Position Check (for this specific symbol)
+        try:
+            position_info_list = client.futures_position_information(symbol=symbol)
+            if position_info_list and isinstance(position_info_list, list):
+                # The API returns a list, usually with one item for the symbol if queried directly.
+                # If multiple (e.g. for HEDGE mode, though strategy assumes one-way), this needs more complex handling.
+                # For now, assume the first entry is the relevant one for one-way mode.
+                pos_data = position_info_list[0] if position_info_list else None
+                if pos_data and float(pos_data.get('positionAmt', 0.0)) != 0:
+                    print(f"{log_prefix} New signal ({raw_signal}) processing SKIPPED. Symbol '{symbol}' already has an open position on Binance. Amount: {pos_data.get('positionAmt')}.")
+                    # This implies a desync or manually opened position. Bot should not interfere.
+                    return
+        except BinanceAPIException as e:
+            print(f"{log_prefix} API Error checking live position for {symbol}: {e}. Proceeding cautiously.")
+        except Exception as e:
+            print(f"{log_prefix} Unexpected error checking live position for {symbol}: {e}. Proceeding cautiously.")
+
+        # Check 5: Open SL/TP Orders on Binance (guards against memory desync / leftover orders)
         try:
             open_orders_on_exchange = client.futures_get_open_orders(symbol=symbol)
-            if open_orders_on_exchange: # If the list is not empty
-                print(f"{log_prefix} New signal processing SKIPPED. Symbol '{symbol}' has {len(open_orders_on_exchange)} existing open order(s) on Binance.")
+            if open_orders_on_exchange:
+                print(f"{log_prefix} New signal ({raw_signal}) processing SKIPPED. Symbol '{symbol}' has {len(open_orders_on_exchange)} existing open order(s) on Binance (potential SL/TP or pending entry).")
                 for order in open_orders_on_exchange:
-                    print(f"  - Order ID: {order['orderId']}, Type: {order['type']}, Side: {order['side']}, Qty: {order['origQty']}, Price: {order.get('price', 'N/A')}")
-                return # Skip new trade entry
+                    print(f"  - Order ID: {order['orderId']}, Type: {order['type']}, Side: {order['side']}, Qty: {order['origQty']}, Price: {order.get('price', 'N/A')}, StopPrice: {order.get('stopPrice', 'N/A')}")
+                return
         except BinanceAPIException as e:
-            print(f"{log_prefix} API Error checking open orders for {symbol}: {e}. Proceeding cautiously (may not skip if orders exist but check failed).")
+            print(f"{log_prefix} API Error checking open SL/TP orders for {symbol}: {e}. Proceeding cautiously.")
         except Exception as e:
-            print(f"{log_prefix} Unexpected error checking open orders for {symbol}: {e}. Proceeding cautiously.")
+            print(f"{log_prefix} Unexpected error checking open SL/TP orders for {symbol}: {e}. Proceeding cautiously.")
 
-
-        klines_df['EMA100'] = calculate_ema(klines_df, 100)
-        klines_df['EMA200'] = calculate_ema(klines_df, 200)
-
-        if klines_df['EMA100'] is None or klines_df['EMA200'] is None or \
-           klines_df['EMA100'].isnull().all() or klines_df['EMA200'].isnull().all() or \
-           len(klines_df) < 202: 
-            print(f"{log_prefix} EMA calculation failed or insufficient data. Aborting.")
-            return
-
-        new_signal = check_ema_crossover_conditions(klines_df, symbol_for_logging=symbol)
-        if new_signal not in ["LONG", "SHORT"]:
-            # No actionable signal, check_ema_crossover_conditions logs reasons.
-            # The new_signal value itself might be a reason string like "VALIDATION_FAILED"
-            if isinstance(new_signal, str): # If it's a reason string
-                 print(f"{log_prefix} No actionable signal for {symbol}. Reason: {new_signal}")
-            # else it's None, meaning no crossover.
-            return
-
-        # Max concurrent position check (protected by active_trades_lock)
-        # This check is now implicitly covered by the active_trade check above if a trade for *this* symbol exists.
-        # However, we still need the global max concurrent positions check.
-        with lock: 
+        # If all preliminary checks passed, this is the validated signal to proceed with.
+        signal = raw_signal 
+        
+        # Max concurrent position check (globally for the bot)
+        with lock: # active_trades_lock
             if len(active_trades) >= configs["max_concurrent_positions"]:
-                print(f"{log_prefix} Max concurrent positions ({configs['max_concurrent_positions']}) reached globally. Cannot open new trade for {symbol}.")
+                print(f"{log_prefix} Max concurrent positions ({configs['max_concurrent_positions']}) reached globally. Cannot open new {signal} trade for {symbol}.")
                 return
         
-        # If we reach here, it's a valid signal, no active trade for this symbol, no open orders for this symbol, and under max global positions.
-        signal = new_signal # To be used consistently hereafter
-
-        print(f"\n{log_prefix} --- Proceeding with New Validated Trade Signal: {signal} (No existing active trade or open orders for this symbol) ---")
-
+        print(f"\n{log_prefix} --- Proceeding with New Validated Trade Signal: {signal} for {symbol} ---")
+        print(f"{log_prefix} Passed Cooldown, ActiveTrade, LivePosition, OpenOrders, MaxConcurrent checks.")
+        
         symbol_info = get_symbol_info(client, symbol)
         if not symbol_info:
             print(f"{log_prefix} Failed to retrieve symbol information for {symbol}. Abort.")
             # Not sending trade rejection here as parameters for it aren't fully formed.
             return
 
-        entry_p = klines_df['close'].iloc[-1] 
+        # entry_p will be determined from klines_df_copy (which has EMAs)
+        entry_p = klines_df_copy['close'].iloc[-1] 
         # Ensure sl_p, tp_p, qty_calc are initialized for send_trade_rejection_notification calls
         sl_p_calc, tp_p_calc, qty_calc_val = None, None, None 
         
-        print(f"{log_prefix} Entry price (last close): {entry_p} for {symbol}")
+        print(f"{log_prefix} Proposed entry price (last close from klines_df_copy): {entry_p} for {symbol}")
         
         # --- Dynamic Leverage Calculation and Setting ---
         target_leverage = configs['leverage'] # Start with configured fixed leverage as default/fallback
         
-        # Determine candles_per_year based on a fixed assumption or a config.
-        # Assuming 15-minute klines as per get_historical_klines default.
-        # KLINE_INTERVAL_1MINUTE, KLINE_INTERVAL_3MINUTE, KLINE_INTERVAL_5MINUTE, KLINE_INTERVAL_15MINUTE, KLINE_INTERVAL_30MINUTE, 
-        # KLINE_INTERVAL_1HOUR, KLINE_INTERVAL_2HOUR, KLINE_INTERVAL_4HOUR, KLINE_INTERVAL_6HOUR, KLINE_INTERVAL_8HOUR, KLINE_INTERVAL_12HOUR, 
-        # KLINE_INTERVAL_1DAY, KLINE_INTERVAL_3DAY, KLINE_INTERVAL_1WEEK, KLINE_INTERVAL_1MONTH
-        # For simplicity, let's assume 15 min interval for now for candles_per_year calc. This should ideally be more robust.
-        # A more robust way would be to parse configs['kline_interval'] if that was a setting.
-        # For now, hardcoding for 15min interval:
-        candles_per_day_approx = 24 * (60 / 15) # 96 candles per day for 15min
+        candles_per_day_approx = 24 * (60 / 15) # Assuming 15min kline interval for default
         candles_per_year_approx = int(candles_per_day_approx * 365)
 
         realized_vol = calculate_realized_volatility(
-            klines_df, 
+            klines_df_copy, # Use klines_df_copy which has necessary columns potentially
             configs.get('realized_volatility_period', DEFAULT_REALIZED_VOLATILITY_PERIOD),
             candles_per_year_approx
         )
@@ -2262,15 +2328,15 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is
 
 
         # --- ATR and SL/TP Calculation ---
-        klines_df['atr'] = calculate_atr(klines_df, period=configs.get('atr_period', DEFAULT_ATR_PERIOD))
-        current_atr_value = klines_df['atr'].iloc[-1]
+        # Use klines_df_copy for ATR calculation as well
+        klines_df_copy['atr'] = calculate_atr(klines_df_copy, period=configs.get('atr_period', DEFAULT_ATR_PERIOD))
+        current_atr_value = klines_df_copy['atr'].iloc[-1]
 
         if pd.isna(current_atr_value) or current_atr_value <= 0:
             reason = f"Invalid ATR value ({current_atr_value:.4f}) for {symbol}. Cannot proceed with trade."
             print(f"{log_prefix} {reason}")
             send_trade_rejection_notification(symbol, signal, reason, entry_p, None, None, qty_calc_val, symbol_info, configs)
-            # Clean up ATR column from DataFrame if it was added temporarily
-            if 'atr' in klines_df.columns: klines_df.drop(columns=['atr'], inplace=True)
+            if 'atr' in klines_df_copy.columns: klines_df_copy.drop(columns=['atr'], inplace=True)
             return
         
         print(f"{log_prefix} Current ATR for {symbol} (period {configs.get('atr_period', DEFAULT_ATR_PERIOD)}): {current_atr_value:.{symbol_info.get('pricePrecision', 2)}f}")
@@ -2280,11 +2346,10 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is
             reason = "ATR-based Stop Loss / Take Profit calculation failed."
             print(f"{log_prefix} {reason} for {symbol}. Abort.")
             send_trade_rejection_notification(symbol, signal, reason, entry_p, sl_p_calc, tp_p_calc, qty_calc_val, symbol_info, configs)
-            if 'atr' in klines_df.columns: klines_df.drop(columns=['atr'], inplace=True) # Cleanup
+            if 'atr' in klines_df_copy.columns: klines_df_copy.drop(columns=['atr'], inplace=True) # Cleanup
             return
         print(f"{log_prefix} Calculated ATR-based SL: {sl_p_calc:.{symbol_info.get('pricePrecision',2)}f}, TP: {tp_p_calc:.{symbol_info.get('pricePrecision',2)}f} for {symbol}.")
-        # Cleanup ATR column if added
-        if 'atr' in klines_df.columns: klines_df.drop(columns=['atr'], inplace=True)
+        if 'atr' in klines_df_copy.columns: klines_df_copy.drop(columns=['atr'], inplace=True) # Cleanup ATR column
         # --- End ATR and SL/TP Calculation ---
 
         acc_bal = get_account_balance(client, configs) 
@@ -2364,7 +2429,7 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is
             quantity=qty_to_order_final, symbol_info=symbol_info, current_balance=acc_bal, 
             risk_percent_config=configs['risk_percent'], configs=configs, 
             specific_leverage_for_trade=target_leverage, # Pass the actual leverage being used
-            klines_df_for_debug=klines_df 
+            klines_df_for_debug=klines_df_copy # Pass klines_df_copy for debug
         )
 
         if not passed_sanity_checks:
@@ -2374,6 +2439,43 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is
             return 
 
         print(f"{log_prefix} Pre-order sanity checks PASSED.")
+
+        # --- Check 6: Trade Signature Check (after all parameters are confirmed) ---
+        # Precision for signature generation should match symbol's price and quantity precision if possible,
+        # or use a reasonable default. Let's use 4 decimal places as a general default for prices in signature.
+        # Quantity precision can be derived from symbol_info.
+        qty_prec_for_sig = int(symbol_info.get('quantityPrecision', 2)) # Use symbol's qty precision
+        price_prec_for_sig = int(symbol_info.get('pricePrecision', 4)) # Use symbol's price precision, default 4
+
+        trade_sig = generate_trade_signature(symbol, signal, entry_p, sl_p_calc, tp_p_calc, qty_to_order_final, precision=price_prec_for_sig)
+        # Note: quantity in signature uses same precision as price for simplicity in `generate_trade_signature` default.
+        # Consider adjusting `generate_trade_signature` if different precisions for qty are needed.
+        # For now, using price_prec_for_sig for qty in signature too. A more robust way:
+        # trade_sig = f"{symbol}_{signal}_{entry_p:.{price_prec_for_sig}f}_{sl_p_calc:.{price_prec_for_sig}f}_{tp_p_calc:.{price_prec_for_sig}f}_{qty_to_order_final:.{qty_prec_for_sig}f}"
+
+
+        with recent_trade_signatures_lock:
+            # Check against signatures from last N seconds (e.g., 60 seconds)
+            # This is different from cooldown; cooldown is per symbol, signature is per exact trade params.
+            # max_signature_age_seconds from cleanup_recent_trade_signatures is 120s.
+            # Let's use a shorter window for *blocking* duplicates, e.g., 60s.
+            # The cleanup job will remove older ones eventually.
+            block_duplicate_signature_within_seconds = 60 
+            if trade_sig in recent_trade_signatures and \
+               (dt.now() - recent_trade_signatures[trade_sig]).total_seconds() < block_duplicate_signature_within_seconds:
+                print(f"{log_prefix} New signal ({signal}) processing SKIPPED for {symbol}. Duplicate trade signature found within {block_duplicate_signature_within_seconds}s: {trade_sig}")
+                # Do not update last_signal_time here, as this specific duplicate was caught by signature.
+                return
+            # If not a recent duplicate, record this signature. It will be cleaned up later.
+            # No need to add it here yet, only add *after* successful order placement attempt or confirmation.
+
+        # --- All checks passed, ready to attempt trade ---
+        # Update Cooldown Timer's last_signal_time for this symbol *before* placing order.
+        # If order placement fails, the cooldown still applies to prevent immediate retries of the same signal.
+        with last_signal_lock:
+            last_signal_time[symbol] = dt.now()
+            print(f"{log_prefix} Updated last_signal_time for {symbol} to {last_signal_time[symbol]} (Cooldown activated).")
+
         
         # Determine positionSide based on signal
         position_side_for_trade = "LONG" if signal == "LONG" else "SHORT"
@@ -2405,22 +2507,27 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is
         with lock: # This is active_trades_lock
             if len(active_trades) >= configs["max_concurrent_positions"]:
                 print(f"{log_prefix} Max concurrent positions ({configs['max_concurrent_positions']}) reached just before recording trade. Order for {symbol} was placed but will not be managed by bot. This may require manual intervention for order ID {entry_order.get('orderId') if entry_order else 'UNKNOWN'}.")
-                # This is a tricky state: order placed but bot won't manage. 
-                # For now, just notify and don't add to active_trades.
-                # A more robust solution might try to cancel the orphaned market order if possible, but that's complex.
-                # Sending a specific Telegram alert for this "orphaned but filled" scenario:
                 orphan_reason = f"Max positions ({configs['max_concurrent_positions']}) met after order fill. Order ID {entry_order.get('orderId')} for {symbol} is orphaned and needs manual management."
                 send_trade_rejection_notification(symbol, signal, orphan_reason, entry_p, sl_p_calc, tp_p_calc, qty_to_order_final, symbol_info, configs)
+                # Do NOT add signature here as the trade is orphaned.
                 return
 
             # If we are here, entry_order is successful and there's space for the trade.
             print(f"{log_prefix} Market entry order FILLED. Details: {entry_order}")
-            actual_ep = float(entry_order.get('avgPrice', entry_p))
+            actual_ep = float(entry_order.get('avgPrice', entry_p)) # Use actual fill price
             
+            # Add the trade signature to recent_trade_signatures *after* successful fill and *before* SL/TP placement.
+            # This ensures that if SL/TP placement fails, the signature is still there to prevent immediate retries
+            # of the same entry if the bot restarts or logic loops quickly.
+            with recent_trade_signatures_lock:
+                recent_trade_signatures[trade_sig] = dt.now()
+                print(f"{log_prefix} Trade signature recorded for {symbol}: {trade_sig}")
+
             final_sl_price = sl_p_calc
             final_tp_price = tp_p_calc
 
-            if entry_p > 0 : 
+            # Adjust SL/TP based on actual fill price vs proposed entry price
+            if entry_p > 0 and abs(actual_ep - entry_p) > 1e-9: # If actual fill is different
                 sl_dist_pct = abs(entry_p - sl_p_calc) / entry_p
                 tp_dist_pct = abs(entry_p - tp_p_calc) / entry_p
                 
@@ -2428,58 +2535,37 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is
                 tp_p_adj = actual_ep * (1 + tp_dist_pct if signal == "LONG" else 1 - tp_dist_pct)
                 
                 price_prec_for_print = int(symbol_info.get('pricePrecision', 2))
-                print(f"SL/TP adjusted for actual fill {actual_ep:.{price_prec_for_print}f}: SL {sl_p_adj:.{price_prec_for_print}f}, TP {tp_p_adj:.{price_prec_for_print}f}")
+                print(f"{log_prefix} SL/TP adjusted for actual fill {actual_ep:.{price_prec_for_print}f} (from proposed {entry_p:.{price_prec_for_print}f}): SL {sl_p_adj:.{price_prec_for_print}f}, TP {tp_p_adj:.{price_prec_for_print}f}")
                 final_sl_price, final_tp_price = sl_p_adj, tp_p_adj
+            else:
+                print(f"{log_prefix} Actual fill price {actual_ep} matches proposed entry price. Using original SL/TP.")
 
-            # SL and TP orders are placed after the entry order is confirmed and still within the main lock.
-            # This ensures that if SL/TP placement fails, the trade isn't fully recorded in active_trades
-            # without its SL/TP, or handled more gracefully.
-            # However, placing SL/TP outside the immediate lock of adding to active_trades might be cleaner
-            # if their failure doesn't mean the main trade should be unwound (which is hard with market orders).
-            # For now, keeping them conceptually linked but their placement calls are outside this specific `active_trades` update lock.
-            # The critical part is that `active_trades` is updated atomically with the *decision* to trade based on slot availability.
 
-            # Record the trade in active_trades
-            current_pd_timestamp = pd.Timestamp.now(tz='UTC') 
-            # Pre-initialize sl_order_id and tp_order_id to None for the new_trade_data
-            # They will be updated after SL/TP placement attempts.
+            # Record the trade in active_trades (preliminary, SL/TP order IDs to be updated)
+            # current_pd_timestamp is defined once before creating new_trade_data
+            new_trade_data_open_timestamp = pd.Timestamp.now(tz='UTC') 
             new_trade_data = {
                 "entry_order_id": entry_order['orderId'], 
-                "sl_order_id": None, # Initialize as None
-                "tp_order_id": None, # Initialize as None
+                "sl_order_id": None, "tp_order_id": None,
                 "entry_price": actual_ep,
                 "current_sl_price": final_sl_price, "current_tp_price": final_tp_price, 
                 "initial_sl_price": final_sl_price, "initial_tp_price": final_tp_price, 
                 "quantity": qty_to_order_final, "side": signal, 
-                "symbol_info": symbol_info, "open_timestamp": current_pd_timestamp
+                "symbol_info": symbol_info, "open_timestamp": new_trade_data_open_timestamp # Use the defined timestamp
             }
             try:
-                current_pd_timestamp = pd.Timestamp.now(tz='UTC') 
-                new_trade_data = {
-                    "entry_order_id": entry_order['orderId'], 
-                    "sl_order_id": None, # Initialize as None
-                    "tp_order_id": None, # Initialize as None
-                    "entry_price": actual_ep,
-                    "current_sl_price": final_sl_price, "current_tp_price": final_tp_price, 
-                    "initial_sl_price": final_sl_price, "initial_tp_price": final_tp_price, 
-                    "quantity": qty_to_order_final, "side": signal, 
-                    "symbol_info": symbol_info, "open_timestamp": current_pd_timestamp
-                }
                 active_trades[symbol] = new_trade_data
-                print(f"{log_prefix} Trade for {symbol} (Entry ID: {entry_order['orderId']}) preliminarily recorded in active_trades. SL/TP placement follows.")
+                print(f"{log_prefix} Trade for {symbol} (Entry ID: {entry_order['orderId']}) preliminarily recorded in active_trades. SL/TP placement follows. Open time: {new_trade_data_open_timestamp}")
             except Exception as e_rec:
                 critical_error_msg = f"{log_prefix} CRITICAL ERROR: Order {entry_order['orderId']} for {symbol} placed successfully, BUT FAILED TO RECORD IN active_trades. Reason: {e_rec}. This trade may be orphaned and re-attempted. Manual intervention might be needed."
                 print(critical_error_msg)
                 traceback.print_exc()
                 if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
                     send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], f"🆘 {critical_error_msg}")
-                # Do not proceed with SL/TP placement if recording failed, as active_trades[symbol] won't exist or be correct.
-                # The function will eventually release symbols_currently_processing_lock and return.
-                # Next cycle might try again. This alerting is key.
-                return # Explicitly return to avoid SL/TP placement attempts on an unrecorded trade.
+                # Do not proceed with SL/TP placement if recording failed.
+                return 
 
-        # --- SL/TP Placement (occurs outside the immediate active_trades update lock for atomicity of count) ---
-        # This means if SL/TP placement fails, the trade is already in active_trades.
+        # --- SL/TP Placement (occurs outside the immediate active_trades update lock for atomicity of count, but after signature and preliminary recording) ---
         # The safety net (ensure_sl_tp_for_all_open_positions) is crucial to catch this.
         # And immediate SL/TP failure alert is also important.
 
