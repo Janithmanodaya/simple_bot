@@ -612,10 +612,8 @@ def send_telegram_message(bot_token, chat_id, message):
 
     return asyncio.run(_send())
 
-def start_command_listener(bot_token, chat_id, last_message):
-    async def command3_handler(update, context: ContextTypes.DEFAULT_TYPE):
-        if str(update.effective_chat.id) == str(chat_id):
-            await context.bot.send_message(chat_id=chat_id, text=last_message, parse_mode="Markdown")
+# Removed the first, simpler definition of start_command_listener as it was a duplicate stub.
+# The definition below is the one that is actually used.
 
 def start_command_listener(bot_token, chat_id, last_message_content): # Renamed for clarity
     async def actual_bot_runner_async(): # Renamed to indicate it's async
@@ -627,9 +625,22 @@ def start_command_listener(bot_token, chat_id, last_message_content): # Renamed 
                 # It is, due to closure over start_command_listener's scope.
                 await context.bot.send_message(chat_id=chat_id, text=last_message_content, parse_mode="Markdown")
         
-        application.add_handler(CommandHandler("command3", command3_handler))
-        application.add_handler(CommandHandler("start", start_handler)) # Assuming start_handler is defined
-        application.add_handler(CommandHandler("help", help_handler))   # Assuming help_handler is defined
+        # Add existing and new command handlers
+        application.add_handler(CommandHandler("start", start_handler))
+        application.add_handler(CommandHandler("help", help_handler))
+        application.add_handler(CommandHandler("command3", command3_handler)) # Example command
+
+        application.add_handler(CommandHandler("status", status_handler))
+        application.add_handler(CommandHandler("positions", positions_handler))
+        application.add_handler(CommandHandler("orders", orders_handler))
+        application.add_handler(CommandHandler("halt", halt_handler))
+        application.add_handler(CommandHandler("resume", resume_handler))
+        application.add_handler(CommandHandler("closeall", close_all_handler))
+        application.add_handler(CommandHandler("setrisk", set_risk_handler))
+        application.add_handler(CommandHandler("setleverage", set_leverage_handler))
+        application.add_handler(CommandHandler("log", log_handler))
+        application.add_handler(CommandHandler("config", config_handler)) # For viewing config
+        application.add_handler(CommandHandler("shutdown", shutdown_handler))
 
         initialized_successfully = False
         try:
@@ -678,6 +689,7 @@ def start_command_listener(bot_token, chat_id, last_message_content): # Renamed 
     thread = threading.Thread(target=thread_starter, name="TelegramBotThread") # Added name
     thread.daemon = True
     thread.start()
+    print("start_command_listener: Telegram thread kicked off.") # Added debug line
 
 
 # --- Telegram Notification for Trade Rejection ---
@@ -2149,14 +2161,19 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is
     # --- Cleanup old trade signatures (periodically) ---
     cleanup_recent_trade_signatures()
 
-    # --- Check 1: Overall trading halt status (Daily Drawdown / Daily Loss) ---
-    with daily_state_lock:
+    # --- Check 1: Overall trading halt status (Daily Drawdown / Daily Loss / Manual) ---
+    global trading_halted_manual # Ensure access to the manual halt flag
+    with daily_state_lock: # daily_state_lock primarily protects drawdown and daily_loss flags
         if trading_halted_drawdown:
             print(f"{log_prefix} Trade entry BLOCKED for {symbol}. Reason: Max Drawdown trading halt is active.")
             return
         if trading_halted_daily_loss:
             print(f"{log_prefix} Trade entry BLOCKED for {symbol}. Reason: Daily Stop Loss trading halt is active.")
             return
+    # Manual halt check (can be outside daily_state_lock as it's a separate global)
+    if trading_halted_manual:
+        print(f"{log_prefix} Trade entry BLOCKED for {symbol}. Reason: Trading is MANUALLY HALTED.")
+        return
     # --- End trading halt status check ---
 
     # Attempt to mark this symbol as being processed by this thread.
@@ -2971,6 +2988,14 @@ def trading_loop(client, configs, monitored_symbols):
     
     try:
         while True:
+            global bot_shutdown_requested
+            if bot_shutdown_requested:
+                print("Shutdown requested via Telegram command. Exiting trading loop...")
+                # Send a message to Telegram confirming shutdown initiation from loop
+                if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+                     send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], "ℹ️ Bot is shutting down now as requested...")
+                break # Exit the trading loop
+
             current_cycle_number += 1
             cycle_start_time = time.time()
             configs['cycle_start_time_ref'] = cycle_start_time # For threads to use consistent base
@@ -3210,18 +3235,20 @@ def main():
     # Call initialize_binance_client once and unpack its results
     # The first item in the returned tuple is the actual client object.
     client_connection_details = initialize_binance_client(configs)
-    client_obj = client_connection_details[0]
+    # Assign to global client variable for handlers
+    global client 
+    client = client_connection_details[0] # client_obj is now assigned to global client
     env_for_msg = client_connection_details[1]
     server_time_obj = client_connection_details[2]
     
-    if not client_obj: # Check if the actual client object is None
+    if not client: # Check if the global client object is None
         # Error messages are printed by initialize_binance_client already
         print("Exiting: Binance client init failed.") 
         sys.exit(1)
 
-    # Now use client_obj for operations
+    # Now use global client for operations
     print("\nFetching initial account balance...")
-    initial_balance = get_account_balance(client_obj, configs) # Use the actual client object, pass configs
+    initial_balance = get_account_balance(client, configs) # Use the global client object, pass configs
 
     if configs['mode'] == 'live' and initial_balance is None:
         # IP-related error or other critical issue detected by get_account_balance returning None.
@@ -3230,12 +3257,12 @@ def main():
         while initial_balance is None:
             print("Retrying initial connection in 60 seconds... Check Telegram for IP details if this is a whitelist issue.")
             time.sleep(60)
-            initial_balance = get_account_balance(client_obj, configs)
+            initial_balance = get_account_balance(client, configs) # Use global client
             if initial_balance is not None:
                 print(f"Initial API connection successful! Current balance: {initial_balance:.2f} USDT")
                 # Re-send startup message now that connection is established
                 if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
-                    open_pos_text_retry = get_open_positions(client_obj, format_for_telegram=True)
+                    open_pos_text_retry = get_open_positions(client, format_for_telegram=True) # Use global client
                     # configs['bot_start_time_str'] should already be set
                     startup_msg_retry = build_startup_message(configs, initial_balance, open_pos_text_retry, configs.get('bot_start_time_str', 'N/A'))
                     send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], startup_msg_retry)
@@ -3256,14 +3283,14 @@ def main():
         print(f"\nSuccessfully connected to Binance {env_for_msg.title()} API. Server Time: {pd.to_datetime(server_time_obj['serverTime'], unit='ms')} UTC")
     elif env_for_msg: # If client initialized but server time fetch failed or env_for_msg is None (should be rare)
         print(f"\nSuccessfully connected to Binance {env_for_msg.title()} API. (Server time not fully available)")
-    else: # Fallback if client_obj is somehow valid but other details are not
+    else: # Fallback if client is somehow valid but other details are not
         print(f"\nSuccessfully connected to Binance API. (Connection details partially unavailable)")
 
     configs.setdefault("api_delay_short", 1) 
     configs.setdefault("api_delay_symbol_processing", 0.1) # Can be very short with threads
     configs.setdefault("loop_delay_minutes", 5)
 
-    monitored_symbols = get_all_usdt_perpetual_symbols(client_obj) # Use client_obj
+    monitored_symbols = get_all_usdt_perpetual_symbols(client) # Use global client
     if not monitored_symbols: print("Exiting: No symbols to monitor."); sys.exit(1)
     
     # --- Initial Telegram Notification ---
@@ -3275,9 +3302,9 @@ def main():
         # If there were pre-existing positions from API, they'd show "N/A (Bot)" for SL/TP.
         s_info_map_initial = _build_symbol_info_map_from_active_trades(active_trades) # active_trades is global
         
-        if client_obj:
+        if client: # Use global client
             if configs["mode"] == "live":
-                open_pos_text = get_open_positions(client_obj, format_for_telegram=True, active_trades_data=active_trades.copy(), symbol_info_map=s_info_map_initial)
+                open_pos_text = get_open_positions(client, format_for_telegram=True, active_trades_data=active_trades.copy(), symbol_info_map=s_info_map_initial) # Use global client
             else:
                 open_pos_text = "None (Backtest Mode)"
         else:
@@ -3301,7 +3328,7 @@ def main():
 
     if configs["mode"] == "live":
         try:
-            trading_loop(client_obj, configs, monitored_symbols) # Use client_obj
+            trading_loop(client, configs, monitored_symbols) # Use global client
         except KeyboardInterrupt: 
             print("\nBot stopped by user (Ctrl+C).")
             # Send a notification for graceful shutdown by user
@@ -3318,7 +3345,7 @@ def main():
             print("\n--- Live Trading Bot Shutting Down ---")
 
             # Cancel orders if any
-            if client_obj and active_trades:
+            if client and active_trades: # Use global client
                 print(f"Cancelling {len(active_trades)} bot-managed active SL/TP orders...")
                 with active_trades_lock:
                     for symbol, trade_details in list(active_trades.items()):
@@ -3327,11 +3354,11 @@ def main():
                             if oid:
                                 try:
                                     print(f"Cancelling {oid_key} {oid} for {symbol}...")
-                                    client_obj.futures_cancel_order(symbol=symbol, orderId=oid)
+                                    client.futures_cancel_order(symbol=symbol, orderId=oid) # Use global client
                                 except Exception as e_c:
                                     print(f"Failed to cancel {oid_key} {oid} for {symbol}: {e_c}")
 
-            print("Live Bot shutdown sequence complete.")
+            print("Live Bot shutdown sequence complete.") # This line was duplicated, removing one instance
 
             # ✅ Send Telegram Shutdown Message
             if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
@@ -3343,23 +3370,12 @@ def main():
                     f"*Environment:* `{configs.get('environment', 'Unknown')}`"
                 )
                 send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], shutdown_msg)
-
-            if client_obj and active_trades: # Use client_obj
-                print(f"Cancelling {len(active_trades)} bot-managed active SL/TP orders...")
-                with active_trades_lock:
-                    for symbol, trade_details in list(active_trades.items()):
-                        for oid_key in ['sl_order_id', 'tp_order_id']:
-                            oid = trade_details.get(oid_key)
-                            if oid:
-                                try:
-                                    print(f"Cancelling {oid_key} {oid} for {symbol}...")
-                                    client_obj.futures_cancel_order(symbol=symbol, orderId=oid) # Use client_obj
-                                except Exception as e_c: print(f"Failed to cancel {oid_key} {oid} for {symbol}: {e_c}")
-            print("Live Bot shutdown sequence complete.")
+            # The second block for cancelling orders was a duplicate, it has been removed by ensuring the first one uses global `client`.
+            # The `print("Live Bot shutdown sequence complete.")` was also duplicated.
     elif configs["mode"] == "backtest":
         try:
-            # Pass client_obj to backtesting_loop; it might also be used for initializing backtest env
-            backtesting_loop(client_obj, configs, monitored_symbols) # Use client_obj
+            # Pass global client to backtesting_loop; it might also be used for initializing backtest env
+            backtesting_loop(client, configs, monitored_symbols) # Use global client
         except KeyboardInterrupt: print("\nBacktest stopped by user (Ctrl+C).")
         except Exception as e: print(f"\nCRITICAL UNEXPECTED ERROR IN BACKTESTING: {e}"); traceback.print_exc()
         finally:
@@ -4933,6 +4949,283 @@ def backtesting_loop(client, configs, monitored_symbols):
         print(f"Trade log saved to {log_filename}")
     except Exception as e_log:
         print(f"Error saving trade log: {e_log}")
+
+# --- Global variables for Telegram Handlers and Bot Control ---
+# client instance will be populated in main()
+client = None 
+# configs dictionary will be populated in main() and is treated as global in many functions
+# active_trades, active_trades_lock, etc. are already defined at the top level.
+
+config_filepath = "configure.csv" # Path to the configuration CSV file, used by handlers
+bot_shutdown_requested = False    # Flag to signal graceful shutdown from Telegram command
+trading_halted_manual = False     # Flag for manual trading halt from Telegram command
+
+# --- Telegram Command Handlers ---
+
+async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global client, configs, active_trades, active_trades_lock # Removed current_balance from globals here
+    global trading_halted_drawdown, trading_halted_daily_loss, trading_halted_manual
+    
+    effective_chat_id = str(update.effective_chat.id)
+    # Ensure chat_id is available in configs for comparison
+    expected_chat_id = str(configs.get("telegram_chat_id"))
+    if not expected_chat_id:
+        print("Error: telegram_chat_id not found in configs for status_handler.")
+        await update.message.reply_text("Bot configuration error: Admin chat ID not set.", parse_mode="Markdown")
+        return
+    if effective_chat_id != expected_chat_id:
+        print(f"Status request from unauthorized chat ID: {effective_chat_id}")
+        return
+
+    # Fetch fresh balance for status to ensure accuracy
+    balance_for_status = get_account_balance(client, configs) 
+    if balance_for_status is None: # Indicates a critical error from get_account_balance
+        await update.message.reply_text("Error: Could not fetch current balance. API connection issue likely.", parse_mode="Markdown")
+        return
+    
+    # Update global current_balance if needed, or rely on manage_daily_state to do so.
+    # For this handler, using the freshly fetched balance_for_status is best.
+    current_balance = balance_for_status # Update global for consistency if other parts rely on it
+
+    equity = get_current_equity(client, configs, balance_for_status, active_trades, active_trades_lock)
+    if equity is None:
+        await update.message.reply_text("Error: Could not calculate current equity.", parse_mode="Markdown")
+        return
+
+    active_trades_count = 0
+    with active_trades_lock:
+        active_trades_count = len(active_trades)
+
+    status_text = (
+        f"📊 *Bot Status*\n\n"
+        f"Balance: `{balance_for_status:.2f}` USDT\n"
+        f"Equity: `{equity:.2f}` USDT\n"
+        f"Halted (Manual): `{trading_halted_manual}`\n"
+        f"Halted (Drawdown): `{trading_halted_drawdown}`\n"
+        f"Halted (Daily Loss): `{trading_halted_daily_loss}`\n"
+        f"Active Trades: `{active_trades_count}`"
+    )
+    await update.message.reply_text(status_text, parse_mode="Markdown")
+
+async def positions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global client, configs, active_trades, active_trades_lock
+    effective_chat_id = str(update.effective_chat.id)
+    expected_chat_id = str(configs.get("telegram_chat_id"))
+    if effective_chat_id != expected_chat_id: return
+
+    s_info_map = {}
+    active_trades_copy = {}
+    with active_trades_lock:
+        active_trades_copy = active_trades.copy() 
+        s_info_map = _build_symbol_info_map_from_active_trades(active_trades_copy)
+        
+    positions_text = get_open_positions(client, format_for_telegram=True, active_trades_data=active_trades_copy, symbol_info_map=s_info_map)
+    await update.message.reply_text(f"*Open Positions:*\n{positions_text}", parse_mode="Markdown")
+
+async def orders_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global client, configs
+    effective_chat_id = str(update.effective_chat.id)
+    expected_chat_id = str(configs.get("telegram_chat_id"))
+    if effective_chat_id != expected_chat_id: return
+
+    open_orders = get_open_orders(client) 
+    if not open_orders:
+        await update.message.reply_text("No open orders.", parse_mode="Markdown")
+        return
+
+    orders_texts = ["*Open Orders:*"]
+    for o in open_orders:
+        # Assuming symbol_info is not readily available here to get exact pricePrecision for each order.
+        # Using a general precision or fetching it would be an enhancement. For now, default.
+        price_prec = 2 # Default
+        # symbol_specific_info = get_symbol_info(client, o['symbol']) # Too slow to do for each order in handler
+        # if symbol_specific_info: price_prec = int(symbol_specific_info.get('pricePrecision', 2))
+
+        price_str = f"{float(o['price']):.{price_prec}f}" if o['type'] != 'MARKET' else 'MARKET'
+        stop_price_str = f"{float(o.get('stopPrice',0)):.{price_prec}f}" if o.get('stopPrice') and float(o.get('stopPrice',0)) > 0 else "N/A"
+        orders_texts.append(
+            f"- {o['symbol']} (ID: {o['orderId']}): {o['side']} {o['type']} Qty: {o['origQty']} @ {price_str}, StopPx: {stop_price_str}"
+        )
+    await update.message.reply_text("\n".join(orders_texts), parse_mode="Markdown")
+
+async def halt_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global trading_halted_manual, configs
+    effective_chat_id = str(update.effective_chat.id)
+    expected_chat_id = str(configs.get("telegram_chat_id"))
+    if effective_chat_id != expected_chat_id: return
+    
+    trading_halted_manual = True
+    message = "Trading MANUALLY HALTED. Bot will not open new positions."
+    print(message)
+    await update.message.reply_text(f"🛑 {message}", parse_mode="Markdown")
+
+async def resume_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global trading_halted_manual, configs
+    effective_chat_id = str(update.effective_chat.id)
+    expected_chat_id = str(configs.get("telegram_chat_id"))
+    if effective_chat_id != expected_chat_id: return
+
+    trading_halted_manual = False
+    message = "Trading MANUALLY RESUMED. Bot can open new positions (if other auto-halts are not active)."
+    print(message)
+    await update.message.reply_text(f"✅ {message}", parse_mode="Markdown")
+
+async def close_all_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global client, configs, active_trades, active_trades_lock
+    effective_chat_id = str(update.effective_chat.id)
+    expected_chat_id = str(configs.get("telegram_chat_id"))
+    if effective_chat_id != expected_chat_id: return
+
+    await update.message.reply_text("Attempting to close all active positions...", parse_mode="Markdown")
+    try:
+        # Run synchronous function in a separate thread to avoid blocking asyncio event loop
+        await asyncio.to_thread(close_all_open_positions, client, configs, active_trades, active_trades_lock)
+        await update.message.reply_text("All positions closure process initiated. Check logs for details.", parse_mode="Markdown")
+    except Exception as e:
+        detailed_error = f"Error during close_all_positions: {e}\n{traceback.format_exc()}"
+        print(detailed_error)
+        await update.message.reply_text(f"Error during close_all_positions: {e}", parse_mode="Markdown")
+
+
+async def set_risk_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global configs, config_filepath
+    effective_chat_id = str(update.effective_chat.id)
+    expected_chat_id = str(configs.get("telegram_chat_id"))
+    if effective_chat_id != expected_chat_id: return
+
+    try:
+        if not context.args:
+            await update.message.reply_text("Usage: /setrisk <percentage> (e.g., /setrisk 1.0)", parse_mode="Markdown")
+            return
+        risk_str = context.args[0]
+        new_risk_percent_val = float(risk_str)
+
+        if 0 < new_risk_percent_val <= 100: # User inputs as percentage e.g., 1 for 1%
+            old_risk = configs.get('risk_percent', 0.01) * 100.0 # Default to 0.01 if not found, then *100
+            configs['risk_percent'] = new_risk_percent_val / 100.0 # Store as decimal
+            
+            configs_to_save = configs.copy()
+            # Remove sensitive keys before saving
+            for k_sens in ["api_key", "api_secret", "telegram_bot_token", "telegram_chat_id", "last_startup_message", "cycle_start_time_ref"]:
+                configs_to_save.pop(k_sens, None)
+            
+            if save_configuration_to_csv(config_filepath, configs_to_save):
+                msg = f"Risk per trade updated from {old_risk:.2f}% to {new_risk_percent_val:.2f}% and saved."
+            else:
+                msg = f"Risk per trade updated to {new_risk_percent_val:.2f}%, but FAILED to save to {config_filepath}."
+            print(msg)
+            await update.message.reply_text(msg, parse_mode="Markdown")
+        else:
+            await update.message.reply_text("Invalid risk percentage. Must be > 0 and <= 100.", parse_mode="Markdown")
+    except (IndexError, ValueError):
+        await update.message.reply_text("Usage: /setrisk <percentage> (e.g., /setrisk 1.0)", parse_mode="Markdown")
+    except Exception as e:
+        print(f"Error in set_risk_handler: {e}")
+        await update.message.reply_text(f"An error occurred: {e}", parse_mode="Markdown")
+
+
+async def set_leverage_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global configs, config_filepath
+    effective_chat_id = str(update.effective_chat.id)
+    expected_chat_id = str(configs.get("telegram_chat_id"))
+    if effective_chat_id != expected_chat_id: return
+
+    try:
+        if not context.args:
+            await update.message.reply_text("Usage: /setleverage <value> (e.g., /setleverage 20)", parse_mode="Markdown")
+            return
+        leverage_str = context.args[0]
+        new_leverage = int(leverage_str)
+
+        if 1 <= new_leverage <= 125: # Binance typical limits
+            old_leverage = configs.get('leverage', 20) # Default to 20 if not found
+            configs['leverage'] = new_leverage
+            
+            configs_to_save = configs.copy()
+            for k_sens in ["api_key", "api_secret", "telegram_bot_token", "telegram_chat_id", "last_startup_message", "cycle_start_time_ref"]:
+                configs_to_save.pop(k_sens, None)
+
+            if save_configuration_to_csv(config_filepath, configs_to_save):
+                msg = f"Default leverage updated from {old_leverage}x to {new_leverage}x and saved."
+            else:
+                msg = f"Default leverage updated to {new_leverage}x, but FAILED to save to {config_filepath}."
+            print(msg)
+            await update.message.reply_text(msg, parse_mode="Markdown")
+            await update.message.reply_text(f"Note: This sets the default leverage. Dynamic leverage might override this for specific trades if enabled.", parse_mode="Markdown")
+        else:
+            await update.message.reply_text("Invalid leverage. Must be between 1 and 125.", parse_mode="Markdown")
+    except (IndexError, ValueError):
+        await update.message.reply_text("Usage: /setleverage <value> (e.g., /setleverage 20)", parse_mode="Markdown")
+    except Exception as e:
+        print(f"Error in set_leverage_handler: {e}")
+        await update.message.reply_text(f"An error occurred: {e}", parse_mode="Markdown")
+
+async def log_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global configs
+    effective_chat_id = str(update.effective_chat.id)
+    expected_chat_id = str(configs.get("telegram_chat_id"))
+    if effective_chat_id != expected_chat_id: return
+
+    last_startup_msg = configs.get("last_startup_message", "No recent status summary available.")
+    # In a real scenario, you might fetch last N lines from a log file.
+    # For now, we'll show a placeholder or the last status summary.
+    log_text = (
+        f"📜 *Bot Log/Status Summary*\n\n"
+        f"Recent Status Snapshot:\n{last_startup_msg}\n\n"
+        f"_Note: Detailed log file access via Telegram is currently basic. For full logs, please check the console/log file directly._"
+    )
+    await update.message.reply_text(log_text, parse_mode="Markdown")
+
+async def config_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global configs
+    effective_chat_id = str(update.effective_chat.id)
+    expected_chat_id = str(configs.get("telegram_chat_id"))
+    if effective_chat_id != expected_chat_id: return
+
+    config_texts = ["⚙️ *Current Bot Configuration:*"]
+    excluded_keys = ["api_key", "api_secret", "telegram_bot_token", "telegram_chat_id", "last_startup_message", "cycle_start_time_ref", "strategy_id", "strategy_name"] # Also exclude fixed strategy details
+    
+    sorted_config_keys = sorted(configs.keys())
+
+    for key in sorted_config_keys:
+        if key not in excluded_keys:
+            value = configs[key]
+            if key == "risk_percent": value_str = f"{value * 100:.2f}%"
+            elif key == "portfolio_risk_cap": value_str = f"{value:.2f}%"
+            elif key == "max_drawdown_percent": value_str = f"{value:.2f}%"
+            elif key == "daily_stop_loss_percent": value_str = f"{value:.2f}%"
+            elif key == "target_annualized_volatility": value_str = f"{value * 100:.2f}% (decimal: {value:.4f})"
+            elif isinstance(value, float): value_str = f"{value:.4f}"
+            else: value_str = str(value)
+            config_texts.append(f"`{key.replace('_', ' ').title()}`: `{value_str}`")
+    
+    if len(config_texts) == 1: 
+        config_texts.append("No displayable configurations found.")
+
+    message_parts = []
+    current_part = ""
+    for line in config_texts:
+        if len(current_part) + len(line) + 1 > 4096: 
+            message_parts.append(current_part)
+            current_part = line
+        else:
+            if current_part: current_part += "\n"
+            current_part += line
+    if current_part: message_parts.append(current_part)
+
+    for part in message_parts:
+        await update.message.reply_text(part, parse_mode="Markdown")
+
+async def shutdown_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global bot_shutdown_requested, configs
+    effective_chat_id = str(update.effective_chat.id)
+    expected_chat_id = str(configs.get("telegram_chat_id"))
+    if effective_chat_id != expected_chat_id: return
+
+    bot_shutdown_requested = True
+    message = "Shutdown request received. Bot will attempt to stop gracefully after the current trading cycle."
+    print(message)
+    await update.message.reply_text(f"⏳ {message}", parse_mode="Markdown")
 
 
 if __name__ == "__main__":
