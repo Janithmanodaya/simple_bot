@@ -640,6 +640,7 @@ def start_telegram_polling(bot_token: str, app_configs: dict):
     application.add_handler(CommandHandler("log", log_handler))
     application.add_handler(CommandHandler("config", config_handler))
     application.add_handler(CommandHandler("shutdown", shutdown_handler))
+    application.add_handler(CommandHandler("blacklist", blacklist_handler)) # New blacklist command
     # Note: command3_handler is removed as it was tied to the old start_command_listener structure
 
     print("Telegram ▶ run_polling() starting…")
@@ -2057,13 +2058,67 @@ def pre_order_sanity_checks(symbol, signal, entry_price, sl_price, tp_price, qua
 
 
 # --- Main Trading Logic ---
+
+def load_symbol_blacklist(filepath: str) -> list[str]:
+    """Loads symbols from a blacklist CSV file."""
+    if not os.path.exists(filepath):
+        print(f"Info: Symbol blacklist file '{filepath}' not found. No symbols will be blacklisted.")
+        return []
+    try:
+        df = pd.read_csv(filepath)
+        if 'symbol' not in df.columns:
+            print(f"Error: Blacklist CSV file '{filepath}' must contain a 'symbol' column.")
+            return []
+        
+        # Ensure symbols are strings, convert to uppercase, handle potential NaN, get unique, and sort
+        blacklisted_symbols = sorted(list(set(df['symbol'].dropna().astype(str).str.upper().tolist())))
+        
+        if not blacklisted_symbols:
+            print(f"Info: Symbol blacklist file '{filepath}' is empty or contains no valid symbols.")
+            return []
+        # This print was moved to main() to avoid repetition if called multiple times by handlers.
+        # print(f"Loaded {len(blacklisted_symbols)} unique, sorted symbol(s) from blacklist file '{filepath}'.")
+        return blacklisted_symbols
+    except pd.errors.EmptyDataError:
+        print(f"Info: Symbol blacklist file '{filepath}' is empty. No symbols will be blacklisted.")
+        return []
+    except Exception as e:
+        print(f"Error loading symbol blacklist from '{filepath}': {e}")
+        return []
+
+def add_symbol_to_blacklist(filepath: str, symbol_to_add: str) -> bool:
+    """
+    Adds a symbol to the blacklist CSV file.
+    Returns True if added, False if already exists or error.
+    """
+    symbol_to_add = symbol_to_add.upper() # Ensure consistency
+    current_blacklist = load_symbol_blacklist(filepath) # This already returns unique, sorted, uppercase symbols
+    
+    if symbol_to_add in current_blacklist:
+        print(f"Symbol {symbol_to_add} already in blacklist '{filepath}'.")
+        return False # Indicates already exists
+
+    new_blacklist_set = set(current_blacklist)
+    new_blacklist_set.add(symbol_to_add)
+    updated_blacklist = sorted(list(new_blacklist_set))
+    
+    try:
+        df_to_save = pd.DataFrame(updated_blacklist, columns=['symbol'])
+        df_to_save.to_csv(filepath, index=False)
+        print(f"Symbol {symbol_to_add} added to blacklist '{filepath}'.")
+        return True # Indicates successfully added
+    except Exception as e:
+        print(f"Error saving updated blacklist to '{filepath}': {e}")
+        return False # Indicates error
+
 def get_all_usdt_perpetual_symbols(client):
     print("\nFetching all USDT perpetual symbols...")
+    # Note: Blacklist filtering is now handled in main() before calling trading_loop
     try:
         syms = [s['symbol'] for s in client.futures_exchange_info()['symbols']
                 if s.get('symbol','').endswith('USDT') and s.get('contractType')=='PERPETUAL'
                 and s.get('status')=='TRADING' and s.get('quoteAsset')=='USDT' and s.get('marginAsset')=='USDT']
-        print(f"Found {len(syms)} USDT perpetuals. Examples: {syms[:5]}")
+        # print(f"Found {len(syms)} USDT perpetuals (before blacklist). Examples: {syms[:5]}") # Log before filtering if needed
         return sorted(list(set(syms)))
     except Exception as e: print(f"Error fetching symbols: {e}"); return []
 
@@ -3246,8 +3301,24 @@ def main():
     configs.setdefault("api_delay_symbol_processing", 0.1) # Can be very short with threads
     configs.setdefault("loop_delay_minutes", 5)
 
-    monitored_symbols = get_all_usdt_perpetual_symbols(client) # Use global client
-    if not monitored_symbols: print("Exiting: No symbols to monitor."); sys.exit(1)
+    # Load symbol blacklist
+    blacklist_filepath = "symbol_blacklist.csv"
+    blacklisted_symbols = load_symbol_blacklist(blacklist_filepath)
+    if blacklisted_symbols:
+        print(f"Loaded {len(blacklisted_symbols)} symbol(s) from blacklist: {', '.join(blacklisted_symbols)}")
+
+    monitored_symbols_all = get_all_usdt_perpetual_symbols(client) # Use global client
+    
+    # Filter out blacklisted symbols
+    monitored_symbols = [s for s in monitored_symbols_all if s not in blacklisted_symbols]
+    
+    excluded_by_blacklist_count = len(monitored_symbols_all) - len(monitored_symbols)
+    if excluded_by_blacklist_count > 0:
+        print(f"Excluded {excluded_by_blacklist_count} symbol(s) due to blacklist: {', '.join(sorted(list(set(monitored_symbols_all) - set(monitored_symbols))))}")
+    
+    if not monitored_symbols: 
+        print("Exiting: No symbols to monitor after applying blacklist (or no symbols found initially).")
+        sys.exit(1)
     
     # --- Initial Telegram Notification ---
     # --- Telegram Startup Notification ---
@@ -5187,6 +5258,66 @@ async def shutdown_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = "Shutdown request received. Bot will attempt to stop gracefully after the current trading cycle."
     print(message)
     await update.message.reply_text(f"⏳ {message}", parse_mode="Markdown")
+
+async def blacklist_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the /blacklist command to show or add symbols to the blacklist."""
+    app_configs = context.bot_data.get('configs', {})
+    effective_chat_id = str(update.effective_chat.id)
+    expected_chat_id = str(app_configs.get("telegram_chat_id"))
+
+    if effective_chat_id != expected_chat_id:
+        print(f"Blacklist command from unauthorized chat ID: {effective_chat_id}")
+        return
+
+    blacklist_file = "symbol_blacklist.csv" # Define the path to the blacklist file
+
+    if not context.args: # /blacklist - show current blacklist
+        current_blacklist = load_symbol_blacklist(blacklist_file)
+        if not current_blacklist:
+            await update.message.reply_text("The symbol blacklist is currently empty.", parse_mode="Markdown")
+        else:
+            message_text = "*Current Symbol Blacklist:*\n" + "\n".join([f"- `{s}`" for s in current_blacklist])
+            await update.message.reply_text(message_text, parse_mode="Markdown")
+    else: # /blacklist <SYMBOL> - add to blacklist
+        symbol_to_add = context.args[0].upper()
+        
+        # Validate symbol format (basic check, can be improved)
+        if not symbol_to_add.isalnum() or not symbol_to_add.endswith("USDT"):
+             await update.message.reply_text(f"Invalid symbol format: `{symbol_to_add}`. Please use format like `XRPUSDT`.", parse_mode="Markdown")
+             return
+
+        print(f"Attempting to add '{symbol_to_add}' to blacklist via Telegram command...")
+        added = add_symbol_to_blacklist(blacklist_file, symbol_to_add)
+        
+        reply_messages = []
+        if added:
+            reply_messages.append(f"`{symbol_to_add}` added to the blacklist.")
+            reply_messages.append("_Note: A bot restart is typically required for this change to affect the active symbol scanning process._")
+        elif added is False and os.path.exists(blacklist_file): # Check if 'False' was due to already existing vs error
+            # Re-load to check if it was truly an "already exists" case or a file save error
+            # This assumes load_symbol_blacklist returns a list, and add_symbol_to_blacklist returned False because it was already there
+            # or because of a file save error.
+            # A more robust check in add_symbol_to_blacklist could return specific error codes/types.
+            # For now, if it's not added and the file exists, we assume it was already there or a save error.
+            # Let's refine `add_symbol_to_blacklist` to be more explicit or check here.
+            # Re-checking if symbol is in the list after attempting to add.
+            _temp_blacklist = load_symbol_blacklist(blacklist_file) # load_symbol_blacklist handles uppercase
+            if symbol_to_add in _temp_blacklist:
+                 reply_messages.append(f"`{symbol_to_add}` is already in the blacklist.")
+            else: # If not in list after attempting add, then it was likely a save error
+                 reply_messages.append(f"Error adding `{symbol_to_add}` to the blacklist. It was not found after attempting to add. Please check bot logs.")
+        else: # `added` is False and file might not exist (e.g. initial error in add_symbol_to_blacklist)
+            reply_messages.append(f"Error adding `{symbol_to_add}` to the blacklist. Please check bot logs.")
+
+        # Show updated blacklist
+        current_blacklist_updated = load_symbol_blacklist(blacklist_file)
+        if not current_blacklist_updated:
+            reply_messages.append("\nThe symbol blacklist is currently empty.")
+        else:
+            reply_messages.append("\n*Updated Symbol Blacklist:*")
+            reply_messages.extend([f"- `{s}`" for s in current_blacklist_updated])
+        
+        await update.message.reply_text("\n".join(reply_messages), parse_mode="Markdown")
 
 
 if __name__ == "__main__":
