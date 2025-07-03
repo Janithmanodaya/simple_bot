@@ -67,7 +67,156 @@ trading_halted_daily_loss = False
 daily_realized_pnl = 0.0
 daily_state_lock = threading.Lock() # Lock for synchronizing access to daily state variables
 
+import os # Added for checking file existence
+import pandas as pd # Added for CSV operations, though pandas is already imported later, ensure it's available here
+
 # --- Utility and Configuration Functions ---
+
+def load_configuration_from_csv(filepath: str) -> dict | None:
+    """Loads configuration from a CSV file."""
+    if not os.path.exists(filepath):
+        print(f"Info: Configuration file '{filepath}' not found.")
+        return None
+    try:
+        df = pd.read_csv(filepath)
+        if 'name' not in df.columns or 'value' not in df.columns:
+            print(f"Error: CSV file '{filepath}' must contain 'name' and 'value' columns.")
+            return None
+        
+        # Convert to dictionary, handling potential NaN values from empty cells
+        configs = pd.Series(df.value.values, index=df.name).dropna().to_dict()
+        
+        if not configs:
+            print(f"Info: Configuration file '{filepath}' is empty or contains no valid data.")
+            return None
+        print(f"Configuration loaded from '{filepath}'.")
+        return configs
+    except pd.errors.EmptyDataError:
+        print(f"Info: Configuration file '{filepath}' is empty.")
+        return None
+    except Exception as e:
+        print(f"Error loading configuration from '{filepath}': {e}")
+        return None
+
+def save_configuration_to_csv(filepath: str, configs_to_save: dict) -> bool:
+    """Saves configuration to a CSV file."""
+    try:
+        # Ensure only non-sensitive, relevant data is saved
+        # API keys and telegram details are explicitly popped before this function is called.
+        # Convert dictionary to DataFrame: name, value
+        df_to_save = pd.DataFrame(list(configs_to_save.items()), columns=['name', 'value'])
+        df_to_save.to_csv(filepath, index=False)
+        print(f"Configuration saved to '{filepath}'.")
+        return True
+    except Exception as e:
+        print(f"Error saving configuration to '{filepath}': {e}")
+        return False
+
+def validate_configurations(loaded_configs: dict) -> tuple[bool, str, dict]:
+    """
+    Validates loaded configurations for types and basic range checks.
+    Returns: (is_valid, message, validated_configs_dict)
+    """
+    if not isinstance(loaded_configs, dict):
+        return False, "Configuration data is not a dictionary.", {}
+
+    validated_configs = {}
+    # Define expected keys, their types, and optional validation functions/ranges
+    # Validation functions take the value and return True if valid, or a string error message
+    expected_params = {
+        "environment": {"type": str, "valid_values": ["testnet", "mainnet"]},
+        "mode": {"type": str, "valid_values": ["live", "backtest"]},
+        "backtest_days": {"type": int, "optional": True, "condition": lambda x: x > 0},
+        "backtest_start_balance_type": {"type": str, "optional": True, "valid_values": ["current", "custom"]},
+        "backtest_custom_start_balance": {"type": float, "optional": True, "condition": lambda x: x > 0},
+        "risk_percent": {"type": float, "condition": lambda x: 0 < x <= 1.0}, # Stored as 0.01 for 1%
+        "leverage": {"type": int, "condition": lambda x: 1 <= x <= 125},
+        "max_concurrent_positions": {"type": int, "condition": lambda x: x > 0},
+        "margin_type": {"type": str, "valid_values": ["ISOLATED", "CROSS"]},
+        "portfolio_risk_cap": {"type": float, "condition": lambda x: 0 < x <= 100.0},
+        "atr_period": {"type": int, "condition": lambda x: x > 0},
+        "atr_multiplier_sl": {"type": float, "condition": lambda x: x > 0},
+        "tp_rr_ratio": {"type": float, "condition": lambda x: x > 0},
+        "max_drawdown_percent": {"type": float, "condition": lambda x: 0 <= x <= 100.0},
+        "daily_stop_loss_percent": {"type": float, "condition": lambda x: 0 <= x <= 100.0},
+        "target_annualized_volatility": {"type": float, "condition": lambda x: 0 < x <= 5.0}, # e.g. 0.80 for 80%
+        "realized_volatility_period": {"type": int, "condition": lambda x: x > 0},
+        "min_leverage": {"type": int, "condition": lambda x: 1 <= x <= 125},
+        "max_leverage": {"type": int, "condition": lambda x: 1 <= x <= 125}, # Further check against min_leverage done in input logic
+        "allow_exceed_risk_for_min_notional": {"type": bool}
+        # API keys and telegram details are not part of this CSV validation
+    }
+    
+    bool_true_values = ['true', 'yes', '1', 'y', True, 1, 1.0] # Added True, 1, 1.0 for direct bool/num
+    bool_false_values = ['false', 'no', '0', 'n', False, 0, 0.0] # Added False, 0, 0.0
+
+    for key, rules in expected_params.items():
+        if key not in loaded_configs:
+            if not rules.get("optional", False):
+                return False, f"Missing required configuration key: '{key}'.", {}
+            continue # Skip optional missing keys
+
+        val_str = str(loaded_configs[key]) # Work with string representation for initial parsing for bools
+        val_orig = loaded_configs[key] # Keep original for type check if not bool
+        
+        try:
+            converted_val = None
+            if rules["type"] == bool:
+                if isinstance(val_orig, bool): # Already a boolean
+                    converted_val = val_orig
+                elif val_str.lower() in [str(btv).lower() for btv in bool_true_values if isinstance(btv, str)]: # check string versions of true values
+                    converted_val = True
+                elif val_str.lower() in [str(bfv).lower() for bfv in bool_false_values if isinstance(bfv, str)]: # check string versions of false values
+                    converted_val = False
+                else: # Try direct conversion for numeric bools (1.0, 0.0 etc)
+                    try:
+                        num_val = float(val_str)
+                        if num_val == 1.0: converted_val = True
+                        elif num_val == 0.0: converted_val = False
+                        else: return False, f"Invalid boolean value for '{key}': {val_str}.", {}
+                    except ValueError:
+                         return False, f"Invalid boolean value for '{key}': {val_str}.", {}
+            elif rules["type"] == int:
+                converted_val = int(float(val_str)) # Convert to float first to handle "10.0" then to int
+            elif rules["type"] == float:
+                converted_val = float(val_str)
+            elif rules["type"] == str:
+                converted_val = val_str # Already string, or explicitly convert
+            else: # Should not happen with defined rules
+                return False, f"Unknown expected type for '{key}'.", {}
+            
+            validated_configs[key] = converted_val
+
+            # Value validation (e.g., enums, ranges)
+            if "valid_values" in rules and converted_val not in rules["valid_values"]:
+                return False, f"Invalid value for '{key}': '{converted_val}'. Allowed: {rules['valid_values']}.", {}
+            if "condition" in rules:
+                condition_check = rules["condition"](converted_val)
+                if condition_check is False: # Explicitly check for False
+                     return False, f"Value for '{key}' ('{converted_val}') does not meet condition: {rules.get('condition_desc', 'Range/value error')}.", {}
+                # If condition_check returns a string, it's an error message (not standard here but could be)
+
+        except ValueError:
+            return False, f"Invalid type for '{key}'. Expected {rules['type'].__name__}, got '{val_str}'.", {}
+        except Exception as e_val: # Catch any other validation error
+             return False, f"Validation error for '{key}' with value '{val_str}': {e_val}", {}
+
+    # Specific inter-dependent checks (e.g. max_leverage >= min_leverage)
+    if "min_leverage" in validated_configs and "max_leverage" in validated_configs:
+        if validated_configs["max_leverage"] < validated_configs["min_leverage"]:
+            return False, "max_leverage cannot be less than min_leverage.", {}
+            
+    if "mode" in validated_configs and validated_configs["mode"] == "backtest":
+        if "backtest_days" not in validated_configs:
+            return False, "Missing 'backtest_days' for backtest mode.", {}
+        if "backtest_start_balance_type" not in validated_configs:
+             return False, "Missing 'backtest_start_balance_type' for backtest mode.", {}
+        if validated_configs["backtest_start_balance_type"] == "custom" and "backtest_custom_start_balance" not in validated_configs:
+            return False, "Missing 'backtest_custom_start_balance' when type is custom.", {}
+
+
+    return True, "Validation successful.", validated_configs
+
 
 def get_current_market_price(client, symbol: str) -> float | None:
     """Fetches the current market price for a symbol."""
@@ -580,240 +729,442 @@ def get_user_configurations():
     """
     Prompts the user for various trading configurations and returns them as a dictionary.
     Includes input validation for each configuration item.
+    Allows loading from or saving to 'configure.csv'.
     """
     print("\n--- Strategy Configuration ---")
     configs = {}
+    loaded_configs_from_csv = None
+    config_filepath = "configure.csv"
+    proceed_to_custom_setup = False
+
+    # Ask user if they want to load from CSV or do custom setup
     while True:
-        env_input = input("Select environment (1:testnet / 2:mainnet): ").strip()
-        if env_input == "1":
-            configs["environment"] = "testnet"
-            break
-        elif env_input == "2":
-            configs["environment"] = "mainnet"
+        load_choice = input(f"Load from '{config_filepath}' (L) or Custom Setup (C)? [L]: ").strip().lower()
+        if not load_choice or load_choice == 'l':
+            loaded_configs_from_csv = load_configuration_from_csv(config_filepath)
+            if loaded_configs_from_csv:
+                is_valid, validation_msg, validated_configs_csv = validate_configurations(loaded_configs_from_csv)
+                if is_valid:
+                    print("Configuration loaded successfully from CSV:")
+                    for k, v in validated_configs_csv.items(): print(f"  {k}: {v}")
+                    
+                    while True:
+                        change_choice = input("Make changes to these settings? (y/N) [N]: ").strip().lower()
+                        if not change_choice or change_choice == 'n':
+                            configs = validated_configs_csv # Use loaded and validated configs
+                            # Ensure API keys are loaded based on the environment from CSV
+                            if "environment" in configs:
+                                api_key, api_secret, telegram_token, telegram_chat_id = load_api_keys(configs["environment"])
+                                configs["api_key"] = api_key
+                                configs["api_secret"] = api_secret
+                                configs["telegram_bot_token"] = telegram_token
+                                configs["telegram_chat_id"] = telegram_chat_id
+                            else:
+                                print("Error: 'environment' missing from loaded CSV configuration. Cannot load API keys.")
+                                # Fallback to custom setup or ask for environment specifically
+                                proceed_to_custom_setup = True
+                                break 
+                            
+                            # Add fixed strategy details
+                            configs["strategy_id"] = 8
+                            configs["strategy_name"] = "Advance EMA Cross"
+                            configs["max_scan_threads"] = 5 # Fixed value
+                            print("--- Configuration Complete (Loaded from CSV) ---")
+                            return configs
+                        elif change_choice == 'y':
+                            configs = validated_configs_csv # Start custom setup with these values
+                            proceed_to_custom_setup = True
+                            break # Break from change_choice loop
+                        else:
+                            print("Invalid choice. Please enter 'y' or 'n'.")
+                    if proceed_to_custom_setup: break # Break from load_choice loop to go to custom setup
+                else:
+                    print(f"Invalid data in '{config_filepath}': {validation_msg} Proceeding to custom setup.")
+                    proceed_to_custom_setup = True
+                    break # Break from load_choice loop
+            else:
+                print(f"'{config_filepath}' not found or empty/corrupted. Proceeding to custom setup.")
+                proceed_to_custom_setup = True
+                break # Break from load_choice loop
+        elif load_choice == 'c':
+            proceed_to_custom_setup = True
+            break # Break from load_choice loop
+        else:
+            print("Invalid choice. Please enter 'L' or 'C'.")
+
+    # If proceed_to_custom_setup is True (either by choice or failure to load)
+    # `configs` might already hold values from CSV if user chose 'y' to change them.
+    # Otherwise, `configs` is empty.
+
+    print("\n--- Custom Configuration Setup ---")
+    # Helper to get input, using value from `configs` (loaded from CSV) as default if available
+    def get_input_with_default(prompt_message, current_value_key, default_constant_value, type_converter=str):
+        default_to_show = configs.get(current_value_key, default_constant_value)
+        user_input = input(f"{prompt_message} (default: {default_to_show}): ")
+        
+        # If user enters nothing, use the default_to_show (which could be from CSV or constant)
+        if not user_input:
+            # Need to ensure the default_to_show is of the correct type if it came from CSV (already string)
+            # or from constant (might need conversion if it's not already a string for display)
+            # The type_converter will handle this.
+            try:
+                return type_converter(default_to_show)
+            except ValueError: # If default_to_show can't be converted (e.g. empty string for float)
+                 # This case needs careful handling. For now, let's assume default_to_show is valid or re-prompt logic handles it.
+                 # Or, use the original default_constant_value if default_to_show fails conversion.
+                 return type_converter(default_constant_value)
+        try:
+            return type_converter(user_input)
+        except ValueError:
+            # If conversion fails, the validation loop in the main part will catch it and re-prompt.
+            # For robustness, could return a specific error marker or re-prompt here.
+            # For now, rely on outer validation loop.
+            raise # Re-raise to be caught by the calling loop's try-except
+
+    # Environment
+    while True:
+        # Environment is special, it dictates API key loading.
+        # If loaded from CSV, it should already be in `configs`.
+        env_default_display = configs.get("environment", "testnet") # Default to testnet if not in CSV
+        env_input = input(f"Select environment (1:testnet / 2:mainnet) (current: {env_default_display}): ").strip()
+        
+        chosen_env = None
+        if not env_input and "environment" in configs: # User hit enter, use CSV loaded value
+            chosen_env = configs["environment"]
+        elif env_input == "1": chosen_env = "testnet"
+        elif env_input == "2": chosen_env = "mainnet"
+        
+        if chosen_env in ["testnet", "mainnet"]:
+            configs["environment"] = chosen_env
             break
         print("Invalid environment. Please enter '1' for testnet or '2' for mainnet.")
-    # Load all keys including Telegram
+
+    # Load API keys based on selected environment
     api_key, api_secret, telegram_token, telegram_chat_id = load_api_keys(configs["environment"])
     configs["api_key"] = api_key
     configs["api_secret"] = api_secret
     configs["telegram_bot_token"] = telegram_token
     configs["telegram_chat_id"] = telegram_chat_id
-
+    
+    # Mode
     while True:
-        mode_input = input("Select mode (1:live / 2:backtest): ").strip()
-        if mode_input in ["1", "2"]:
-            configs["mode"] = "live" if mode_input == "1" else "backtest"
+        mode_default_display = configs.get("mode", "live")
+        mode_input = input(f"Select mode (1:live / 2:backtest) (current: {mode_default_display}): ").strip()
+        
+        chosen_mode = None
+        if not mode_input and "mode" in configs: chosen_mode = configs["mode"]
+        elif mode_input == "1": chosen_mode = "live"
+        elif mode_input == "2": chosen_mode = "backtest"
+
+        if chosen_mode in ["live", "backtest"]:
+            configs["mode"] = chosen_mode
             break
         print("Invalid mode. Please enter '1' for live or '2' for backtest.")
 
     if configs["mode"] == "backtest":
         while True:
             try:
-                days_input = input("Enter number of days for backtesting (e.g., 30): ")
-                days = int(days_input)
+                days = get_input_with_default(
+                    "Enter number of days for backtesting",
+                    "backtest_days", 30, int
+                )
                 if days > 0:
                     configs["backtest_days"] = days
                     break
                 print("Number of days must be a positive integer.")
-            except ValueError:
-                print("Invalid input. Please enter an integer for the number of days.")
+            except ValueError: print("Invalid input. Please enter an integer for the number of days.")
         
         while True:
-            balance_choice_input = input("For backtest, use (1:current account balance) or (2:set a custom start balance)? [1]: ").strip()
-            if not balance_choice_input: balance_choice_input = "1" # Default if user presses Enter
+            bt_balance_type_default_display = configs.get("backtest_start_balance_type", "current")
+            balance_choice_input = input(f"For backtest, use (1:current account balance) or (2:set a custom start balance)? (current: {bt_balance_type_default_display}) [1 if new, else current]: ").strip()
+            
+            chosen_bt_balance_type = None
+            # If user hits enter, and there was a value from CSV, use that. Otherwise, default to '1' (current).
+            if not balance_choice_input:
+                chosen_bt_balance_type = configs.get("backtest_start_balance_type", "current") # 'current' is implied by '1'
+                if chosen_bt_balance_type == "current": pass # Already set
+                elif chosen_bt_balance_type == "custom": pass # Already set
+                else: # If CSV had something else, or nothing, map to '1' or '2' logic
+                    chosen_bt_balance_type = "current" # Default to current
+            elif balance_choice_input == "1": chosen_bt_balance_type = "current"
+            elif balance_choice_input == "2": chosen_bt_balance_type = "custom"
 
-            if balance_choice_input == "1":
-                configs["backtest_start_balance_type"] = "current"
-                break
-            elif balance_choice_input == "2":
-                configs["backtest_start_balance_type"] = "custom"
+            if chosen_bt_balance_type in ["current", "custom"]:
+                configs["backtest_start_balance_type"] = chosen_bt_balance_type
                 break
             print("Invalid choice. Please enter '1' for current or '2' for custom.")
 
         if configs["backtest_start_balance_type"] == "custom":
             while True:
                 try:
-                    custom_bal_input = input("Enter custom start balance for backtest (e.g., 10000): ")
-                    custom_bal = float(custom_bal_input)
+                    custom_bal = get_input_with_default(
+                        "Enter custom start balance for backtest",
+                        "backtest_custom_start_balance", 10000.0, float
+                    )
                     if custom_bal > 0:
                         configs["backtest_custom_start_balance"] = custom_bal
                         break
                     print("Custom balance must be a positive number.")
-                except ValueError:
-                    print("Invalid input. Please enter a number for the custom balance.")
+                except ValueError: print("Invalid input. Please enter a number for the custom balance.")
+    else: # Live mode, ensure backtest keys are not in the final saved CSV if they were from a previous load
+        configs.pop("backtest_days", None)
+        configs.pop("backtest_start_balance_type", None)
+        configs.pop("backtest_custom_start_balance", None)
 
+
+    # Risk Percent
     while True:
         try:
-            risk_input = input(f"Enter account risk % per trade (e.g., 1 for 1%, default: {DEFAULT_RISK_PERCENT}%): ")
-            risk_percent = float(risk_input or DEFAULT_RISK_PERCENT)
-            if 0 < risk_percent <= 100:
-                configs["risk_percent"] = risk_percent / 100
+            # For risk_percent, the stored value is float (e.g., 0.01), display is % (e.g., 1.0)
+            # Default constant is 1.0 (meaning 1%)
+            # If loaded from CSV, it's already 0.01. Convert to % for display.
+            risk_default_display = (configs.get("risk_percent", DEFAULT_RISK_PERCENT / 100.0) * 100.0 
+                                    if "risk_percent" in configs else DEFAULT_RISK_PERCENT)
+
+            risk_input_str = input(f"Enter account risk % per trade (e.g., 1 for 1%) (default: {risk_default_display:.2f}%): ")
+            
+            risk_percent_val = 0
+            if not risk_input_str: # User hit enter
+                risk_percent_val = float(risk_default_display) # Use the displayed default (already in %)
+            else:
+                risk_percent_val = float(risk_input_str)
+
+            if 0 < risk_percent_val <= 100:
+                configs["risk_percent"] = risk_percent_val / 100.0 # Store as decimal
                 break
             print("Risk percentage must be a positive value (e.g., 0.5, 1, up to 100).")
-        except ValueError:
-            print("Invalid input for risk percentage. Please enter a number.")
+        except ValueError: print("Invalid input for risk percentage. Please enter a number.")
+
+    # Leverage
     while True:
         try:
-            leverage_input = input(f"Enter leverage (e.g., 10 for 10x, default: {DEFAULT_LEVERAGE}x): ")
-            leverage = int(leverage_input or DEFAULT_LEVERAGE)
+            leverage = get_input_with_default(
+                "Enter leverage (e.g., 10 for 10x)",
+                "leverage", DEFAULT_LEVERAGE, int
+            )
             if 1 <= leverage <= 125:
                 configs["leverage"] = leverage
                 break
             print("Leverage must be an integer between 1 and 125.")
-        except ValueError:
-            print("Invalid input for leverage. Please enter an integer.")
+        except ValueError: print("Invalid input for leverage. Please enter an integer.")
+
+    # Max Concurrent Positions
     while True:
         try:
-            max_pos_input = input(f"Enter max concurrent positions (default: {DEFAULT_MAX_CONCURRENT_POSITIONS}): ")
-            max_concurrent_positions = int(max_pos_input or DEFAULT_MAX_CONCURRENT_POSITIONS)
-            if max_concurrent_positions > 0:
-                configs["max_concurrent_positions"] = max_concurrent_positions
+            max_pos = get_input_with_default(
+                "Enter max concurrent positions",
+                "max_concurrent_positions", DEFAULT_MAX_CONCURRENT_POSITIONS, int
+            )
+            if max_pos > 0:
+                configs["max_concurrent_positions"] = max_pos
                 break
             print("Max concurrent positions must be a positive integer.")
-        except ValueError:
-            print("Invalid input for max positions. Please enter an integer.")
+        except ValueError: print("Invalid input for max positions. Please enter an integer.")
+
+    # Margin Type
     while True:
-        margin_input = input(f"Enter margin type (ISOLATED/CROSS, default: {DEFAULT_MARGIN_TYPE}): ").upper().strip()
-        margin_type = margin_input or DEFAULT_MARGIN_TYPE
-        if margin_type in ["ISOLATED", "CROSS"]:
-            configs["margin_type"] = margin_type
+        margin_default_display = configs.get("margin_type", DEFAULT_MARGIN_TYPE)
+        margin_input = input(f"Enter margin type (ISOLATED/CROSS) (default: {margin_default_display}): ").upper().strip()
+        
+        chosen_margin = None
+        if not margin_input and "margin_type" in configs: chosen_margin = configs["margin_type"]
+        elif not margin_input : chosen_margin = DEFAULT_MARGIN_TYPE # if no csv val and empty input
+        else: chosen_margin = margin_input
+
+        if chosen_margin in ["ISOLATED", "CROSS"]:
+            configs["margin_type"] = chosen_margin
             break
         print("Invalid margin type. Please enter 'ISOLATED' or 'CROSS'.")
-    # Removed user input for max_scan_threads, fixing it to 5.
-    configs["max_scan_threads"] = 5
-    print(f"Maximum symbol scan threads fixed to 5.")
+    
+    configs["max_scan_threads"] = 5 # Fixed
+    print(f"Maximum symbol scan threads fixed to {configs['max_scan_threads']}.")
 
+    # Portfolio Risk Cap
     while True:
         try:
-            portfolio_risk_input = input(f"Enter max portfolio risk % (aggregate open trades, e.g., {DEFAULT_PORTFOLIO_RISK_CAP} for {DEFAULT_PORTFOLIO_RISK_CAP}%): ")
-            portfolio_risk_cap_percent = float(portfolio_risk_input or DEFAULT_PORTFOLIO_RISK_CAP)
-            if 0 < portfolio_risk_cap_percent <= 100:
-                configs["portfolio_risk_cap"] = portfolio_risk_cap_percent # Store as percentage, e.g., 5.0
+            portfolio_risk = get_input_with_default(
+                f"Enter max portfolio risk % (aggregate open trades, e.g., {DEFAULT_PORTFOLIO_RISK_CAP} for {DEFAULT_PORTFOLIO_RISK_CAP}%)",
+                "portfolio_risk_cap", DEFAULT_PORTFOLIO_RISK_CAP, float
+            )
+            if 0 < portfolio_risk <= 100:
+                configs["portfolio_risk_cap"] = portfolio_risk
                 break
             print("Portfolio risk percentage must be a positive value (e.g., 3, 5, up to 100).")
-        except ValueError:
-            print("Invalid input for portfolio risk percentage. Please enter a number.")
+        except ValueError: print("Invalid input for portfolio risk percentage. Please enter a number.")
 
+    # ATR Period
     while True:
         try:
-            atr_period_input = input(f"Enter ATR Period for SL/TP (e.g., {DEFAULT_ATR_PERIOD}): ")
-            atr_period = int(atr_period_input or DEFAULT_ATR_PERIOD)
-            if atr_period > 0:
-                configs["atr_period"] = atr_period
+            atr_period_val = get_input_with_default(
+                "Enter ATR Period for SL/TP",
+                "atr_period", DEFAULT_ATR_PERIOD, int
+            )
+            if atr_period_val > 0:
+                configs["atr_period"] = atr_period_val
                 break
             print("ATR Period must be a positive integer.")
-        except ValueError:
-            print("Invalid input for ATR Period. Please enter an integer.")
+        except ValueError: print("Invalid input for ATR Period. Please enter an integer.")
 
+    # ATR Multiplier SL
     while True:
         try:
-            atr_multiplier_sl_input = input(f"Enter ATR Multiplier for Stop Loss (e.g., {DEFAULT_ATR_MULTIPLIER_SL}): ")
-            atr_multiplier_sl = float(atr_multiplier_sl_input or DEFAULT_ATR_MULTIPLIER_SL)
-            if atr_multiplier_sl > 0:
-                configs["atr_multiplier_sl"] = atr_multiplier_sl
+            atr_mult_sl = get_input_with_default(
+                "Enter ATR Multiplier for Stop Loss",
+                "atr_multiplier_sl", DEFAULT_ATR_MULTIPLIER_SL, float
+            )
+            if atr_mult_sl > 0:
+                configs["atr_multiplier_sl"] = atr_mult_sl
                 break
             print("ATR Multiplier for SL must be a positive number.")
-        except ValueError:
-            print("Invalid input for ATR Multiplier (SL). Please enter a number.")
+        except ValueError: print("Invalid input for ATR Multiplier (SL). Please enter a number.")
 
+    # TP R:R Ratio
     while True:
         try:
-            tp_rr_ratio_input = input(f"Enter Take Profit Risk:Reward Ratio (e.g., {DEFAULT_TP_RR_RATIO}): ")
-            tp_rr_ratio = float(tp_rr_ratio_input or DEFAULT_TP_RR_RATIO)
-            if tp_rr_ratio > 0:
-                configs["tp_rr_ratio"] = tp_rr_ratio
+            tp_rr = get_input_with_default(
+                "Enter Take Profit Risk:Reward Ratio",
+                "tp_rr_ratio", DEFAULT_TP_RR_RATIO, float
+            )
+            if tp_rr > 0:
+                configs["tp_rr_ratio"] = tp_rr
                 break
             print("Take Profit R:R Ratio must be a positive number.")
-        except ValueError:
-            print("Invalid input for TP R:R Ratio. Please enter a number.")
-
+        except ValueError: print("Invalid input for TP R:R Ratio. Please enter a number.")
+    
+    # Max Daily Drawdown %
     while True:
         try:
-            max_drawdown_input = input(f"Enter Max Daily Drawdown % (from high equity, 0 to disable, default: {DEFAULT_MAX_DRAWDOWN_PERCENT}%): ")
-            max_drawdown_percent = float(max_drawdown_input or DEFAULT_MAX_DRAWDOWN_PERCENT)
-            if 0 <= max_drawdown_percent <= 100:
-                configs["max_drawdown_percent"] = max_drawdown_percent
+            max_dd = get_input_with_default(
+                f"Enter Max Daily Drawdown % (from high equity, 0 to disable, default: {DEFAULT_MAX_DRAWDOWN_PERCENT}%)",
+                "max_drawdown_percent", DEFAULT_MAX_DRAWDOWN_PERCENT, float
+            )
+            if 0 <= max_dd <= 100:
+                configs["max_drawdown_percent"] = max_dd
                 break
             print("Max Daily Drawdown % must be between 0 (disabled) and 100.")
-        except ValueError:
-            print("Invalid input for Max Daily Drawdown %. Please enter a number.")
+        except ValueError: print("Invalid input for Max Daily Drawdown %. Please enter a number.")
 
+    # Daily Stop Loss %
     while True:
         try:
-            daily_stop_loss_input = input(f"Enter Daily Stop Loss % (of start equity, 0 to disable, default: {DEFAULT_DAILY_STOP_LOSS_PERCENT}%): ")
-            daily_stop_loss_percent = float(daily_stop_loss_input or DEFAULT_DAILY_STOP_LOSS_PERCENT)
-            if 0 <= daily_stop_loss_percent <= 100:
-                configs["daily_stop_loss_percent"] = daily_stop_loss_percent
+            daily_sl = get_input_with_default(
+                f"Enter Daily Stop Loss % (of start equity, 0 to disable, default: {DEFAULT_DAILY_STOP_LOSS_PERCENT}%)",
+                "daily_stop_loss_percent", DEFAULT_DAILY_STOP_LOSS_PERCENT, float
+            )
+            if 0 <= daily_sl <= 100:
+                configs["daily_stop_loss_percent"] = daily_sl
                 break
             print("Daily Stop Loss % must be between 0 (disabled) and 100.")
-        except ValueError:
-            print("Invalid input for Daily Stop Loss %. Please enter a number.")
+        except ValueError: print("Invalid input for Daily Stop Loss %. Please enter a number.")
 
+    # Target Annualized Volatility
     while True:
         try:
-            target_vol_input = input(f"Enter Target Annualized Volatility (e.g., {DEFAULT_TARGET_ANNUALIZED_VOLATILITY:.2f} for {DEFAULT_TARGET_ANNUALIZED_VOLATILITY*100:.0f}%): ")
-            target_vol = float(target_vol_input or DEFAULT_TARGET_ANNUALIZED_VOLATILITY)
-            if 0 < target_vol <= 5.0: # Assuming target vol is a decimal like 0.8 (80%) up to 500%
-                configs["target_annualized_volatility"] = target_vol
-                break
-            print("Target Annualized Volatility must be a positive number (e.g., 0.8 for 80%). Sensible range up to e.g. 5.0 (500%).")
-        except ValueError:
-            print("Invalid input for Target Annualized Volatility. Please enter a number.")
+            # Display as percentage if it's like 0.80 -> 80%
+            target_vol_default_display = (configs.get("target_annualized_volatility", DEFAULT_TARGET_ANNUALIZED_VOLATILITY) * 100.0
+                                           if "target_annualized_volatility" in configs else DEFAULT_TARGET_ANNUALIZED_VOLATILITY * 100.0)
+
+            target_vol_input_str = input(f"Enter Target Annualized Volatility % (e.g., {target_vol_default_display:.0f}% for {configs.get('target_annualized_volatility', DEFAULT_TARGET_ANNUALIZED_VOLATILITY):.2f}): ")
             
+            target_vol_pct = 0
+            if not target_vol_input_str: # User hit enter
+                target_vol_pct = float(target_vol_default_display) # Use the displayed default (already in %)
+            else:
+                target_vol_pct = float(target_vol_input_str)
+            
+            target_vol_decimal = target_vol_pct / 100.0
+
+            if 0 < target_vol_decimal <= 5.0: # Check decimal value
+                configs["target_annualized_volatility"] = target_vol_decimal
+                break
+            print("Target Annualized Volatility must be a positive number (e.g., input 80 for 80% or 0.8). Sensible range up to 500% (5.0).")
+        except ValueError: print("Invalid input for Target Annualized Volatility. Please enter a number.")
+            
+    # Realized Volatility Period
     while True:
         try:
-            vol_period_input = input(f"Enter Realized Volatility Period (candles, e.g., {DEFAULT_REALIZED_VOLATILITY_PERIOD}): ")
-            vol_period = int(vol_period_input or DEFAULT_REALIZED_VOLATILITY_PERIOD)
+            vol_period = get_input_with_default(
+                "Enter Realized Volatility Period (candles)",
+                "realized_volatility_period", DEFAULT_REALIZED_VOLATILITY_PERIOD, int
+            )
             if vol_period > 0:
                 configs["realized_volatility_period"] = vol_period
                 break
             print("Realized Volatility Period must be a positive integer.")
-        except ValueError:
-            print("Invalid input for Realized Volatility Period. Please enter an integer.")
+        except ValueError: print("Invalid input for Realized Volatility Period. Please enter an integer.")
 
+    # Minimum Leverage
     while True:
         try:
-            min_lev_input = input(f"Enter Minimum Leverage for dynamic adjustment (e.g., {DEFAULT_MIN_LEVERAGE}): ")
-            min_lev = int(min_lev_input or DEFAULT_MIN_LEVERAGE)
-            if 1 <= min_lev <= 125: # Binance absolute min is 1
+            min_lev = get_input_with_default(
+                "Enter Minimum Leverage for dynamic adjustment",
+                "min_leverage", DEFAULT_MIN_LEVERAGE, int
+            )
+            if 1 <= min_lev <= 125:
                 configs["min_leverage"] = min_lev
                 break
             print("Minimum Leverage must be an integer between 1 and 125.")
-        except ValueError:
-            print("Invalid input for Minimum Leverage. Please enter an integer.")
+        except ValueError: print("Invalid input for Minimum Leverage. Please enter an integer.")
 
+    # Maximum Leverage
     while True:
         try:
-            max_lev_input = input(f"Enter Maximum Leverage for dynamic adjustment (e.g., {DEFAULT_MAX_LEVERAGE}): ")
-            max_lev = int(max_lev_input or DEFAULT_MAX_LEVERAGE)
-            # We'll compare max_lev with min_lev after min_lev is set
-            if configs.get("min_leverage", DEFAULT_MIN_LEVERAGE) <= max_lev <= 125:
+            max_lev = get_input_with_default(
+                "Enter Maximum Leverage for dynamic adjustment",
+                "max_leverage", DEFAULT_MAX_LEVERAGE, int
+            )
+            min_lev_for_check = configs.get("min_leverage", DEFAULT_MIN_LEVERAGE) # Should be set by now
+            if min_lev_for_check <= max_lev <= 125:
                 configs["max_leverage"] = max_lev
                 break
-            print(f"Maximum Leverage must be an integer between {configs.get('min_leverage', DEFAULT_MIN_LEVERAGE)} and 125.")
-        except ValueError:
-            print("Invalid input for Maximum Leverage. Please enter an integer.")
-        except KeyError: # Should not happen if min_leverage is set before this loop
-            print("Error: min_leverage not set. Please restart configuration.") # Fallback
-            configs["min_leverage"] = DEFAULT_MIN_LEVERAGE # Set a default to prevent loop error
-            # This case indicates a logic flow error if min_leverage isn't in configs.
+            print(f"Maximum Leverage must be an integer between {min_lev_for_check} and 125.")
+        except ValueError: print("Invalid input for Maximum Leverage. Please enter an integer.")
 
+    # Allow Exceed Risk for Min Notional
     while True:
-        exceed_risk_input = input(f"Allow exceeding individual trade risk % to meet MIN_NOTIONAL? (yes/no, default: {'yes' if DEFAULT_ALLOW_EXCEED_RISK_FOR_MIN_NOTIONAL else 'no'}): ").lower().strip()
-        if not exceed_risk_input: # User pressed Enter, use default
-            configs["allow_exceed_risk_for_min_notional"] = DEFAULT_ALLOW_EXCEED_RISK_FOR_MIN_NOTIONAL
-            break
-        if exceed_risk_input in ["yes", "y"]:
-            configs["allow_exceed_risk_for_min_notional"] = True
-            break
-        elif exceed_risk_input in ["no", "n"]:
-            configs["allow_exceed_risk_for_min_notional"] = False
+        # Determine default display: if loaded from CSV, use that, else use constant
+        default_bool_display = ""
+        if "allow_exceed_risk_for_min_notional" in configs:
+            default_bool_display = 'yes' if configs["allow_exceed_risk_for_min_notional"] else 'no'
+        else:
+            default_bool_display = 'yes' if DEFAULT_ALLOW_EXCEED_RISK_FOR_MIN_NOTIONAL else 'no'
+
+        exceed_risk_input = input(f"Allow exceeding individual trade risk % to meet MIN_NOTIONAL? (yes/no) (default: {default_bool_display}): ").lower().strip()
+        
+        chosen_exceed_risk = None
+        if not exceed_risk_input: # User hit enter
+            chosen_exceed_risk = configs.get("allow_exceed_risk_for_min_notional", DEFAULT_ALLOW_EXCEED_RISK_FOR_MIN_NOTIONAL)
+        elif exceed_risk_input in ["yes", "y"]: chosen_exceed_risk = True
+        elif exceed_risk_input in ["no", "n"]: chosen_exceed_risk = False
+        
+        if isinstance(chosen_exceed_risk, bool):
+            configs["allow_exceed_risk_for_min_notional"] = chosen_exceed_risk
             break
         print("Invalid input. Please enter 'yes' or 'no'.")
 
     configs["strategy_id"] = 8
     configs["strategy_name"] = "Advance EMA Cross"
-    print("--- Configuration Complete ---")
+    
+    # Save configurations to CSV
+    # We need to remove API keys before saving to CSV if they were temporarily added
+    # However, the current plan is that API keys are NOT part of the CSV.
+    # They are loaded from keys.py into the `configs` dict *after* this function returns (or towards the end).
+    # So, the `configs` dict at this point should only contain user-configurable parameters.
+    
+    # The API keys are added to `configs` dict after `environment` is known.
+    # So, we need to make a copy for saving that excludes them.
+    configs_to_save = configs.copy()
+    configs_to_save.pop("api_key", None)
+    configs_to_save.pop("api_secret", None)
+    configs_to_save.pop("telegram_bot_token", None)
+    configs_to_save.pop("telegram_chat_id", None)
+    
+    if save_configuration_to_csv(config_filepath, configs_to_save):
+        print(f"Configurations saved to '{config_filepath}'.")
+    else:
+        print(f"Failed to save configurations to '{config_filepath}'.")
+        
+    print("--- Configuration Complete (Custom Setup) ---")
     return configs
 
 # --- Helper function to build symbol_info_map from active_trades ---
