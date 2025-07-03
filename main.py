@@ -3123,13 +3123,13 @@ def trading_loop(client, configs, monitored_symbols):
                 # --- Loop Delay ---
                 # Determine appropriate sleep time
                 # If any halt is active, or max positions, might use a shorter delay to check for new day or slot availability sooner.
-                current_loop_delay_seconds = configs['loop_delay_minutes'] * 60 # Default delay
+                current_loop_delay_seconds = configs['loop_delay_minutes'] * 25 # Default delay
                 if halt_dd_flag or halt_dsl_flag or (num_active_trades >= max_pos_limit and proceed_with_new_trades == False) :
                     # Using a shorter delay if halted or at max positions, to check for day reset or position closure sooner
-                    current_loop_delay_seconds = 60 
+                    current_loop_delay_seconds = 25 
                     print(f"Using shorter loop delay ({current_loop_delay_seconds}s) due to trading halt or max positions.")
                 
-                print(f"Waiting for {current_loop_delay_seconds / 60:.1f} m...")
+                print(f"Waiting for {current_loop_delay_seconds / 25:.1f} m...")
                 time.sleep(current_loop_delay_seconds)
 
             except Exception as loop_err: # Catch errors within the try block of the loop
