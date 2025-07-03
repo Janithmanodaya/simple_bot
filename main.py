@@ -2136,7 +2136,31 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is
         # Initial check for sufficient kline data 
         if klines_df.empty or len(klines_df) < 202: 
             print(f"{log_prefix} Insufficient kline data ({len(klines_df)}). Aborting.")
-            return 
+            return
+
+        # --- ACTIVE TRADE AND OPEN ORDERS CHECK ---
+        # Check 1: Is there already an active trade managed by the bot for this symbol?
+        with lock: # active_trades_lock
+            if symbol in active_trades:
+                active_trade_details = active_trades[symbol]
+                print(f"{log_prefix} New signal processing SKIPPED. Symbol '{symbol}' already has an active '{active_trade_details.get('side')}' trade @ {active_trade_details.get('entry_price')}.")
+                # Optionally, verify SL/TP status here if needed, but for now, just skip.
+                return # Skip new trade entry
+
+        # Check 2: Are there any open orders on Binance for this symbol?
+        # This helps prevent duplicate trades if, for example, a limit order from a previous attempt is still pending.
+        try:
+            open_orders_on_exchange = client.futures_get_open_orders(symbol=symbol)
+            if open_orders_on_exchange: # If the list is not empty
+                print(f"{log_prefix} New signal processing SKIPPED. Symbol '{symbol}' has {len(open_orders_on_exchange)} existing open order(s) on Binance.")
+                for order in open_orders_on_exchange:
+                    print(f"  - Order ID: {order['orderId']}, Type: {order['type']}, Side: {order['side']}, Qty: {order['origQty']}, Price: {order.get('price', 'N/A')}")
+                return # Skip new trade entry
+        except BinanceAPIException as e:
+            print(f"{log_prefix} API Error checking open orders for {symbol}: {e}. Proceeding cautiously (may not skip if orders exist but check failed).")
+        except Exception as e:
+            print(f"{log_prefix} Unexpected error checking open orders for {symbol}: {e}. Proceeding cautiously.")
+
 
         klines_df['EMA100'] = calculate_ema(klines_df, 100)
         klines_df['EMA200'] = calculate_ema(klines_df, 200)
@@ -2150,25 +2174,24 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is
         new_signal = check_ema_crossover_conditions(klines_df, symbol_for_logging=symbol)
         if new_signal not in ["LONG", "SHORT"]:
             # No actionable signal, check_ema_crossover_conditions logs reasons.
-            return 
-
-        # Check if symbol is already in active_trades (protected by active_trades_lock)
-        with lock: 
-            if symbol in active_trades:
-                print(f"{log_prefix} Signal {new_signal} IGNORED. Symbol already has an active trade: {active_trades[symbol].get('side')} @ {active_trades[symbol].get('entry_price')}")
-                return
+            # The new_signal value itself might be a reason string like "VALIDATION_FAILED"
+            if isinstance(new_signal, str): # If it's a reason string
+                 print(f"{log_prefix} No actionable signal for {symbol}. Reason: {new_signal}")
+            # else it's None, meaning no crossover.
+            return
 
         # Max concurrent position check (protected by active_trades_lock)
+        # This check is now implicitly covered by the active_trade check above if a trade for *this* symbol exists.
+        # However, we still need the global max concurrent positions check.
         with lock: 
             if len(active_trades) >= configs["max_concurrent_positions"]:
-                print(f"{log_prefix} Max concurrent positions ({configs['max_concurrent_positions']}) reached. Cannot open new trade for {symbol}.")
+                print(f"{log_prefix} Max concurrent positions ({configs['max_concurrent_positions']}) reached globally. Cannot open new trade for {symbol}.")
                 return
         
-        # If we reach here, it's a valid signal for a new trade, symbol not active, and under max positions.
+        # If we reach here, it's a valid signal, no active trade for this symbol, no open orders for this symbol, and under max global positions.
         signal = new_signal # To be used consistently hereafter
-        # was_existing_trade = False # This is implicitly true now if we proceed.
 
-        print(f"\n{log_prefix} --- Proceeding with New Validated Trade Signal: {signal} (No existing active trade) ---")
+        print(f"\n{log_prefix} --- Proceeding with New Validated Trade Signal: {signal} (No existing active trade or open orders for this symbol) ---")
 
         symbol_info = get_symbol_info(client, symbol)
         if not symbol_info:
