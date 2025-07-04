@@ -44,7 +44,8 @@ DEFAULT_TARGET_ANNUALIZED_VOLATILITY = 0.80 # Target annualized volatility for l
 DEFAULT_REALIZED_VOLATILITY_PERIOD = 30   # Period in candles for calculating realized volatility
 DEFAULT_MIN_LEVERAGE = 1                  # Minimum leverage to use
 DEFAULT_MAX_LEVERAGE = 20                 # Maximum leverage to use (user preference, also check exchange limits)
-
+DEFAULT_STRATEGY = "ema_cross"   # Default strategy to run
+DEFAULT_FIB_ORDER_TIMEOUT_MINUTES = 5 # Default timeout for Fib retracement limit orders
 
 # --- Global State Variables ---
 # Stores details of active trades. Key: symbol (e.g., "BTCUSDT")
@@ -62,6 +63,12 @@ symbols_currently_processing_lock = threading.Lock()
 # Globals for Cooldown Timer
 last_signal_time = {}
 last_signal_lock = threading.Lock()
+
+# Globals for 1-minute candle buffers (for Fibonacci strategy)
+# Key: symbol (e.g., "BTCUSDT"), Value: deque of last N 1-minute candles (Pandas DataFrames/Series)
+symbol_1m_candle_buffers = {}
+symbol_1m_candle_buffers_lock = threading.Lock()
+DEFAULT_1M_BUFFER_SIZE = 200 # Max 1-minute candles to keep per symbol for new strategy (e.g., for pivot lookbacks)
 
 # Globals for Trade Signature Check
 recent_trade_signatures = {} # Stores trade_signature: timestamp
@@ -154,7 +161,10 @@ def validate_configurations(loaded_configs: dict) -> tuple[bool, str, dict]:
         "realized_volatility_period": {"type": int, "condition": lambda x: x > 0},
         "min_leverage": {"type": int, "condition": lambda x: 1 <= x <= 125},
         "max_leverage": {"type": int, "condition": lambda x: 1 <= x <= 125}, # Further check against min_leverage done in input logic
-        "allow_exceed_risk_for_min_notional": {"type": bool}
+        "allow_exceed_risk_for_min_notional": {"type": bool},
+        "strategy_choice": {"type": str, "valid_values": ["ema_cross", "fib_retracement"]},
+        "fib_1m_buffer_size": {"type": int, "optional": True, "condition": lambda x: 20 <= x <= 1000}, # For Fibonacci strategy
+        "fib_order_timeout_minutes": {"type": int, "optional": True, "condition": lambda x: 1 <= x <= 60} # For Fibonacci strategy
         # API keys and telegram details are not part of this CSV validation
     }
     
@@ -612,6 +622,738 @@ def send_telegram_message(bot_token, chat_id, message):
 
     return asyncio.run(_send())
 
+# --- Fibonacci Retracement Strategy Modules (New) ---
+from collections import deque # For 1m candle buffer
+import numpy as np # For pivot detection, already imported but good to note dependency
+
+# --- Data Module (Fib Strategy) ---
+def update_1m_candle_buffer(symbol: str, new_candle_df_row: pd.Series, buffer_size: int):
+    """
+    Updates the 1-minute candle buffer for a given symbol.
+    `new_candle_df_row` should be a Pandas Series representing the latest 1m candle,
+    with a DateTimeIndex.
+    """
+    global symbol_1m_candle_buffers, symbol_1m_candle_buffers_lock
+    with symbol_1m_candle_buffers_lock:
+        if symbol not in symbol_1m_candle_buffers:
+            symbol_1m_candle_buffers[symbol] = deque(maxlen=buffer_size)
+        
+        # Ensure the new candle is not duplicating the last one in the buffer if timestamps match
+        if symbol_1m_candle_buffers[symbol]:
+            last_buffered_candle_time = symbol_1m_candle_buffers[symbol][-1].name # Assuming index is timestamp
+            if new_candle_df_row.name == last_buffered_candle_time:
+                # Overwrite last candle if timestamp is the same (e.g. update on partial candle close)
+                symbol_1m_candle_buffers[symbol][-1] = new_candle_df_row
+                # print(f"Updated last 1m candle for {symbol} at {new_candle_df_row.name}")
+                return
+            elif new_candle_df_row.name < last_buffered_candle_time:
+                # print(f"Skipping older 1m candle for {symbol}. New: {new_candle_df_row.name}, Last: {last_buffered_candle_time}")
+                return # Skip if out of order
+
+        symbol_1m_candle_buffers[symbol].append(new_candle_df_row)
+        # print(f"Appended new 1m candle for {symbol} at {new_candle_df_row.name}. Buffer size: {len(symbol_1m_candle_buffers[symbol])}")
+
+def get_historical_klines_1m(client, symbol: str, limit: int = 200): # Default limit for initial fill or checks
+    """
+    Fetches historical 1-minute klines for the Fibonacci strategy.
+    Returns a DataFrame and an error object (similar to get_historical_klines).
+    """
+    start_time = time.time()
+    klines_1m = []
+    api_error = None
+    # print(f"Fetching 1m klines for {symbol}, limit {limit}...") # Verbose
+    try:
+        klines_1m = client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1MINUTE, limit=limit)
+    except BinanceAPIException as e:
+        print(f"API Error fetching 1m klines for {symbol}: {e}")
+        api_error = e
+        return pd.DataFrame(), api_error
+    except Exception as e:
+        print(f"General error fetching 1m klines for {symbol}: {e}")
+        api_error = e
+        return pd.DataFrame(), api_error
+    
+    duration = time.time() - start_time
+    processing_error = None
+    try:
+        if not klines_1m:
+            # print(f"No 1m kline data for {symbol} (fetch duration: {duration:.2f}s).")
+            return pd.DataFrame(), api_error
+
+        df = pd.DataFrame(klines_1m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+        for col in ['open', 'high', 'low', 'close', 'volume']: df[col] = pd.to_numeric(df[col], errors='coerce')
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.set_index('timestamp', inplace=True)
+        df.dropna(subset=['open', 'high', 'low', 'close'], inplace=True)
+        
+        if df.empty and not api_error:
+            # print(f"1m kline data for {symbol} resulted in empty DataFrame after processing (fetch duration: {duration:.2f}s).")
+            pass
+        # else: print(f"Fetched {len(df)} 1m klines for {symbol} (runtime: {duration:.2f}s).") # Verbose
+        return df, None
+    except Exception as e:
+        print(f"Error processing 1m kline data for {symbol}: {e}")
+        processing_error = e
+        return pd.DataFrame(), processing_error
+
+# --- Market Structure Detector (Fib Strategy) ---
+# Global state for Fibonacci strategy (per symbol)
+# Stores: 'trend' (None, 'uptrend', 'downtrend'), 
+#         'last_swing_high_price', 'last_swing_high_time', 
+#         'last_swing_low_price', 'last_swing_low_time',
+#         'bos_detail' (dict of BoS event), 
+#         'state' ('IDLE', 'AWAITING_PULLBACK', 'PENDING_ENTRY', 'IN_TRADE'),
+#         'pending_entry_order_id', 'pending_entry_details',
+#         'flip_bias_direction' (None, 'long', 'short') - for prioritizing next BoS after SL.
+fib_strategy_states = {}
+fib_strategy_states_lock = threading.Lock()
+
+# Constants for pivot detection
+PIVOT_N_LEFT = 5  # Number of candles to the left for pivot detection
+PIVOT_N_RIGHT = 5 # Number of candles to the right for pivot detection (needs adjustment for real-time)
+
+def identify_swing_pivots(data: pd.Series, n_left: int, n_right: int, is_high: bool) -> pd.Series:
+    """
+    Identifies swing highs or lows in a series.
+    For real-time, n_right implies a delay. For historical, it's fine.
+    For live usage with n_right > 0, the pivot is confirmed 'n_right' bars later.
+    A simpler real-time approach might use n_right=0 and other confirmation.
+    This implementation is standard for historical pivot detection.
+
+    Args:
+        data (pd.Series): Price data (e.g., 'high' or 'low' series).
+        n_left (int): Number of bars to the left that must be lower (for high) or higher (for low).
+        n_right (int): Number of bars to the right that must be lower (for high) or higher (for low).
+        is_high (bool): True to find swing highs, False for swing lows.
+
+    Returns:
+        pd.Series: Boolean series indicating pivot points.
+    """
+    if is_high:
+        # Current bar is a swing high if its value is greater than all values in n_left and n_right windows
+        pivot_conditions = (data > data.shift(i) for i in range(1, n_left + 1))
+        pivot_conditions_right = (data >= data.shift(-i) for i in range(1, n_right + 1)) # Use >= for right to allow flat tops
+    else:
+        # Current bar is a swing low if its value is less than all values in n_left and n_right windows
+        pivot_conditions = (data < data.shift(i) for i in range(1, n_left + 1))
+        pivot_conditions_right = (data <= data.shift(-i) for i in range(1, n_right + 1)) # Use <= for right to allow flat bottoms
+
+    # Combine conditions using np.logical_and.reduce for multiple conditions
+    # Need to handle NaNs from shifting, ensure comparison window is valid
+    
+    # Pad with False for initial/final elements where window is incomplete
+    pivots = pd.Series(False, index=data.index)
+    
+    # Iterate through the series, excluding edges where full window isn't available
+    for i in range(n_left, len(data) - n_right):
+        current_val = data.iloc[i]
+        
+        # Left side check
+        left_window = data.iloc[i-n_left : i]
+        if is_high:
+            if not (left_window < current_val).all(): continue
+        else: # is_low
+            if not (left_window > current_val).all(): continue
+            
+        # Right side check
+        right_window = data.iloc[i+1 : i+1+n_right]
+        if is_high:
+            if not (right_window <= current_val).all(): continue # Allow equals for right side (flat top)
+        else: # is_low
+            if not (right_window >= current_val).all(): continue # Allow equals for right side (flat bottom)
+            
+        pivots.iloc[i] = True
+        
+    return pivots
+
+def get_latest_pivots_from_buffer(candle_buffer_df: pd.DataFrame, n_left: int, n_right: int) -> tuple[pd.Series | None, pd.Series | None, pd.Series | None, pd.Series | None]:
+    """
+    Gets the most recent confirmed swing high and low from the buffer.
+    A pivot is confirmed n_right bars after it occurs.
+    Returns: (timestamp_high, price_high, timestamp_low, price_low)
+             Returns (None, None, None, None) if no confirmed pivots found.
+    """
+    if candle_buffer_df.empty or len(candle_buffer_df) < n_left + n_right + 1:
+        return None, None, None, None
+
+    # Identify all historical pivots in the buffer
+    # Note: For live, identify_swing_pivots with n_right > 0 means pivots are confirmed with a delay.
+    # We are interested in the *most recent confirmed* pivots.
+    # The last `n_right` candles cannot have confirmed pivots yet.
+    
+    relevant_data_for_pivots = candle_buffer_df.iloc[:-(n_right+1)] if n_right > 0 else candle_buffer_df
+    if relevant_data_for_pivots.empty:
+        return None, None, None, None
+
+    swing_highs_bool = identify_swing_pivots(relevant_data_for_pivots['high'], n_left, n_right, is_high=True)
+    swing_lows_bool = identify_swing_pivots(relevant_data_for_pivots['low'], n_left, n_right, is_high=False)
+
+    confirmed_highs = relevant_data_for_pivots[swing_highs_bool]
+    confirmed_lows = relevant_data_for_pivots[swing_lows_bool]
+
+    latest_high_price, latest_high_time = None, None
+    latest_low_price, latest_low_time = None, None
+
+    if not confirmed_highs.empty:
+        latest_high_price = confirmed_highs['high'].iloc[-1]
+        latest_high_time = confirmed_highs.index[-1]
+        
+    if not confirmed_lows.empty:
+        latest_low_price = confirmed_lows['low'].iloc[-1]
+        latest_low_time = confirmed_lows.index[-1]
+        
+    return latest_high_time, latest_high_price, latest_low_time, latest_low_price
+
+
+def detect_market_structure_and_bos(symbol: str, candle_buffer_df: pd.DataFrame, configs: dict):
+    """
+    Detects market structure (trend) and Break of Structure (BoS) events.
+    Updates fib_strategy_states for the symbol.
+
+    Args:
+        symbol (str): The trading symbol.
+        candle_buffer_df (pd.DataFrame): DataFrame of 1-minute candles (index=timestamp, cols=['open', 'high', 'low', 'close']).
+        configs (dict): Bot configuration.
+
+    Returns:
+        dict | None: BoS event details if detected {direction, swing_high, swing_low, bos_price, timestamp}, else None.
+    """
+    global fib_strategy_states, fib_strategy_states_lock
+    
+    if candle_buffer_df.empty or len(candle_buffer_df) < PIVOT_N_LEFT + PIVOT_N_RIGHT + 1 + 1: # +1 for current candle
+        print(f"[{symbol}] Insufficient data in candle_buffer_df for BoS detection ({len(candle_buffer_df)} candles).")
+        return None
+
+    current_candle = candle_buffer_df.iloc[-1]
+    current_close = current_candle['close']
+    
+    # Get latest confirmed pivots (excluding the very latest candles that can't be confirmed yet)
+    # For BoS, we look at "established" prior swings.
+    # The n_right in identify_swing_pivots creates a delay.
+    # So, the pivots we get are from `PIVOT_N_RIGHT` bars ago or older.
+    
+    # Data for pivot identification should not include the current, still-forming candle.
+    # And pivot confirmation itself has a delay of PIVOT_N_RIGHT bars.
+    # So, we consider pivots from `candle_buffer_df` up to `-(PIVOT_N_RIGHT + 1)` index.
+    
+    # Let's simplify: get pivots from the whole buffer. The `identify_swing_pivots` already handles edge cases.
+    # The `get_latest_pivots_from_buffer` then picks the most recent *confirmed* ones.
+    
+    # For `get_latest_pivots_from_buffer`, n_right means the pivot is confirmed `n_right` bars *after* it forms.
+    # So, the latest pivot from `get_latest_pivots_from_buffer` is from at least `n_right` bars ago relative to the end of data passed to it.
+    # We pass data *excluding* the current bar for pivot calculation.
+    historical_data_for_pivots = candle_buffer_df.iloc[:-1] # Exclude current incomplete candle
+
+    if len(historical_data_for_pivots) < PIVOT_N_LEFT + PIVOT_N_RIGHT + 1:
+         print(f"[{symbol}] Insufficient historical data ({len(historical_data_for_pivots)}) for pivot calculation in BoS.")
+         return None
+
+
+    prev_high_time, prev_swing_high, prev_low_time, prev_swing_low = get_latest_pivots_from_buffer(
+        historical_data_for_pivots, PIVOT_N_LEFT, PIVOT_N_RIGHT
+    )
+
+    with fib_strategy_states_lock:
+        state = fib_strategy_states.get(symbol, {"state": "IDLE", "trend": None, "last_swing_high": None, "last_swing_low": None})
+
+        # Basic trend definition (can be more sophisticated)
+        # If we have a recent confirmed swing high and low:
+        if prev_swing_high and prev_swing_low:
+            if state["last_swing_high"] and state["last_swing_low"]:
+                # Higher highs and higher lows -> uptrend
+                if prev_swing_high > state["last_swing_high"] and prev_swing_low > state["last_swing_low"]:
+                    state["trend"] = "uptrend"
+                # Lower highs and lower lows -> downtrend
+                elif prev_swing_high < state["last_swing_high"] and prev_swing_low < state["last_swing_low"]:
+                    state["trend"] = "downtrend"
+                # else, could be ranging or unclear, maintain previous trend or set to None
+            
+            # Update last known major swings
+            state["last_swing_high_price"] = prev_swing_high
+            state["last_swing_high_time"] = prev_high_time
+            state["last_swing_low_price"] = prev_swing_low
+            state["last_swing_low_time"] = prev_low_time
+        
+        # BoS Detection
+        state = fib_strategy_states.get(symbol) # Get existing state or None
+        if not state: # First time seeing this symbol for Fib strategy or after a reset
+            state = {
+                "state": "IDLE", "trend": None, 
+                "last_swing_high_price": None, "last_swing_high_time": None,
+                "last_swing_low_price": None, "last_swing_low_time": None,
+                "bos_detail": None,
+                "pending_entry_order_id": None, "pending_entry_details": None,
+                "flip_bias_direction": None 
+            }
+            # Do not assign to fib_strategy_states[symbol] yet, do it at the end of the with block.
+
+        newly_identified_trend = state.get("trend")
+        if prev_swing_high and prev_swing_low:
+            if state.get("last_swing_high_price") and state.get("last_swing_low_price"):
+                if prev_swing_high > state["last_swing_high_price"] and prev_swing_low > state["last_swing_low_price"]:
+                    newly_identified_trend = "uptrend"
+                elif prev_swing_high < state["last_swing_high_price"] and prev_swing_low < state["last_swing_low_price"]:
+                    newly_identified_trend = "downtrend"
+            else:
+                if prev_high_time and prev_low_time:
+                    if prev_high_time > prev_low_time: newly_identified_trend = "uptrend"
+                    elif prev_low_time > prev_high_time: newly_identified_trend = "downtrend"
+            state["trend"] = newly_identified_trend
+            state["last_swing_high_price"] = prev_swing_high
+            state["last_swing_high_time"] = prev_high_time
+            state["last_swing_low_price"] = prev_swing_low
+            state["last_swing_low_time"] = prev_low_time
+        
+        bos_event = None
+        current_trend = state.get("trend")
+        last_sh_price = state.get("last_swing_high_price")
+        last_sl_price = state.get("last_swing_low_price")
+        # For logging/clarity, get times, ensure they exist if prices exist
+        last_sh_time = state.get("last_swing_high_time") if last_sh_price else None
+        last_sl_time = state.get("last_swing_low_time") if last_sl_price else None
+
+        if (current_trend == "uptrend" or current_trend is None) and last_sh_price:
+            if current_close > last_sh_price:
+                if last_sl_price is None:
+                    print(f"📈 [{symbol}] Potential Bullish BoS: Close ({current_close:.4f}) > Prev Swing High ({last_sh_price:.4f}), but prior swing low for BoS move is undefined. BoS not confirmed.")
+                else:
+                    print(f"📈 [{symbol}] Bullish BoS detected! Close ({current_close:.4f}) > Prev Swing High ({last_sh_price:.4f} at {last_sh_time})")
+                    bos_event = {"direction": "long", "swing_high_bos_move": current_candle['high'], "swing_low_bos_move": last_sl_price, "bos_price": current_close, "timestamp": current_candle.name, "broken_structure_price": last_sh_price}
+        
+        if not bos_event and (current_trend == "downtrend" or current_trend is None) and last_sl_price:
+            if current_close < last_sl_price:
+                if last_sh_price is None:
+                     print(f"📉 [{symbol}] Potential Bearish BoS: Close ({current_close:.4f}) < Prev Swing Low ({last_sl_price:.4f}), but prior swing high for BoS move is undefined. BoS not confirmed.")
+                else:
+                    print(f"📉 [{symbol}] Bearish BoS detected! Close ({current_close:.4f}) < Prev Swing Low ({last_sl_price:.4f} at {last_sl_time})")
+                    bos_event = {"direction": "short", "swing_high_bos_move": last_sh_price, "swing_low_bos_move": current_candle['low'], "bos_price": current_close, "timestamp": current_candle.name, "broken_structure_price": last_sl_price}
+        
+        if bos_event:
+            flip_bias = state.get("flip_bias_direction")
+            if flip_bias and flip_bias != bos_event["direction"]:
+                print(f"[{symbol}] BoS detected ({bos_event['direction']}) but flip bias is for {flip_bias}. Ignoring this BoS.")
+                fib_strategy_states[symbol] = state # Save updated state (trend/pivots) even if BoS ignored
+                return None 
+
+            if flip_bias and flip_bias == bos_event["direction"]:
+                print(f"[{symbol}] BoS detected ({bos_event['direction']}) ALIGNS with flip bias. Proceeding with priority.")
+                # Note: flip_bias is not cleared here. It should be cleared by trade management logic
+                # (e.g., after a successful trade entry from this, or if the setup becomes invalid).
+
+            state["state"] = "AWAITING_PULLBACK"
+            state["bos_detail"] = bos_event 
+        
+        fib_strategy_states[symbol] = state 
+        return bos_event
+
+# --- Order Manager Components (Fib Strategy) ---
+# (Further integration with monitor_active_trades or a new Fib-specific monitor is needed)
+
+# --- Fibonacci Module (Fib Strategy) ---
+def calculate_fibonacci_retracement_levels(swing_high_price: float, swing_low_price: float, direction: str) -> dict | None:
+    """
+    Calculates Fibonacci retracement levels (0.5 and 0.618) for a given move.
+
+    Args:
+        swing_high_price (float): The highest price of the BoS move.
+        swing_low_price (float): The lowest price of the BoS move.
+        direction (str): "long" if BoS was bullish (breakout upwards), 
+                         "short" if BoS was bearish (breakdown downwards).
+
+    Returns:
+        dict | None: A dictionary with 'level_0_5', 'level_0_618', 
+                     'zone_upper', 'zone_lower' prices, or None if inputs are invalid.
+    """
+    if swing_high_price is None or swing_low_price is None or swing_high_price <= swing_low_price:
+        print(f"Error calculating Fib levels: Invalid swing prices. High: {swing_high_price}, Low: {swing_low_price}")
+        return None
+
+    price_range = swing_high_price - swing_low_price
+
+    if direction == "long": # Bullish BoS, expect pullback downwards to buy
+        # Fib levels are measured from low (0%) to high (100%)
+        # Retracement levels are below the swing_high_price
+        level_0_5 = swing_high_price - (price_range * 0.5)
+        level_0_618 = swing_high_price - (price_range * 0.618)
+        # Golden zone is between 0.5 and 0.618. For a long, 0.618 is lower.
+        zone_upper = level_0_5
+        zone_lower = level_0_618
+    elif direction == "short": # Bearish BoS, expect pullback upwards to sell
+        # Fib levels are measured from high (0%) to low (100%)
+        # Retracement levels are above the swing_low_price
+        level_0_5 = swing_low_price + (price_range * 0.5)
+        level_0_618 = swing_low_price + (price_range * 0.618)
+        # Golden zone is between 0.5 and 0.618. For a short, 0.618 is higher.
+        zone_upper = level_0_618 
+        zone_lower = level_0_5
+    else:
+        print(f"Error calculating Fib levels: Invalid direction '{direction}'.")
+        return None
+        
+    # Ensure zone_upper is actually above zone_lower (can happen if levels are identical due to precision)
+    if zone_upper < zone_lower: # Should not happen with distinct 0.5 and 0.618 but as a safeguard
+        zone_upper, zone_lower = zone_lower, zone_upper 
+
+    return {
+        "level_0_5": level_0_5,
+        "level_0_618": level_0_618,
+        "zone_upper": zone_upper, # Higher price of the golden zone
+        "zone_lower": zone_lower  # Lower price of the golden zone
+    }
+
+# --- Entry & Exit Logic (Fib Strategy) ---
+def manage_fib_retracement_entry_logic(client, configs: dict, symbol: str, bos_event: dict, symbol_info: dict):
+    """
+    Manages the entry logic for the Fibonacci Retracement strategy after a BoS event.
+    Places a limit order in the golden zone, and if filled, SL/TP orders.
+    """
+    global active_trades, active_trades_lock, fib_strategy_states, fib_strategy_states_lock
+    global last_signal_time, last_signal_lock # For Cooldown on new signal type
+    global recent_trade_signatures, recent_trade_signatures_lock # For Trade Signature Check
+
+    log_prefix = f"[{threading.current_thread().name}] {symbol} FibEntry:"
+    
+    if not bos_event or not symbol_info:
+        print(f"{log_prefix} Missing bos_event or symbol_info. Aborting.")
+        return
+
+    direction = bos_event['direction']
+    swing_high_bos = bos_event['swing_high_bos_move'] # Actual high of the move (for long), or start high of move (for short)
+    swing_low_bos = bos_event['swing_low_bos_move']   # Actual low of the move (for short), or start low of move (for long)
+    broken_structure_price = bos_event['broken_structure_price']
+    
+    # 1. Calculate Fibonacci Levels
+    fib_levels = calculate_fibonacci_retracement_levels(swing_high_bos, swing_low_bos, direction)
+    if not fib_levels:
+        print(f"{log_prefix} Failed to calculate Fibonacci levels. Aborting.")
+        with fib_strategy_states_lock: # Reset state if Fib calculation fails
+            if symbol in fib_strategy_states: fib_strategy_states[symbol]['state'] = "IDLE"
+        return
+
+    zone_upper = fib_levels['zone_upper']
+    zone_lower = fib_levels['zone_lower']
+    entry_price_target = (zone_upper + zone_lower) / 2.0 # Mid-point of the golden zone
+
+    p_prec = int(symbol_info['pricePrecision'])
+    entry_price_target = round(entry_price_target, p_prec) # Round to symbol's precision
+
+    print(f"{log_prefix} Target Golden Zone for {direction}: {zone_lower:.{p_prec}f} - {zone_upper:.{p_prec}f}. Target Entry: {entry_price_target:.{p_prec}f}")
+
+    # 2. Determine SL and TP
+    # Add a small buffer (e.g., 0.1% of price range, or fixed pips based on ATR later)
+    price_range_for_sl_buffer = abs(swing_high_bos - swing_low_bos)
+    sl_buffer_amount = price_range_for_sl_buffer * 0.05 # 5% of the BoS move range as buffer, or a min_tick based buffer
+    # Ensure buffer is at least a few ticks
+    min_tick_size = 1 / (10**p_prec)
+    sl_buffer_amount = max(sl_buffer_amount, min_tick_size * 5) # e.g. 5 ticks buffer
+
+    sl_price, tp_price = None, None
+    if direction == "long":
+        # SL below the low of the move that caused BoS
+        sl_price = swing_low_bos - sl_buffer_amount 
+        # TP at the broken swing high
+        tp_price = broken_structure_price 
+    elif direction == "short":
+        # SL above the high of the move that caused BoS
+        sl_price = swing_high_bos + sl_buffer_amount
+        # TP at the broken swing low
+        tp_price = broken_structure_price
+    
+    sl_price = round(sl_price, p_prec)
+    tp_price = round(tp_price, p_prec)
+
+    if sl_price is None or tp_price is None : # Should not happen if direction is valid
+        print(f"{log_prefix} SL/TP price calculation error. Aborting."); return
+    if (direction == "long" and (entry_price_target <= sl_price or entry_price_target >= tp_price)) or \
+       (direction == "short" and (entry_price_target >= sl_price or entry_price_target <= tp_price)):
+        print(f"{log_prefix} Invalid SL/TP relative to entry: Entry={entry_price_target}, SL={sl_price}, TP={tp_price}. Aborting.")
+        with fib_strategy_states_lock: # Reset state
+            if symbol in fib_strategy_states: fib_strategy_states[symbol]['state'] = "IDLE"
+        return
+    
+    print(f"{log_prefix} Calculated Entry: {entry_price_target:.{p_prec}f}, SL: {sl_price:.{p_prec}f}, TP: {tp_price:.{p_prec}f}")
+
+    # 3. Risk:Reward and Position Sizing (Similar to manage_trade_entry)
+    # Cooldown, ActiveTrade, LivePosition, OpenOrders, MaxConcurrent checks
+    # These checks are largely similar to manage_trade_entry, adapt as needed.
+    # For brevity, let's assume these checks pass or are integrated into a shared pre-trade check function later.
+
+    with last_signal_lock: # Cooldown for this *type* of signal (Fib based)
+        cooldown_seconds = configs.get("fib_signal_cooldown_seconds", 120) # Separate cooldown for Fib strategy
+        if symbol in last_signal_time and (dt.now() - last_signal_time.get(f"{symbol}_fib", dt.min)).total_seconds() < cooldown_seconds:
+            print(f"{log_prefix} Cooldown active for Fib strategy on {symbol}. Skipping.")
+            return
+
+    with active_trades_lock:
+        if symbol in active_trades:
+            print(f"{log_prefix} Symbol {symbol} already has an active trade (EMA strat or other). Skipping Fib entry.")
+            return
+        if len(active_trades) >= configs["max_concurrent_positions"]:
+            print(f"{log_prefix} Max concurrent positions reached. Cannot open Fib trade for {symbol}.")
+            return
+            
+    # (Skipping live position/order checks for brevity - assume they'd be here)
+
+    acc_bal = get_account_balance(client, configs)
+    if acc_bal is None or acc_bal <= 0:
+        print(f"{log_prefix} Invalid account balance ({acc_bal}). Aborting."); return
+
+    # Use the dynamic/fixed leverage already set (assume it's appropriate or handled elsewhere for 1m strategy)
+    # For Fib strategy, we might want a specific leverage setting or use the general one.
+    # Let's assume dynamic leverage logic or general config leverage is fine for now.
+    # The `specific_leverage_for_trade` in sanity checks will use the symbol's current leverage.
+    # Fetch current leverage for the symbol for sanity check
+    current_leverage_on_symbol = configs.get('leverage') # Default
+    try:
+        pos_info_lev = client.futures_position_information(symbol=symbol)
+        if pos_info_lev and isinstance(pos_info_lev, list) and pos_info_lev[0]:
+            current_leverage_on_symbol = int(pos_info_lev[0].get('leverage', configs.get('leverage')))
+    except Exception as e_lev:
+        print(f"{log_prefix} Could not fetch current leverage for {symbol}: {e_lev}. Using default {current_leverage_on_symbol}x.")
+
+
+    qty_to_order = calculate_position_size(acc_bal, configs['risk_percent'], entry_price_target, sl_price, symbol_info, configs)
+    if qty_to_order is None or qty_to_order <= 0:
+        print(f"{log_prefix} Invalid position size calculated (Qty: {qty_to_order}). Aborting."); return
+
+    # Portfolio Risk Check (similar to manage_trade_entry)
+    new_trade_risk_abs = qty_to_order * abs(entry_price_target - sl_price)
+    # ... (portfolio risk calculation and check logic as in manage_trade_entry) ...
+    # For brevity, assume it passes.
+
+    # Sanity Checks
+    passed_sanity, sanity_reason = pre_order_sanity_checks(
+        symbol, direction.upper(), entry_price_target, sl_price, tp_price, qty_to_order, 
+        symbol_info, acc_bal, configs['risk_percent'], configs,
+        specific_leverage_for_trade=current_leverage_on_symbol # Pass actual leverage
+    )
+    if not passed_sanity:
+        print(f"{log_prefix} Pre-order sanity checks FAILED: {sanity_reason}"); return
+    
+    print(f"{log_prefix} Sanity checks PASSED. Target R:R: {abs(tp_price-entry_price_target)/abs(sl_price-entry_price_target):.2f}")
+
+    # Trade Signature
+    trade_sig_fib = generate_trade_signature(symbol, f"FIB_{direction.upper()}", entry_price_target, sl_price, tp_price, qty_to_order, p_prec)
+    with recent_trade_signatures_lock:
+        if trade_sig_fib in recent_trade_signatures and \
+           (dt.now() - recent_trade_signatures[trade_sig_fib]).total_seconds() < 60 : # 60s signature duplicate check
+            print(f"{log_prefix} Duplicate Fib trade signature found. Skipping."); return
+    
+    # Update Cooldown
+    with last_signal_lock:
+        last_signal_time[f"{symbol}_fib"] = dt.now()
+
+    # 4. Place Limit Entry Order
+    print(f"{log_prefix} Placing LIMIT {direction.upper()} order: Qty {qty_to_order} @ {entry_price_target:.{p_prec}f}")
+    limit_order_side = "BUY" if direction == "long" else "SELL"
+    position_side_trade = "LONG" if direction == "long" else "SHORT"
+
+    entry_limit_order, entry_limit_error = place_new_order(
+        client, symbol_info, limit_order_side, "LIMIT", qty_to_order, 
+        price=entry_price_target, position_side=position_side_trade
+    )
+
+    if not entry_limit_order:
+        print(f"{log_prefix} Failed to place LIMIT entry order. Error: {entry_limit_error}")
+        # Potentially reset fib_strategy_state here if order placement fails critically
+        with fib_strategy_states_lock:
+            if symbol in fib_strategy_states: fib_strategy_states[symbol]['state'] = "IDLE"
+        return
+
+    print(f"{log_prefix} LIMIT entry order placed: ID {entry_limit_order['orderId']}. Status: {entry_limit_order['status']}")
+    
+    # If order is FILLED immediately (e.g. if limit price crossed spread aggressively)
+    # Or if it's just NEW, we need to store it and monitor.
+    # For now, this function's scope ends at placing the limit order.
+    # The monitoring of this limit order (fill, timeout, SL/TP placement on fill)
+    # needs to be handled by a separate mechanism, likely integrated into `monitor_active_trades`
+    # or a new `monitor_pending_fib_entries`.
+
+    with fib_strategy_states_lock:
+        if symbol in fib_strategy_states:
+            fib_strategy_states[symbol]['state'] = "PENDING_ENTRY" # New state
+            fib_strategy_states[symbol]['pending_entry_order_id'] = entry_limit_order['orderId']
+            fib_strategy_states[symbol]['pending_entry_details'] = {
+                "limit_price": entry_price_target,
+                "sl_price": sl_price,
+                "tp_price": tp_price,
+                "quantity": qty_to_order,
+                "side": direction, # "long" or "short"
+                "bos_event_snapshot": bos_event # Store the BoS that led to this
+            }
+            # Add trade signature *after* successful limit order placement attempt
+            with recent_trade_signatures_lock:
+                 recent_trade_signatures[trade_sig_fib] = dt.now()
+        else: # Should not happen if BoS detection set it up
+            print(f"{log_prefix} Error: State for {symbol} not found in fib_strategy_states after placing limit order.")
+            # Attempt to cancel the order if state is inconsistent
+            try: client.futures_cancel_order(symbol=symbol, orderId=entry_limit_order['orderId'])
+            except Exception as e_cancel: print(f"{log_prefix} Failed to cancel orphaned limit order {entry_limit_order['orderId']}: {e_cancel}")
+
+def monitor_pending_fib_entries(client, configs: dict):
+    """
+    Monitors pending limit entry orders for the Fibonacci strategy.
+    If filled, places SL/TP. If timed out, cancels the order.
+    """
+    global fib_strategy_states, fib_strategy_states_lock, active_trades, active_trades_lock
+    
+    log_prefix_monitor = "[FibMonitor]"
+    symbols_to_reset_state = []
+    # Iterate over a copy of items because the dictionary might be modified
+    pending_entries_copy = {}
+    with fib_strategy_states_lock:
+        pending_entries_copy = {sym: state_data for sym, state_data in fib_strategy_states.items() if state_data.get('state') == "PENDING_ENTRY"}
+
+    if not pending_entries_copy:
+        return
+
+    print(f"\n{log_prefix_monitor} Checking {len(pending_entries_copy)} pending Fibonacci entry order(s)...")
+
+    for symbol, state_data in pending_entries_copy.items():
+        order_id = state_data.get('pending_entry_order_id')
+        pending_details = state_data.get('pending_entry_details')
+        order_placed_time = state_data.get('bos_detail', {}).get('timestamp') # Using BoS timestamp as proxy for order placement time
+
+        # Define symbol_info for use below
+        symbol_info = None
+        if pending_details and 'bos_event_snapshot' in pending_details:
+            symbol_info = pending_details['bos_event_snapshot'].get('symbol_info', None)
+
+        if not order_id or not pending_details or not order_placed_time:
+            print(f"{log_prefix_monitor} Incomplete pending entry data for {symbol}. Resetting state.")
+            symbols_to_reset_state.append(symbol)
+            continue
+        
+        try:
+            order_status = client.futures_get_order(symbol=symbol, orderId=order_id)
+            
+            if order_status['status'] == 'FILLED':
+                print(f"{log_prefix_monitor} ✅ Limit entry order {order_id} for {symbol} FILLED!")
+                actual_entry_price = float(order_status['avgPrice'])
+                qty = float(order_status['executedQty']) # Should match pending_details['quantity']
+                
+                # Original intended SL/TP from when limit order was placed
+                sl_price = pending_details['sl_price']
+                tp_price = pending_details['tp_price']
+                trade_side = pending_details['side'] # "long" or "short"
+                position_side_for_sl_tp = "LONG" if trade_side == "long" else "SHORT"
+
+                # Adjust SL/TP if actual fill price is significantly different (optional, good practice)
+                # For simplicity, we'll use the originally calculated SL/TP based on target entry.
+                # More advanced: Recalculate SL/TP based on actual_entry_price if slippage is a concern
+                # and the R:R must be strictly maintained from actual fill.
+
+                print(f"{log_prefix_monitor} Placing SL/TP for filled Fib trade {symbol}: SL {sl_price}, TP {tp_price}")
+                
+                sl_ord, tp_ord = None, None
+                # Place SL
+                sl_ord, sl_err = place_new_order(client, symbol_info, # Use symbol_info defined above
+                                     "SELL" if trade_side == "long" else "BUY", "STOP_MARKET", qty, 
+                                     stop_price=sl_price, position_side=position_side_for_sl_tp, is_closing_order=True)
+                if not sl_ord: print(f"{log_prefix_monitor} CRITICAL: FAILED TO PLACE SL for {symbol}! Error: {sl_err}")
+                
+                # Place TP
+                tp_ord, tp_err = place_new_order(client, symbol_info,
+                                     "SELL" if trade_side == "long" else "BUY", "TAKE_PROFIT_MARKET", qty,
+                                     stop_price=tp_price, position_side=position_side_for_sl_tp, is_closing_order=True)
+                if not tp_ord: print(f"{log_prefix_monitor} WARNING: Failed to place TP for {symbol}. Error: {tp_err}")
+
+                # Transition to active_trades
+                with active_trades_lock:
+                    if symbol not in active_trades: # Ensure no other trade (e.g. EMA) opened in meantime
+                        active_trades[symbol] = {
+                            "entry_order_id": order_id,
+                            "sl_order_id": sl_ord.get('orderId') if sl_ord else None,
+                            "tp_order_id": tp_ord.get('orderId') if tp_ord else None,
+                            "entry_price": actual_entry_price,
+                            "current_sl_price": sl_price,
+                            "current_tp_price": tp_price,
+                            "initial_sl_price": sl_price, 
+                            "initial_tp_price": tp_price,
+                            "quantity": qty,
+                            "side": trade_side.upper(), # Ensure uppercase for consistency with EMA strategy
+                            "symbol_info": symbol_info,
+                            "open_timestamp": pd.Timestamp(order_status['updateTime'], unit='ms', tz='UTC'),
+                            "strategy_type": "FIBONACCI" # Add strategy type marker
+                        }
+                        print(f"{log_prefix_monitor} Fib trade for {symbol} moved to active_trades.")
+                        
+                        # Send Telegram notification for new active Fib trade
+                        if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+                             # Build message similar to EMA new trade notification
+                            s_info_fib = active_trades[symbol]['symbol_info']
+                            qty_prec_fib = int(s_info_fib.get('quantityPrecision', 0))
+                            price_prec_fib = int(s_info_fib.get('pricePrecision', 2))
+                            fib_trade_msg = (
+                                f"🚀 FIB TRADE ENTRY FILLED 🚀\n\n"
+                                f"Symbol: {symbol}\n"
+                                f"Side: {trade_side.upper()}\n"
+                                f"Quantity: {qty:.{qty_prec_fib}f}\n"
+                                f"Entry Price: {actual_entry_price:.{price_prec_fib}f}\n"
+                                f"SL: {sl_price:.{price_prec_fib}f}\n"
+                                f"TP: {tp_price:.{price_prec_fib}f}\n"
+                                f"(SL Order: {sl_ord.get('orderId') if sl_ord else 'FAIL'}, TP Order: {tp_ord.get('orderId') if tp_ord else 'FAIL'})"
+                            )
+                            send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], fib_trade_msg)
+
+                    else:
+                        print(f"{log_prefix_monitor} {symbol} already in active_trades. Limit fill for Fib trade {order_id} will not be managed by bot SL/TP. Manual check advised.")
+                        # If it's already in active_trades, this is an unexpected state. Cancel the new SL/TP if placed.
+                        if sl_ord: client.futures_cancel_order(symbol=symbol, orderId=sl_ord['orderId'])
+                        if tp_ord: client.futures_cancel_order(symbol=symbol, orderId=tp_ord['orderId'])
+                
+                symbols_to_reset_state.append(symbol) # Mark for state reset (pending -> IDLE)
+            
+            elif order_status['status'] in ['CANCELED', 'EXPIRED', 'REJECTED']:
+                print(f"{log_prefix_monitor} Limit entry order {order_id} for {symbol} is {order_status['status']}. Resetting state.")
+                symbols_to_reset_state.append(symbol)
+            
+            elif order_status['status'] == 'NEW' or order_status['status'] == 'PARTIALLY_FILLED':
+                # Time Stop logic
+                order_timeout_minutes = configs.get("fib_order_timeout_minutes", 5)
+                if order_placed_time and (pd.Timestamp.now(tz='UTC') - order_placed_time).total_seconds() > order_timeout_minutes * 60:
+                    print(f"{log_prefix_monitor} Limit entry order {order_id} for {symbol} timed out ({order_timeout_minutes}m). Cancelling.")
+                    try:
+                        client.futures_cancel_order(symbol=symbol, orderId=order_id)
+                        print(f"{log_prefix_monitor} Successfully cancelled timed-out order {order_id} for {symbol}.")
+                        send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"),
+                                              f"⏳ Fib entry order for `{symbol}` (ID: {order_id}) timed out and was cancelled.")
+                    except Exception as e_cancel:
+                        print(f"{log_prefix_monitor} Failed to cancel timed-out order {order_id} for {symbol}: {e_cancel}")
+                    symbols_to_reset_state.append(symbol)
+                # else: Order is still new/partially_filled and within timeout, do nothing.
+                # print(f"{log_prefix_monitor} Limit entry order {order_id} for {symbol} is still {order_status['status']}.")
+            
+            # Any other status means it's likely no longer relevant or an issue
+            elif order_status['status'] not in ['NEW', 'PARTIALLY_FILLED']:
+                 print(f"{log_prefix_monitor} Limit entry order {order_id} for {symbol} has unexpected status: {order_status['status']}. Resetting state.")
+                 symbols_to_reset_state.append(symbol)
+
+        except BinanceAPIException as e:
+            if e.code == -2013: # Order does not exist
+                print(f"{log_prefix_monitor} Limit entry order {order_id} for {symbol} NOT FOUND (likely manually cancelled or already processed). Resetting state.")
+                symbols_to_reset_state.append(symbol)
+            else:
+                print(f"{log_prefix_monitor} API Error checking order {order_id} for {symbol}: {e}")
+        except Exception as e:
+            print(f"{log_prefix_monitor} Unexpected error checking order {order_id} for {symbol}: {e}")
+            traceback.print_exc()
+            symbols_to_reset_state.append(symbol) # Reset state on unexpected error too
+
+    if symbols_to_reset_state:
+        with fib_strategy_states_lock:
+            for sym_to_reset in symbols_to_reset_state:
+                if sym_to_reset in fib_strategy_states:
+                    print(f"{log_prefix_monitor} Resetting Fib strategy state for {sym_to_reset} to IDLE.")
+                    fib_strategy_states[sym_to_reset]['state'] = "IDLE"
+                    fib_strategy_states[sym_to_reset]['pending_entry_order_id'] = None
+                    fib_strategy_states[sym_to_reset]['pending_entry_details'] = None
+                    # Keep flip_bias_direction unless explicitly cleared by a successful trade or other logic
+                    # Keep trend and pivot data as they might still be relevant
+                else: # Should not happen if pending_entries_copy was derived correctly
+                    print(f"{log_prefix_monitor} Warning: Tried to reset state for {sym_to_reset}, but it was not in fib_strategy_states.")
+
+
 def start_telegram_polling(bot_token: str, app_configs: dict):
     # Create and set a new event loop for this thread
     loop = asyncio.new_event_loop()
@@ -733,17 +1475,30 @@ def get_user_configurations(load_choice_override: str = None, make_changes_overr
                                 configs["telegram_chat_id"] = telegram_chat_id
                             else:
                                 print("Error: 'environment' missing from loaded CSV configuration. Cannot load API keys.")
-                                # Fallback to custom setup or ask for environment specifically
                                 proceed_to_custom_setup = True
-                                break 
+                                break
                             
-                            # Add fixed strategy details
-                            configs["strategy_id"] = 8
-                            configs["strategy_name"] = "Advance EMA Cross"
+                            # Set strategy specific details based on choice
+                            strategy_choice = configs.get("strategy_choice", DEFAULT_STRATEGY)
+                            if strategy_choice == "ema_cross":
+                                configs["strategy_id"] = 8
+                                configs["strategy_name"] = "Advance EMA Cross"
+                            elif strategy_choice == "fib_retracement":
+                                configs["strategy_id"] = 9 # New ID for the new strategy
+                                configs["strategy_name"] = "Fibonacci Retracement"
+                                # Ensure fib_1m_buffer_size has a default if not in CSV
+                                if "fib_1m_buffer_size" not in configs:
+                                    configs["fib_1m_buffer_size"] = DEFAULT_1M_BUFFER_SIZE
+                            else: # Should not happen if validation is correct
+                                print(f"Warning: Unknown strategy_choice '{strategy_choice}' from CSV. Defaulting to EMA Cross.")
+                                configs["strategy_choice"] = "ema_cross"
+                                configs["strategy_id"] = 8
+                                configs["strategy_name"] = "Advance EMA Cross"
+
                             configs["max_scan_threads"] = 5 # Fixed value
                             print("--- Configuration Complete (Loaded from CSV) ---")
                             return configs
-                        elif actual_make_changes_choice == 'y': # Corrected variable name here
+                        elif actual_make_changes_choice == 'y':
                             configs = validated_configs_csv # Start custom setup with these values
                             proceed_to_custom_setup = True
                             break # Break from this inner while True loop
@@ -770,17 +1525,27 @@ def get_user_configurations(load_choice_override: str = None, make_changes_overr
 
     print("\n--- Custom Configuration Setup ---")
     # Helper to get input, using value from `configs` (loaded from CSV) as default if available
-    def get_input_with_default(prompt_message, current_value_key, default_constant_value, type_converter=str):
-        default_to_show = configs.get(current_value_key, default_constant_value)
-        user_input = input(f"{prompt_message} (default: {default_to_show}): ")
+    def get_input_with_default(prompt_message, current_value_key, default_constant_value, type_converter=str, is_percentage_display=False):
+        default_from_config = configs.get(current_value_key)
         
-        # If user enters nothing, use the default_to_show (which could be from CSV or constant)
+        # For percentage display, if default_from_config is present (e.g. 0.01), convert to % (e.g. 1.0) for display.
+        # If not present, use default_constant_value (which is assumed to be in display format, e.g. 1.0 for 1%).
+        if is_percentage_display:
+            default_to_show_val = (default_from_config * 100.0) if default_from_config is not None else default_constant_value
+            default_to_show_str = f"{default_to_show_val:.2f}%" if isinstance(default_to_show_val, float) else str(default_to_show_val)
+        else:
+            default_to_show_val = default_from_config if default_from_config is not None else default_constant_value
+            default_to_show_str = str(default_to_show_val)
+
+        user_input = input(f"{prompt_message} (default: {default_to_show_str}): ")
+        
+        # If user enters nothing, use the default_to_show_val (which could be from CSV or constant, already in correct scale)
         if not user_input:
             # Need to ensure the default_to_show is of the correct type if it came from CSV (already string)
             # or from constant (might need conversion if it's not already a string for display)
             # The type_converter will handle this.
             try:
-                return type_converter(default_to_show)
+                return type_converter(default_to_show_val)
             except ValueError: # If default_to_show can't be converted (e.g. empty string for float)
                  # This case needs careful handling. For now, let's assume default_to_show is valid or re-prompt logic handles it.
                  # Or, use the original default_constant_value if default_to_show fails conversion.
@@ -793,25 +1558,40 @@ def get_user_configurations(load_choice_override: str = None, make_changes_overr
             # For now, rely on outer validation loop.
             raise # Re-raise to be caught by the calling loop's try-except
 
+    # Strategy Choice
+    while True:
+        strategy_default_display = configs.get("strategy_choice", DEFAULT_STRATEGY)
+        strategy_input = input(f"Select strategy (1:EMA Cross / 2:Fib Retracement) (current: {strategy_default_display}): ").strip()
+        
+        chosen_strategy = None
+        if not strategy_input and "strategy_choice" in configs: chosen_strategy = configs["strategy_choice"]
+        elif strategy_input == "1": chosen_strategy = "ema_cross"
+        elif strategy_input == "2": chosen_strategy = "fib_retracement"
+
+        if chosen_strategy in ["ema_cross", "fib_retracement"]:
+            configs["strategy_choice"] = chosen_strategy
+            if chosen_strategy == "ema_cross":
+                configs["strategy_id"] = 8
+                configs["strategy_name"] = "Advance EMA Cross"
+            else: # fib_retracement
+                configs["strategy_id"] = 9
+                configs["strategy_name"] = "Fibonacci Retracement"
+            break
+        print("Invalid strategy choice. Please enter '1' or '2'.")
+
     # Environment
     while True:
-        # Environment is special, it dictates API key loading.
-        # If loaded from CSV, it should already be in `configs`.
-        env_default_display = configs.get("environment", "testnet") # Default to testnet if not in CSV
+        env_default_display = configs.get("environment", "testnet")
         env_input = input(f"Select environment (1:testnet / 2:mainnet) (current: {env_default_display}): ").strip()
-        
         chosen_env = None
-        if not env_input and "environment" in configs: # User hit enter, use CSV loaded value
-            chosen_env = configs["environment"]
+        if not env_input and "environment" in configs: chosen_env = configs["environment"]
         elif env_input == "1": chosen_env = "testnet"
         elif env_input == "2": chosen_env = "mainnet"
-        
         if chosen_env in ["testnet", "mainnet"]:
             configs["environment"] = chosen_env
             break
-        print("Invalid environment. Please enter '1' for testnet or '2' for mainnet.")
+        print("Invalid environment. Please enter '1' or '2'.")
 
-    # Load API keys based on selected environment
     api_key, api_secret, telegram_token, telegram_chat_id = load_api_keys(configs["environment"])
     configs["api_key"] = api_key
     configs["api_secret"] = api_secret
@@ -822,16 +1602,14 @@ def get_user_configurations(load_choice_override: str = None, make_changes_overr
     while True:
         mode_default_display = configs.get("mode", "live")
         mode_input = input(f"Select mode (1:live / 2:backtest) (current: {mode_default_display}): ").strip()
-        
         chosen_mode = None
         if not mode_input and "mode" in configs: chosen_mode = configs["mode"]
         elif mode_input == "1": chosen_mode = "live"
         elif mode_input == "2": chosen_mode = "backtest"
-
         if chosen_mode in ["live", "backtest"]:
             configs["mode"] = chosen_mode
             break
-        print("Invalid mode. Please enter '1' for live or '2' for backtest.")
+        print("Invalid mode. Please enter '1' or '2'.")
 
     if configs["mode"] == "backtest":
         while True:
@@ -887,24 +1665,29 @@ def get_user_configurations(load_choice_override: str = None, make_changes_overr
     # Risk Percent
     while True:
         try:
-            # For risk_percent, the stored value is float (e.g., 0.01), display is % (e.g., 1.0)
-            # Default constant is 1.0 (meaning 1%)
-            # If loaded from CSV, it's already 0.01. Convert to % for display.
-            risk_default_display = (configs.get("risk_percent", DEFAULT_RISK_PERCENT / 100.0) * 100.0 
-                                    if "risk_percent" in configs else DEFAULT_RISK_PERCENT)
-
-            risk_input_str = input(f"Enter account risk % per trade (e.g., 1 for 1%) (default: {risk_default_display:.2f}%): ")
-            
-            risk_percent_val = 0
-            if not risk_input_str: # User hit enter
-                risk_percent_val = float(risk_default_display) # Use the displayed default (already in %)
-            else:
-                risk_percent_val = float(risk_input_str)
-
-            if 0 < risk_percent_val <= 100:
-                configs["risk_percent"] = risk_percent_val / 100.0 # Store as decimal
-                break
-            print("Risk percentage must be a positive value (e.g., 0.5, 1, up to 100).")
+            risk_percent_val = get_input_with_default(
+                "Enter account risk % per trade (e.g., 1 for 1%)",
+                "risk_percent", DEFAULT_RISK_PERCENT, float, is_percentage_display=True
+            )
+            # The value from get_input_with_default will be in % if user entered it,
+            # or already in correct scale (e.g. 0.01) if from CSV and user hit enter,
+            # or the constant default (e.g. 1.0) if from constant and user hit enter.
+            # We need to ensure it's consistently handled.
+            # If it came from `configs.get("risk_percent")` and user hit enter, it's already 0.01.
+            # If it was input by user, it's 1.0.
+            # If it was default constant, it's 1.0.
+            # So, if value > 1 (likely user input like "1" for 1%), convert to decimal.
+            if risk_percent_val > 1.0 and risk_percent_val <=100.0 : # User likely entered 1 for 1%
+                 configs["risk_percent"] = risk_percent_val / 100.0
+            elif 0 < risk_percent_val <= 1.0: # Already in decimal form (e.g. from CSV or user entered 0.01)
+                 configs["risk_percent"] = risk_percent_val
+            # Handle case where default was used and it was > 1 (e.g. DEFAULT_RISK_PERCENT = 1.0)
+            elif risk_percent_val == DEFAULT_RISK_PERCENT and DEFAULT_RISK_PERCENT > 1.0 and DEFAULT_RISK_PERCENT <= 100.0:
+                 configs["risk_percent"] = risk_percent_val / 100.0
+            else: # Covers 0 or invalid numbers not caught by float conversion
+                print("Risk percentage must be a positive value (e.g., 0.5, 1, up to 100).")
+                continue # Re-prompt
+            break
         except ValueError: print("Invalid input for risk percentage. Please enter a number.")
 
     # Leverage
@@ -1032,24 +1815,34 @@ def get_user_configurations(load_choice_override: str = None, make_changes_overr
     # Target Annualized Volatility
     while True:
         try:
-            # Display as percentage if it's like 0.80 -> 80%
-            target_vol_default_display = (configs.get("target_annualized_volatility", DEFAULT_TARGET_ANNUALIZED_VOLATILITY) * 100.0
-                                           if "target_annualized_volatility" in configs else DEFAULT_TARGET_ANNUALIZED_VOLATILITY * 100.0)
-
-            target_vol_input_str = input(f"Enter Target Annualized Volatility % (e.g., {target_vol_default_display:.0f}% for {configs.get('target_annualized_volatility', DEFAULT_TARGET_ANNUALIZED_VOLATILITY):.2f}): ")
+            target_vol_pct = get_input_with_default(
+                "Enter Target Annualized Volatility % (e.g., 80 for 80%)",
+                "target_annualized_volatility", 
+                DEFAULT_TARGET_ANNUALIZED_VOLATILITY * 100.0, # Constant default is in display %
+                float, 
+                is_percentage_display=True # Input is expected as %, stored as decimal
+            )
+            # Logic similar to risk_percent:
+            # If from CSV via get_input_with_default (user hit enter), it's already decimal (e.g. 0.80)
+            # If user input, it's in % (e.g. 80.0)
+            # If default constant, it's in % (e.g. 80.0 from DEFAULT_TARGET_ANNUALIZED_VOLATILITY * 100.0)
             
-            target_vol_pct = 0
-            if not target_vol_input_str: # User hit enter
-                target_vol_pct = float(target_vol_default_display) # Use the displayed default (already in %)
+            target_vol_decimal_val = 0
+            if target_vol_pct > 1.0 and target_vol_pct <= 500.0: # User entered 80 for 80%
+                target_vol_decimal_val = target_vol_pct / 100.0
+            elif 0 < target_vol_pct <= 5.0: # Already decimal (e.g. from CSV or user entered 0.8)
+                target_vol_decimal_val = target_vol_pct
+            # Handle case where default was used and it was > 1 (e.g. DEFAULT_TARGET_ANNUALIZED_VOLATILITY * 100.0 = 80.0)
+            elif target_vol_pct == (DEFAULT_TARGET_ANNUALIZED_VOLATILITY * 100.0) and \
+                 (DEFAULT_TARGET_ANNUALIZED_VOLATILITY * 100.0) > 1.0 and \
+                 (DEFAULT_TARGET_ANNUALIZED_VOLATILITY * 100.0) <= 500.0:
+                 target_vol_decimal_val = (DEFAULT_TARGET_ANNUALIZED_VOLATILITY * 100.0) / 100.0
             else:
-                target_vol_pct = float(target_vol_input_str)
-            
-            target_vol_decimal = target_vol_pct / 100.0
+                print("Target Annualized Volatility must be a positive number (e.g., input 80 for 80% or 0.8). Sensible range up to 500% (5.0).")
+                continue
 
-            if 0 < target_vol_decimal <= 5.0: # Check decimal value
-                configs["target_annualized_volatility"] = target_vol_decimal
-                break
-            print("Target Annualized Volatility must be a positive number (e.g., input 80 for 80% or 0.8). Sensible range up to 500% (5.0).")
+            configs["target_annualized_volatility"] = target_vol_decimal_val
+            break
         except ValueError: print("Invalid input for Target Annualized Volatility. Please enter a number.")
             
     # Realized Volatility Period
@@ -1114,8 +1907,38 @@ def get_user_configurations(load_choice_override: str = None, make_changes_overr
             break
         print("Invalid input. Please enter 'yes' or 'no'.")
 
-    configs["strategy_id"] = 8
-    configs["strategy_name"] = "Advance EMA Cross"
+    # Fibonacci Strategy Specific: 1M Candle Buffer Size
+    if configs.get("strategy_choice") == "fib_retracement":
+        while True:
+            try:
+                buffer_size = get_input_with_default(
+                    "Enter 1-min candle buffer size (for Fib strategy, e.g., 20-1000)",
+                    "fib_1m_buffer_size", DEFAULT_1M_BUFFER_SIZE, int
+                )
+                if 20 <= buffer_size <= 1000:
+                    configs["fib_1m_buffer_size"] = buffer_size
+                    break
+                print("1-min candle buffer size must be between 20 and 1000.")
+            except ValueError: print("Invalid input. Please enter an integer.")
+    else: # Not fib_retracement strategy, remove if it was in loaded CSV
+        configs.pop("fib_1m_buffer_size", None)
+        configs.pop("fib_order_timeout_minutes", None)
+
+    # Fibonacci Strategy Specific: Order Timeout
+    if configs.get("strategy_choice") == "fib_retracement":
+        while True:
+            try:
+                timeout_val = get_input_with_default(
+                    "Enter Fib order timeout in minutes (e.g., 1-60)",
+                    "fib_order_timeout_minutes", DEFAULT_FIB_ORDER_TIMEOUT_MINUTES, int
+                )
+                if 1 <= timeout_val <= 60:
+                    configs["fib_order_timeout_minutes"] = timeout_val
+                    break
+                print("Fib order timeout must be between 1 and 60 minutes.")
+            except ValueError: print("Invalid input. Please enter an integer.")
+
+    # Strategy ID and Name are set based on "strategy_choice" earlier.
     
     # Save configurations to CSV
     # We need to remove API keys before saving to CSV if they were temporarily added
