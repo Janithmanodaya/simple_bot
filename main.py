@@ -52,6 +52,13 @@ DEFAULT_MICRO_PIVOT_TRAILING_SL = True # Default for enabling micro-pivot traili
 DEFAULT_MICRO_PIVOT_BUFFER_ATR = 0.25  # Default ATR multiplier for micro-pivot SL buffer
 DEFAULT_MICRO_PIVOT_PROFIT_THRESHOLD_R = 0.5 # Default profit threshold (in R) to activate micro-pivot SL
 
+# Minimum Profit Check Default
+DEFAULT_MIN_EXPECTED_PROFIT_USDT = 0.10
+
+# ATR-Smart TP Zones (Volatility-Adaptive TP) Defaults for Fib Strategy
+DEFAULT_USE_ATR_FOR_TP = True
+DEFAULT_TP_ATR_MULTIPLIER = 2.5
+
 # Fibonacci Strategy Specific TP Scaling and SL Management Defaults
 DEFAULT_FIB_TP_USE_EXTENSIONS = True
 DEFAULT_FIB_TP1_EXTENSION_RATIO = 0.618
@@ -197,7 +204,12 @@ def validate_configurations(loaded_configs: dict) -> tuple[bool, str, dict]:
         "fib_tp3_qty_pct": {"type": float, "optional": True, "condition": lambda x: 0 < x < 1}, # Validation for sum of pct could be added later
         "fib_move_sl_after_tp1": {"type": str, "optional": True, "valid_values": ["breakeven", "trailing", "original"]},
         "fib_breakeven_buffer_r": {"type": float, "optional": True, "condition": lambda x: 0 <= x < 1}, # Buffer can be 0
-        "fib_sl_adjustment_after_tp2": {"type": str, "optional": True, "valid_values": ["micro_pivot", "atr_trailing", "original"]}
+        "fib_sl_adjustment_after_tp2": {"type": str, "optional": True, "valid_values": ["micro_pivot", "atr_trailing", "original"]},
+        # ATR-Smart TP for Fib
+        "use_atr_for_tp": {"type": bool, "optional": True},
+        "tp_atr_multiplier": {"type": float, "optional": True, "condition": lambda x: x > 0},
+        # Minimum Expected Profit
+        "min_expected_profit_usdt": {"type": float, "optional": True, "condition": lambda x: x >= 0}
         # API keys and telegram details are not part of this CSV validation
     }
     
@@ -994,10 +1006,18 @@ def detect_market_structure_and_bos(symbol: str, candle_buffer_df: pd.DataFrame,
             
             current_1m_atr = atr_series.iloc[-1]
             bos_event["atr_1m"] = current_1m_atr # Add 1m ATR to the BoS event details
+            print(f"[{symbol}] BoS event created: {bos_event}") # DEBUG: Show full BoS event
             print(f"[{symbol}] BoS event includes 1m ATR ({fib_atr_period}-period): {current_1m_atr:.5f}")
 
             state["state"] = "AWAITING_PULLBACK"
             state["bos_detail"] = bos_event
+        elif state.get("state") == "AWAITING_PULLBACK" and not bos_event : # If no new BoS, but was awaiting pullback, reset if conditions change
+            # This might be too aggressive, consider if state should persist longer or have other criteria for reset.
+            # For now, if it was awaiting pullback and no BoS is now detected (e.g. trend changed, price moved away),
+            # it might be prudent to reset to IDLE to re-evaluate for a fresh BoS.
+            # However, this part of logic might be better handled by timeout in manage_fib_retracement_entry_logic or monitor_pending_fib_entries
+            # For now, let's not reset here automatically unless BoS detection itself indicates a clear invalidation.
+            pass # Keeping state as AWAITING_PULLBACK if no new BoS on this candle. Entry logic will check if price is in zone.
         
         fib_strategy_states[symbol] = state 
         return bos_event
@@ -1070,6 +1090,7 @@ def manage_fib_retracement_entry_logic(client, configs: dict, symbol: str, bos_e
     global recent_trade_signatures, recent_trade_signatures_lock # For Trade Signature Check
 
     log_prefix = f"[{threading.current_thread().name}] {symbol} FibEntry:"
+    print(f"{log_prefix} ▶️ Fib entry logic triggered. Symbol: {symbol}, BoS: {bos_event.get('direction') if bos_event else 'N/A'}") # DEBUG
     
     if not bos_event or not symbol_info:
         print(f"{log_prefix} Missing bos_event or symbol_info. Aborting.")
@@ -1316,8 +1337,9 @@ def manage_fib_retracement_entry_logic(client, configs: dict, symbol: str, bos_e
     except Exception as e_lev:
         print(f"{log_prefix} Could not fetch current leverage for {symbol}: {e_lev}. Using default {current_leverage_on_symbol}x.")
 
-
+    print(f"{log_prefix} Inputs for calculate_position_size: acc_bal={acc_bal}, risk_percent={configs['risk_percent']}, entry_price_target={entry_price_target}, sl_price={sl_price}") # DEBUG
     qty_to_order = calculate_position_size(acc_bal, configs['risk_percent'], entry_price_target, sl_price, symbol_info, configs)
+    print(f"{log_prefix} Output from calculate_position_size: qty_to_order={qty_to_order}") # DEBUG
     if qty_to_order is None or qty_to_order <= 0:
         print(f"{log_prefix} Invalid position size calculated (Qty: {qty_to_order}). Aborting."); return
 
@@ -1456,35 +1478,59 @@ def monitor_pending_fib_entries(client, configs: dict):
 
                 # --- TP Price and Quantity Calculation ---
                 tp1_price_final, tp2_price_final, tp3_price_final = None, None, None
-                
-                if configs.get("fib_tp_use_extensions", DEFAULT_FIB_TP_USE_EXTENSIONS) and bos_event_snapshot:
-                    range_bos = abs(bos_event_snapshot['swing_high_bos_move'] - bos_event_snapshot['swing_low_bos_move'])
-                    tp1_ext_ratio = configs.get("fib_tp1_extension_ratio", DEFAULT_FIB_TP1_EXTENSION_RATIO)
-                    tp2_ext_ratio = configs.get("fib_tp2_extension_ratio", DEFAULT_FIB_TP2_EXTENSION_RATIO)
-                    tp3_ext_ratio = configs.get("fib_tp3_extension_ratio", DEFAULT_FIB_TP3_EXTENSION_RATIO)
+                qty_tp1, qty_tp2, qty_tp3 = 0, 0, 0
 
-                    if trade_side == "long":
-                        tp1_price_final = round(actual_entry_price + (range_bos * tp1_ext_ratio), p_prec)
-                        tp2_price_final = round(actual_entry_price + (range_bos * tp2_ext_ratio), p_prec)
-                        tp3_price_final = round(actual_entry_price + (range_bos * tp3_ext_ratio), p_prec)
-                    else: # SHORT
-                        tp1_price_final = round(actual_entry_price - (range_bos * tp1_ext_ratio), p_prec)
-                        tp2_price_final = round(actual_entry_price - (range_bos * tp2_ext_ratio), p_prec)
-                        tp3_price_final = round(actual_entry_price - (range_bos * tp3_ext_ratio), p_prec)
-                    print(f"{log_prefix_monitor} Calculated Fib Extension TPs for {symbol} ({trade_side}): TP1={tp1_price_final}, TP2={tp2_price_final}, TP3={tp3_price_final}")
-                else: # Use provisional TPs (old logic or if extensions disabled)
-                    tp1_price_final = pending_details.get('tp1_price_provisional')
-                    tp2_price_final = pending_details.get('tp2_price_provisional')
-                    tp3_price_final = pending_details.get('tp3_price_provisional')
-                    print(f"{log_prefix_monitor} Using provisional/original TP logic for {symbol} ({trade_side}): TP1={tp1_price_final}, TP2={tp2_price_final}, TP3={tp3_price_final}")
+                use_atr_tp = configs.get("use_atr_for_tp", DEFAULT_USE_ATR_FOR_TP)
 
-                # TP Quantity Percentages from config
-                qty_pct_tp1 = configs.get("fib_tp1_qty_pct", DEFAULT_FIB_TP1_QTY_PCT)
-                qty_pct_tp2 = configs.get("fib_tp2_qty_pct", DEFAULT_FIB_TP2_QTY_PCT)
-                # TP3 qty is the remainder to ensure total matches total_filled_qty
+                if use_atr_tp:
+                    print(f"{log_prefix_monitor} Using ATR-Smart TP logic for {symbol} ({trade_side}).")
+                    atr_1m = bos_event_snapshot.get("atr_1m")
+                    initial_risk_per_unit = pending_details.get("initial_risk_per_unit") # This is 'R'
+                    tp_atr_mult = configs.get("tp_atr_multiplier", DEFAULT_TP_ATR_MULTIPLIER)
+
+                    if atr_1m is not None and initial_risk_per_unit is not None and atr_1m > 0 and initial_risk_per_unit > 0:
+                        tp_distance = atr_1m * tp_atr_mult * initial_risk_per_unit
+                        if trade_side == "long":
+                            tp1_price_final = round(actual_entry_price + tp_distance, p_prec)
+                        else: # SHORT
+                            tp1_price_final = round(actual_entry_price - tp_distance, p_prec)
+                        
+                        qty_tp1 = total_filled_qty # Single TP takes all quantity
+                        qty_tp2 = 0
+                        qty_tp3 = 0
+                        print(f"{log_prefix_monitor} ATR-Smart TP calculated for {symbol}: TP={tp1_price_final} (ATR: {atr_1m}, R: {initial_risk_per_unit}, Multiplier: {tp_atr_mult})")
+                    else:
+                        print(f"{log_prefix_monitor} Could not calculate ATR-Smart TP due to missing ATR ({atr_1m}) or Risk ({initial_risk_per_unit}). Defaulting to Fib Extension/Provisional TPs.")
+                        use_atr_tp = False # Fallback to extension/provisional
                 
-                qty_tp1 = round(total_filled_qty * qty_pct_tp1, q_prec)
-                qty_tp2 = round(total_filled_qty * qty_pct_tp2, q_prec)
+                if not use_atr_tp: # Fallback or standard Fib Extension/Provisional logic
+                    if configs.get("fib_tp_use_extensions", DEFAULT_FIB_TP_USE_EXTENSIONS) and bos_event_snapshot:
+                        range_bos = abs(bos_event_snapshot['swing_high_bos_move'] - bos_event_snapshot['swing_low_bos_move'])
+                        tp1_ext_ratio = configs.get("fib_tp1_extension_ratio", DEFAULT_FIB_TP1_EXTENSION_RATIO)
+                        tp2_ext_ratio = configs.get("fib_tp2_extension_ratio", DEFAULT_FIB_TP2_EXTENSION_RATIO)
+                        tp3_ext_ratio = configs.get("fib_tp3_extension_ratio", DEFAULT_FIB_TP3_EXTENSION_RATIO)
+
+                        if trade_side == "long":
+                            tp1_price_final = round(actual_entry_price + (range_bos * tp1_ext_ratio), p_prec)
+                            tp2_price_final = round(actual_entry_price + (range_bos * tp2_ext_ratio), p_prec)
+                            tp3_price_final = round(actual_entry_price + (range_bos * tp3_ext_ratio), p_prec)
+                        else: # SHORT
+                            tp1_price_final = round(actual_entry_price - (range_bos * tp1_ext_ratio), p_prec)
+                            tp2_price_final = round(actual_entry_price - (range_bos * tp2_ext_ratio), p_prec)
+                            tp3_price_final = round(actual_entry_price - (range_bos * tp3_ext_ratio), p_prec)
+                        print(f"{log_prefix_monitor} Calculated Fib Extension TPs for {symbol} ({trade_side}): TP1={tp1_price_final}, TP2={tp2_price_final}, TP3={tp3_price_final}")
+                    else: # Use provisional TPs (old logic or if extensions disabled)
+                        tp1_price_final = pending_details.get('tp1_price_provisional')
+                        tp2_price_final = pending_details.get('tp2_price_provisional')
+                        tp3_price_final = pending_details.get('tp3_price_provisional')
+                        print(f"{log_prefix_monitor} Using provisional/original TP logic for {symbol} ({trade_side}): TP1={tp1_price_final}, TP2={tp2_price_final}, TP3={tp3_price_final}")
+
+                    # TP Quantity Percentages from config (only if not ATR-Smart TP)
+                    qty_pct_tp1 = configs.get("fib_tp1_qty_pct", DEFAULT_FIB_TP1_QTY_PCT)
+                    qty_pct_tp2 = configs.get("fib_tp2_qty_pct", DEFAULT_FIB_TP2_QTY_PCT)
+                    
+                    qty_tp1 = round(total_filled_qty * qty_pct_tp1, q_prec)
+                    qty_tp2 = round(total_filled_qty * qty_pct_tp2, q_prec)
                 
                 # Ensure qty_tp1 and qty_tp2 are not zero if their percentages are non-zero, due to small total_filled_qty
                 min_qty_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
@@ -2270,6 +2316,36 @@ def get_user_configurations(load_choice_override: str = None, make_changes_overr
                     break
                 print("Fib SL ATR Multiplier must be a positive number.")
             except ValueError: print("Invalid input for Fib SL ATR Multiplier. Please enter a number.")
+
+        # ATR-Smart TP for Fib
+        while True:
+            default_bool_val = configs.get("use_atr_for_tp", DEFAULT_USE_ATR_FOR_TP)
+            default_bool_disp = 'yes' if default_bool_val else 'no'
+            atr_tp_input = input(f"Use ATR-Smart TP for Fib Strategy? (yes/no) (default: {default_bool_disp}): ").lower().strip()
+            chosen_atr_tp_bool = None
+            if not atr_tp_input: chosen_atr_tp_bool = default_bool_val
+            elif atr_tp_input in ["yes", "y"]: chosen_atr_tp_bool = True
+            elif atr_tp_input in ["no", "n"]: chosen_atr_tp_bool = False
+            if isinstance(chosen_atr_tp_bool, bool):
+                configs["use_atr_for_tp"] = chosen_atr_tp_bool
+                break
+            print("Invalid input. Please enter 'yes' or 'no'.")
+
+        if configs.get("use_atr_for_tp"):
+            while True:
+                try:
+                    tp_atr_mult_val = get_input_with_default(
+                        "Enter TP ATR Multiplier (for ATR-Smart TP)",
+                        "tp_atr_multiplier", DEFAULT_TP_ATR_MULTIPLIER, float
+                    )
+                    if tp_atr_mult_val > 0:
+                        configs["tp_atr_multiplier"] = tp_atr_mult_val
+                        break
+                    print("TP ATR Multiplier must be a positive number.")
+                except ValueError: print("Invalid input for TP ATR Multiplier. Please enter a number.")
+        else: # Not using ATR-Smart TP, remove if it was in loaded CSV
+            configs.pop("tp_atr_multiplier", None)
+
     else: # Not fib_retracement strategy, remove if it was in loaded CSV
         configs.pop("fib_atr_period", None)
         configs.pop("fib_sl_atr_multiplier", None)
@@ -2284,22 +2360,32 @@ def get_user_configurations(load_choice_override: str = None, make_changes_overr
         configs.pop("fib_move_sl_after_tp1", None)
         configs.pop("fib_breakeven_buffer_r", None)
         configs.pop("fib_sl_adjustment_after_tp2", None)
+        # ATR-Smart TP for Fib
+        configs.pop("use_atr_for_tp", None)
+        configs.pop("tp_atr_multiplier", None)
 
 
     # Fibonacci Strategy Specific: TP Scaling and SL Management (only if Fib strategy is chosen)
     if configs.get("strategy_choice") == "fib_retracement":
         print("\n--- Fibonacci Strategy Specific TP & SL Management ---")
-        # fib_tp_use_extensions
-        while True:
-            default_val = configs.get("fib_tp_use_extensions", DEFAULT_FIB_TP_USE_EXTENSIONS)
-            default_disp = 'yes' if default_val else 'no'
-            user_input = input(f"Use Fib Extension TPs for Fib Strategy? (yes/no) (default: {default_disp}): ").lower().strip()
-            chosen_val = None
-            if not user_input: chosen_val = default_val
-            elif user_input in ["yes", "y"]: chosen_val = True
-            elif user_input in ["no", "n"]: chosen_val = False
-            if isinstance(chosen_val, bool): configs["fib_tp_use_extensions"] = chosen_val; break
-            print("Invalid input. Please enter 'yes' or 'no'.")
+
+        # Only ask for Fib Extension TPs if ATR-Smart TP is NOT enabled
+        if not configs.get("use_atr_for_tp", False):
+            while True:
+                default_val = configs.get("fib_tp_use_extensions", DEFAULT_FIB_TP_USE_EXTENSIONS)
+                default_disp = 'yes' if default_val else 'no'
+                user_input = input(f"Use Fib Extension TPs for Fib Strategy? (yes/no) (default: {default_disp}): ").lower().strip()
+                chosen_val = None
+                if not user_input:
+                    chosen_val = default_val
+                elif user_input in ["yes", "y"]:
+                    chosen_val = True
+                elif user_input in ["no", "n"]:
+                    chosen_val = False
+                if isinstance(chosen_val, bool):
+                    configs["fib_tp_use_extensions"] = chosen_val
+                    break
+                print("Invalid input. Please enter 'yes' or 'no'.")
 
         if configs.get("fib_tp_use_extensions"):
             # TP Extension Ratios
@@ -2414,6 +2500,19 @@ def get_user_configurations(load_choice_override: str = None, make_changes_overr
     else: # Not enabled, remove related params if they were in loaded CSV
         configs.pop("micro_pivot_buffer_atr", None)
         configs.pop("micro_pivot_profit_threshold_r", None)
+
+    # Minimum Expected Profit USDT
+    while True:
+        try:
+            min_profit = get_input_with_default(
+                f"Enter Minimum Expected Profit per trade in USDT (0 to disable, e.g., {DEFAULT_MIN_EXPECTED_PROFIT_USDT})",
+                "min_expected_profit_usdt", DEFAULT_MIN_EXPECTED_PROFIT_USDT, float
+            )
+            if min_profit >= 0:
+                configs["min_expected_profit_usdt"] = min_profit
+                break
+            print("Minimum expected profit must be zero or a positive number.")
+        except ValueError: print("Invalid input for minimum expected profit. Please enter a number.")
 
     # Strategy ID and Name are set based on "strategy_choice" earlier.
     
@@ -3375,6 +3474,21 @@ def pre_order_sanity_checks(symbol, signal, entry_price, sl_price, tp_price, qua
         return False, (f"Estimated required margin ({required_margin:.2f} USDT) exceeds "
                        f"current balance ({current_balance:.2f} USDT) for quantity {quantity:.{q_prec}f} at {entry_price:.{p_prec}f} with {specific_leverage_for_trade}x leverage.")
 
+    # 6. Minimum Expected Profit Check
+    # This check is applied to all trades, managed or unmanaged (if TP and SL are defined).
+    # For unmanaged trades, this acts as a safety if the calculated SL/TP for an existing position are too close.
+    min_profit_config = configs.get('min_expected_profit_usdt', DEFAULT_MIN_EXPECTED_PROFIT_USDT)
+    if min_profit_config > 0: # Only apply check if configured > 0
+        # Potential profit based on the distance between TP and SL prices, times quantity.
+        # This represents the gross profit if price moves from SL to TP, or the total range of the trade in USDT.
+        # This interpretation aligns with "TP – SL < min_profit_dollar" where "TP-SL" is the price range.
+        potential_trade_range_usdt = abs(tp_price - sl_price) * quantity
+        
+        if potential_trade_range_usdt < min_profit_config:
+            return False, (f"Potential trade range value ({potential_trade_range_usdt:.2f} USDT) "
+                           f"from SL ({sl_price:.{p_prec}f}) to TP ({tp_price:.{p_prec}f}) with Qty {quantity:.{q_prec}f} "
+                           f"is less than minimum configured ({min_profit_config:.2f} USDT).")
+
     return True, "Checks passed"
 
 
@@ -3450,37 +3564,132 @@ def process_symbol_task(symbol, client, configs, lock):
     # configs['cycle_start_time_ref'] is vital here
     thread_name = threading.current_thread().name
     cycle_start_ref = configs.get('cycle_start_time_ref', time.time()) # Fallback if not passed
-    print(f"[{thread_name}] Processing: {symbol} {format_elapsed_time(cycle_start_ref)}")
+    log_prefix_task = f"[{thread_name}] {symbol} EMA_Task:" # Specific prefix for EMA task
+    print(f"{log_prefix_task} Processing {format_elapsed_time(cycle_start_ref)}")
     try:
-        klines_df, klines_error = get_historical_klines(client, symbol) # Uses default limit 500
+        klines_df, klines_error = get_historical_klines(client, symbol) # Uses default limit 500 for EMA strategy (e.g., 15-min klines)
         
         if klines_error:
             if isinstance(klines_error, BinanceAPIException) and klines_error.code == -1121:
-                # Specific handling for "Invalid symbol"
                 msg = f"Skipped: Invalid symbol reported by API (code -1121)."
-                print(f"[{thread_name}] {symbol}: {msg} {format_elapsed_time(cycle_start_ref)}")
-                # TODO: Consider adding logic here to remove 'symbol' from a shared list of monitored symbols
-                # to prevent repeated checks for persistently invalid symbols. This requires careful synchronization.
+                print(f"{log_prefix_task} {msg} {format_elapsed_time(cycle_start_ref)}")
                 return f"{symbol}: {msg}"
             else:
-                # General error during kline fetch
                 msg = f"Skipped: Error fetching klines ({str(klines_error)})."
-                print(f"[{thread_name}] {symbol}: {msg} {format_elapsed_time(cycle_start_ref)}")
+                print(f"{log_prefix_task} {msg} {format_elapsed_time(cycle_start_ref)}")
                 return f"{symbol}: {msg}"
 
-        if klines_df.empty or len(klines_df) < 202:
-            msg = f"Skipped: Insufficient klines ({len(klines_df)})."
-            print(f"[{thread_name}] {symbol}: {msg} {format_elapsed_time(cycle_start_ref)}")
+        if klines_df.empty or len(klines_df) < 202: # Min klines for EMA200 + validation
+            msg = f"Skipped: Insufficient klines for EMA strategy ({len(klines_df)})."
+            print(f"{log_prefix_task} {msg} {format_elapsed_time(cycle_start_ref)}")
             return f"{symbol}: {msg}"
         
-        print(f"[{thread_name}] {symbol}: Sufficient klines ({len(klines_df)}). Calling manage_trade_entry {format_elapsed_time(cycle_start_ref)}")
-        manage_trade_entry(client, configs, symbol, klines_df.copy(), lock)
-        return f"{symbol}: Processed"
+        print(f"{log_prefix_task} Sufficient klines ({len(klines_df)}). Calling manage_trade_entry (EMA logic) {format_elapsed_time(cycle_start_ref)}")
+        # manage_trade_entry is specifically for EMA cross logic based on its internal workings
+        manage_trade_entry(client, configs, symbol, klines_df.copy(), lock) 
+        return f"{symbol}: EMA Processed"
     except Exception as e:
-        error_detail = f"Unhandled error in process_symbol_task: {e}"
-        print(f"[{thread_name}] ERROR processing {symbol}: {error_detail} {format_elapsed_time(cycle_start_ref)}")
-        traceback.print_exc() # Print full traceback for thread errors
-        return f"{symbol}: Error - {error_detail}"
+        error_detail = f"Unhandled error in process_symbol_task (EMA): {e}"
+        print(f"{log_prefix_task} ERROR processing: {error_detail} {format_elapsed_time(cycle_start_ref)}")
+        traceback.print_exc()
+        return f"{symbol}: EMA Error - {error_detail}"
+
+def process_symbol_fib_task(symbol, client, configs, lock): # lock here is active_trades_lock
+    thread_name = threading.current_thread().name
+    cycle_start_ref = configs.get('cycle_start_time_ref', time.time())
+    log_prefix_task = f"[{thread_name}] {symbol} FIB_Task:"
+    print(f"{log_prefix_task} Processing {format_elapsed_time(cycle_start_ref)}")
+
+    try:
+        s_info = get_symbol_info(client, symbol)
+        if not s_info:
+            print(f"{log_prefix_task} Failed to get symbol_info. Skipping.")
+            return f"{symbol}: Fib Error - No symbol_info"
+
+        # 1. Fetch 1-minute klines
+        # Limit should be based on fib_1m_buffer_size + some for initial pivot calculations if buffer is empty
+        buffer_size_config = configs.get("fib_1m_buffer_size", DEFAULT_1M_BUFFER_SIZE)
+        fetch_limit_1m = buffer_size_config + PIVOT_N_LEFT + PIVOT_N_RIGHT + 5 # Ensure enough for pivots and buffer fill
+        
+        klines_1m_df, klines_1m_error = get_historical_klines_1m(client, symbol, limit=fetch_limit_1m)
+
+        if klines_1m_error:
+            msg = f"Skipped: Error fetching 1m klines ({str(klines_1m_error)})."
+            print(f"{log_prefix_task} {msg} {format_elapsed_time(cycle_start_ref)}")
+            return f"{symbol}: {msg}"
+        
+        if klines_1m_df.empty or len(klines_1m_df) < (PIVOT_N_LEFT + PIVOT_N_RIGHT + 2): # Min for BoS detection + current
+            msg = f"Skipped: Insufficient 1m klines for Fib strategy ({len(klines_1m_df)})."
+            print(f"{log_prefix_task} {msg} {format_elapsed_time(cycle_start_ref)}")
+            return f"{symbol}: {msg}"
+
+        # 2. Update 1-minute candle buffer (only last candle, or fill if buffer is new/empty)
+        # For simplicity in task, let's assume buffer is mainly populated by a dedicated stream or this task is primary populator.
+        # If buffer is empty, populate with fetched klines. Otherwise, just update with latest.
+        with symbol_1m_candle_buffers_lock:
+            is_new_buffer = symbol not in symbol_1m_candle_buffers
+        
+        if is_new_buffer: # Populate whole buffer
+            print(f"{log_prefix_task} Populating new 1m candle buffer for {symbol} with {len(klines_1m_df)} candles.")
+            for idx in range(len(klines_1m_df)):
+                update_1m_candle_buffer(symbol, klines_1m_df.iloc[idx], buffer_size_config)
+        else: # Just update with the latest candle(s)
+            # update_1m_candle_buffer handles duplicates and ordering based on timestamp
+            # We can submit the last few candles from klines_1m_df to ensure it's up-to-date.
+            # For this task, let's ensure at least the very last candle is processed.
+            update_1m_candle_buffer(symbol, klines_1m_df.iloc[-1], buffer_size_config)
+
+
+        # 3. Retrieve the populated 1-minute candle buffer
+        current_buffer_df = None
+        with symbol_1m_candle_buffers_lock:
+            if symbol in symbol_1m_candle_buffers and len(symbol_1m_candle_buffers[symbol]) > 0:
+                # Convert deque of Series to DataFrame for BoS detection
+                records = [s.to_dict() for s in symbol_1m_candle_buffers[symbol] if isinstance(s, pd.Series)]
+                if records:
+                    temp_df = pd.DataFrame(records)
+                    if 'timestamp' not in temp_df.columns and symbol_1m_candle_buffers[symbol][0].name is not None:
+                         temp_df.index = [s.name for s in symbol_1m_candle_buffers[symbol]]
+                    elif 'timestamp' in temp_df.columns: # If 'timestamp' was a column in the Series
+                         temp_df.set_index('timestamp', inplace=True)
+                    
+                    if all(c in temp_df for c in ['open','high','low','close']): # Ensure required columns exist
+                        current_buffer_df = temp_df
+        
+        if current_buffer_df is None or current_buffer_df.empty:
+            msg = f"Skipped: 1m candle buffer for {symbol} is empty or invalid after update."
+            print(f"{log_prefix_task} {msg} {format_elapsed_time(cycle_start_ref)}")
+            return f"{symbol}: {msg}"
+        
+        print(f"{log_prefix_task} Buffer for {symbol} has {len(current_buffer_df)} candles. Detecting BoS...")
+
+        # 4. Detect market structure and BoS
+        bos_event_details = detect_market_structure_and_bos(symbol, current_buffer_df.copy(), configs)
+
+        if bos_event_details:
+            print(f"{log_prefix_task} BoS event detected for {symbol}: {bos_event_details['direction']}")
+            # Add symbol_info to bos_event_details as it's needed by manage_fib_retracement_entry_logic
+            bos_event_details['symbol_info'] = s_info 
+
+            current_fib_state = "IDLE" # Default
+            with fib_strategy_states_lock:
+                if symbol in fib_strategy_states:
+                    current_fib_state = fib_strategy_states[symbol].get('state', "IDLE")
+            
+            if current_fib_state == "AWAITING_PULLBACK":
+                 print(f"{log_prefix_task} State is AWAITING_PULLBACK. Calling manage_fib_retracement_entry_logic.")
+                 manage_fib_retracement_entry_logic(client, configs, symbol, bos_event_details, s_info)
+            else:
+                print(f"{log_prefix_task} BoS detected, but state is '{current_fib_state}', not AWAITING_PULLBACK. No entry logic call.")
+        # else: No BoS event, or already handled by detect_market_structure_and_bos logging
+        
+        return f"{symbol}: Fib Processed"
+    except Exception as e:
+        error_detail = f"Unhandled error in process_symbol_fib_task: {e}"
+        print(f"{log_prefix_task} ERROR processing: {error_detail} {format_elapsed_time(cycle_start_ref)}")
+        traceback.print_exc()
+        return f"{symbol}: Fib Error - {error_detail}"
+
 
 def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is active_trades_lock
     global active_trades, symbols_currently_processing, symbols_currently_processing_lock
@@ -4814,22 +5023,41 @@ def trading_loop(client, configs, monitored_symbols):
                 if proceed_with_new_trades:
                     print(f"Space available for new trades ({num_active_trades}/{max_pos_limit}). Proceeding with symbol scan. {format_elapsed_time(cycle_start_time)}")
                     futures = []
-                    print(f"Submitting {len(monitored_symbols)} symbol tasks to {configs.get('max_scan_threads')} threads... {format_elapsed_time(cycle_start_time)}")
-                    for symbol in monitored_symbols:
-                        # manage_trade_entry will internally check halt flags again before processing
-                        futures.append(executor.submit(process_symbol_task, symbol, client, configs, active_trades_lock))
+                    print(f"Submitting {len(monitored_symbols)} symbol tasks to {configs.get('max_scan_threads')} threads for strategy '{configs['strategy_choice']}'... {format_elapsed_time(cycle_start_time)}")
+                    
+                    task_function_to_submit = None
+                    if configs["strategy_choice"] == "fib_retracement":
+                        task_function_to_submit = process_symbol_fib_task
+                        print(f"Using Fibonacci task function: {task_function_to_submit.__name__}")
+                    elif configs["strategy_choice"] == "ema_cross":
+                        task_function_to_submit = process_symbol_task # This is the original EMA task
+                        print(f"Using EMA Cross task function: {task_function_to_submit.__name__}")
+                    else:
+                        print(f"ERROR: Unknown strategy_choice '{configs['strategy_choice']}' in trading_loop. Cannot submit tasks.")
+                        # Potentially halt or skip this cycle's new trade processing
+                        proceed_with_new_trades = False # Stop trying to process new trades if strategy is unknown
+
+                    if task_function_to_submit and proceed_with_new_trades:
+                        for symbol in monitored_symbols:
+                            # Each task function will internally check halt flags again before processing
+                            futures.append(executor.submit(task_function_to_submit, symbol, client, configs, active_trades_lock))
                     
                     processed_count = 0
-                    for future in as_completed(futures):
-                        try: result = future.result(); # print(f"Task result: {result}") # Optional: log task result
-                        except Exception as e_future: print(f"Task error: {e_future}")
-                        processed_count += 1
-                        if processed_count % (len(monitored_symbols)//5 or 1) == 0 or processed_count == len(monitored_symbols): # Log progress periodically
-                             print(f"Symbol tasks progress: {processed_count}/{len(monitored_symbols)} completed. {format_elapsed_time(cycle_start_time)}")
-                    print(f"All symbol tasks completed for new trade scanning. {format_elapsed_time(cycle_start_time)}")
-                
+                    if futures: # Only iterate if tasks were actually submitted
+                        for future in as_completed(futures):
+                            try: result = future.result(); # print(f"Task result: {result}") # Optional: log task result
+                            except Exception as e_future: print(f"Task error: {e_future}")
+                            processed_count += 1
+                            if processed_count % (len(monitored_symbols)//5 or 1) == 0 or processed_count == len(monitored_symbols): # Log progress periodically
+                                 print(f"Symbol tasks progress: {processed_count}/{len(monitored_symbols)} completed. {format_elapsed_time(cycle_start_time)}")
+                        print(f"All symbol tasks completed for new trade scanning. {format_elapsed_time(cycle_start_time)}")
+                    elif not proceed_with_new_trades and not task_function_to_submit : # If strategy was unknown
+                        print(f"Skipping new trade task submission due to unknown strategy. {format_elapsed_time(cycle_start_time)}")
+                    else: # No futures submitted for other reasons (e.g. monitored_symbols was empty, though guarded earlier)
+                        print(f"No new trade tasks were submitted this cycle. {format_elapsed_time(cycle_start_time)}")
+
                 # --- Operations for when new trades are paused/halted but monitoring continues ---
-                else: # Not proceeding with new trades (halted, or max positions)
+                if not proceed_with_new_trades:
                     if halt_dd_flag: # Max drawdown halt implies all positions should have been closed
                         print(f"Max Drawdown Halt is active. All positions should be closed. Waiting for next trading day. {format_elapsed_time(cycle_start_time)}")
                         # No monitoring needed if all positions are intended to be closed.
@@ -4837,7 +5065,7 @@ def trading_loop(client, configs, monitored_symbols):
                     elif halt_dsl_flag:
                         print(f"Daily Stop Loss Halt for new trades is active. Monitoring existing positions. {format_elapsed_time(cycle_start_time)}")
                     elif num_active_trades >= max_pos_limit:
-                         print(f"Max concurrent positions limit reached. Monitoring existing positions. {format_elapsed_time(cycle_start_time)}")
+                        print(f"Max concurrent positions limit reached. Monitoring existing positions. {format_elapsed_time(cycle_start_time)}")
                     # If none of the above, it implies proceed_with_new_trades was true, so this 'else' shouldn't be hit without a reason.
                     # This block primarily serves to articulate actions when new trades are *not* sought.
 
@@ -5489,7 +5717,8 @@ def ensure_sl_tp_for_all_open_positions(client, configs, active_trades_ref, symb
                     final_msg = f"✅ {log_prefix} For UNMANAGED {symbol} (Entry: {entry_price:.{p_prec_unmanaged}f}, Qty: {abs_position_qty}): "
                     if sl_placed_unmanaged: final_msg += f"SL set @ {calc_sl_price:.{p_prec_unmanaged}f}. "
                     if tp_placed_unmanaged: final_msg += f"TP set @ {calc_tp_price:.{p_prec_unmanaged}f}."
-                    send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"), final_msg.strip())
+                    # send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"), final_msg.strip()) # User request to remove this success message
+                    print(f"{log_prefix} Suppressed Telegram notification for successful SL/TP placement on UNMANAGED trade {symbol}.")
 
 
     except BinanceAPIException as e:
