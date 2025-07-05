@@ -645,7 +645,8 @@ def build_startup_message(configs, balance, open_positions_text, bot_start_time_
 def send_telegram_message(bot_token, chat_id, message):
     """Sends a message to a specified Telegram chat using async."""
     if not bot_token or not chat_id:
-        print("Telegram bot token or chat ID not configured. Cannot send message.")
+        # Enhanced logging here
+        print(f"TELEGRAM_MSG_SKIPPED: Attempted to send message, but bot_token ('{bot_token if bot_token else 'None/Empty'}') or chat_id ('{chat_id if chat_id else 'None/Empty'}') is not configured. Message not sent: '{message[:100]}...'")
         return False
 
     async def _send():
@@ -910,12 +911,13 @@ def detect_market_structure_and_bos(symbol: str, candle_buffer_df: pd.DataFrame,
         # Basic trend definition (can be more sophisticated)
         # If we have a recent confirmed swing high and low:
         if prev_swing_high and prev_swing_low:
-            if state["last_swing_high"] and state["last_swing_low"]:
+            # Access state using the correct keys: _price suffix
+            if state.get("last_swing_high_price") and state.get("last_swing_low_price"):
                 # Higher highs and higher lows -> uptrend
-                if prev_swing_high > state["last_swing_high"] and prev_swing_low > state["last_swing_low"]:
+                if prev_swing_high > state["last_swing_high_price"] and prev_swing_low > state["last_swing_low_price"]:
                     state["trend"] = "uptrend"
                 # Lower highs and lower lows -> downtrend
-                elif prev_swing_high < state["last_swing_high"] and prev_swing_low < state["last_swing_low"]:
+                elif prev_swing_high < state["last_swing_high_price"] and prev_swing_low < state["last_swing_low_price"]:
                     state["trend"] = "downtrend"
                 # else, could be ranging or unclear, maintain previous trend or set to None
             
@@ -1296,7 +1298,11 @@ def manage_fib_retracement_entry_logic(client, configs: dict, symbol: str, bos_e
     # The monitoring logic will handle placing orders only for non-None TPs.
     
     print(f"{log_prefix} Calculated Entry: {entry_price_target:.{p_prec}f}, SL: {sl_price:.{p_prec}f}")
-    print(f"{log_prefix} TP Levels: TP1={tp1_price_final:.{p_prec}f if tp1_price_final else 'N/A'}, TP2={tp2_price_final:.{p_prec}f if tp2_price_final else 'N/A'}, TP3={tp3_price_final:.{p_prec}f if tp3_price_final else 'N/A'}")
+    # Format TP levels carefully to handle None values before printing
+    tp1_str = f"{tp1_price_final:.{p_prec}f}" if tp1_price_final is not None else "N/A"
+    tp2_str = f"{tp2_price_final:.{p_prec}f}" if tp2_price_final is not None else "N/A"
+    tp3_str = f"{tp3_price_final:.{p_prec}f}" if tp3_price_final is not None else "N/A"
+    print(f"{log_prefix} TP Levels: TP1={tp1_str}, TP2={tp2_str}, TP3={tp3_str}")
 
     # 3. Risk:Reward and Position Sizing (Similar to manage_trade_entry)
     # For R:R, use TP1 for calculation, or an average TP if desired. Let's use TP1.
@@ -1393,6 +1399,30 @@ def manage_fib_retracement_entry_logic(client, configs: dict, symbol: str, bos_e
 
     print(f"{log_prefix} LIMIT entry order placed: ID {entry_limit_order['orderId']}. Status: {entry_limit_order['status']}")
     
+    # Send Telegram notification for new limit order placement
+    if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+        side_display = direction.upper()
+        limit_price_display = f"{entry_price_target:.{p_prec}f}"
+        qty_display = f"{qty_to_order:.{int(symbol_info.get('quantityPrecision', 0))}f}"
+        
+        sl_str_limit = f"{sl_price:.{p_prec}f}" if sl_price is not None else "N/A"
+        tp1_str_limit = f"{tp1_price_final:.{p_prec}f}" if tp1_price_final is not None else "N/A"
+
+        limit_order_msg = (
+            f"⏳ FIB LIMIT ORDER PLACED ⏳\n\n"
+            f"Symbol: `{symbol}`\n"
+            f"Side: `{side_display}`\n"
+            f"Type: `LIMIT`\n"
+            f"Quantity: `{qty_display}`\n"
+            f"Limit Price: `{limit_price_display}`\n"
+            f"Order ID: `{entry_limit_order['orderId']}`\n\n"
+            f"Associated SL (if filled): `{sl_str_limit}`\n"
+            f"Associated TP1 (if filled): `{tp1_str_limit}`\n\n"
+            f"Monitoring for fill..."
+        )
+        send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], limit_order_msg)
+        print(f"{log_prefix} Telegram notification sent for new Fib limit order placement.")
+
     # If order is FILLED immediately (e.g. if limit price crossed spread aggressively)
     # Or if it's just NEW, we need to store it and monitor.
     # For now, this function's scope ends at placing the limit order.
@@ -3614,9 +3644,16 @@ def process_symbol_fib_task(symbol, client, configs, lock): # lock here is activ
         klines_1m_df, klines_1m_error = get_historical_klines_1m(client, symbol, limit=fetch_limit_1m)
 
         if klines_1m_error:
-            msg = f"Skipped: Error fetching 1m klines ({str(klines_1m_error)})."
-            print(f"{log_prefix_task} {msg} {format_elapsed_time(cycle_start_ref)}")
-            return f"{symbol}: {msg}"
+            if isinstance(klines_1m_error, BinanceAPIException) and klines_1m_error.code == -1121:
+                msg = f"Skipped: Invalid symbol reported by API (code -1121)."
+                print(f"{log_prefix_task} {msg} {format_elapsed_time(cycle_start_ref)}")
+                # Consider adding to a temporary blacklist for the session or logging for review
+                return f"{symbol}: {msg}" # Correctly returns and skips
+            else:
+                # For other API errors or general errors during kline fetching
+                msg = f"Skipped: Error fetching 1m klines ({str(klines_1m_error)})."
+                print(f"{log_prefix_task} {msg} {format_elapsed_time(cycle_start_ref)}")
+                return f"{symbol}: {msg}"
         
         if klines_1m_df.empty or len(klines_1m_df) < (PIVOT_N_LEFT + PIVOT_N_RIGHT + 2): # Min for BoS detection + current
             msg = f"Skipped: Insufficient 1m klines for Fib strategy ({len(klines_1m_df)})."
