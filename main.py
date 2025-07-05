@@ -80,6 +80,7 @@ active_trades_lock = threading.Lock() # Lock for synchronizing access to active_
 # Set to keep track of symbols currently being processed by manage_trade_entry to prevent race conditions.
 import datetime # Added for last_trading_day
 from datetime import datetime as dt # Alias for ease of use if datetime.datetime is needed alongside datetime.date
+from datetime import timezone  # <-- Add this import for timezone support
 
 symbols_currently_processing = set()
 symbols_currently_processing_lock = threading.Lock()
@@ -99,6 +100,10 @@ recent_trade_signatures = {} # Stores trade_signature: timestamp
 recent_trade_signatures_lock = threading.Lock()
 recent_trade_signature_cleanup_interval = 60 # seconds, how often to check for cleanup
 last_signature_cleanup_time = dt.now() # Initialize last cleanup time
+
+# Globals for "Signal" Mode Virtual Trade Tracking
+active_signals = {} # Stores details of active signals, similar to active_trades
+active_signals_lock = threading.Lock() # Lock for active_signals
 
 # Daily performance and halt status variables
 daily_high_equity = 0.0
@@ -167,7 +172,7 @@ def validate_configurations(loaded_configs: dict) -> tuple[bool, str, dict]:
     # Validation functions take the value and return True if valid, or a string error message
     expected_params = {
         "environment": {"type": str, "valid_values": ["testnet", "mainnet"]},
-        "mode": {"type": str, "valid_values": ["live", "backtest"]},
+        "mode": {"type": str, "valid_values": ["live", "backtest", "signal"]},
         "backtest_days": {"type": int, "optional": True, "condition": lambda x: x > 0},
         "backtest_start_balance_type": {"type": str, "optional": True, "valid_values": ["current", "custom"]},
         "backtest_custom_start_balance": {"type": float, "optional": True, "condition": lambda x: x > 0},
@@ -667,6 +672,124 @@ def send_telegram_message(bot_token, chat_id, message):
             return False
 
     return asyncio.run(_send())
+
+def send_entry_signal_telegram(configs: dict, symbol: str, signal_type_display: str, leverage: int, entry_price: float, 
+                               tp1_price: float, tp2_price: float | None, tp3_price: float | None, sl_price: float,
+                               risk_percentage_config: float, est_pnl_tp1: float | None, est_pnl_sl: float | None,
+                               symbol_info: dict, strategy_name_display: str = "Signal",
+                               signal_timestamp: dt = None, signal_order_type: str = "N/A"):
+    """
+    Formats and sends a Telegram message for a new trade signal in 'Signal' mode.
+    """
+    if signal_timestamp is None:
+        signal_timestamp = dt.now(tz=timezone.utc) # Default to now UTC if not provided
+    
+    if not configs.get("telegram_bot_token") or not configs.get("telegram_chat_id"):
+        print(f"Telegram not configured. Cannot send signal notification for {symbol}.")
+        return
+
+    p_prec = int(symbol_info.get('pricePrecision', 2))
+
+    tp1_str = f"{tp1_price:.{p_prec}f}" if tp1_price is not None else "N/A"
+    tp2_str = f"{tp2_price:.{p_prec}f}" if tp2_price is not None else "N/A" # Will be N/A if None
+    tp3_str = f"{tp3_price:.{p_prec}f}" if tp3_price is not None else "N/A" # Will be N/A if None
+    sl_str = f"{sl_price:.{p_prec}f}" if sl_price is not None else "N/A"
+    
+    pnl_tp1_str = f"{est_pnl_tp1:.2f} USDT" if est_pnl_tp1 is not None else "Not Calculated"
+    pnl_sl_str = f"{est_pnl_sl:.2f} USDT" if est_pnl_sl is not None else "Not Calculated"
+
+    # Determine side emoji
+    side_emoji = "🔼" if "LONG" in signal_type_display.upper() else "🔽" if "SHORT" in signal_type_display.upper() else "↔️"
+    signal_side_text = "LONG" if "LONG" in signal_type_display.upper() else "SHORT" if "SHORT" in signal_type_display.upper() else "N/A"
+    formatted_timestamp = signal_timestamp.strftime('%Y-%m-%d %H:%M:%S %Z')
+
+    message = (
+        f"🔔 *NEW TRADE SIGNAL* | {strategy_name_display} {side_emoji}\n\n"
+        f"🗓️ Time: `{formatted_timestamp}`\n"
+        f"📈 Symbol: `{symbol}`\n"
+        f"SIDE: *{signal_side_text}*\n"
+        f"🔩 Strategy: `{signal_type_display}`\n"
+        f"📊 Order Type: `{signal_order_type}`\n"
+        f"Leverage: `{leverage}x`\n\n"
+        f"➡️ Entry Price: `{entry_price:.{p_prec}f}`\n"
+        f"🛡️ Stop Loss: `{sl_str}`\n"
+    )
+    
+    tps_message_part = ""
+    if tp1_price is not None:
+        tps_message_part += f"🎯 Take Profit 1: `{tp1_str}`\n"
+    if tp2_price is not None:
+        tps_message_part += f"🎯 Take Profit 2: `{tp2_str}`\n"
+    if tp3_price is not None:
+        tps_message_part += f"🎯 Take Profit 3: `{tp3_str}`\n"
+    
+    if not tps_message_part and tp1_price is None: # If all TPs are None (e.g. error in calculation)
+        tps_message_part = "🎯 Take Profit Levels: `N/A`\n"
+        
+    message += tps_message_part
+    
+    message += (
+        f"\n📊 Configured Risk: `{risk_percentage_config * 100:.2f}%`\n\n"
+        f"💰 *Est. P&L ($100 Capital Trade):*\n"
+        f"  - TP1 Hit: `{pnl_tp1_str}`\n"
+        f"  - SL Hit: `{pnl_sl_str}`\n\n"
+        f"⚠️ _This is a signal only. No order has been placed._"
+    )
+
+    print(f"Sending TRADE SIGNAL notification for {symbol} ({signal_type_display}). Details: Entry={entry_price}, SL={sl_str}, TP1={tp1_str}, PNL_TP1={pnl_tp1_str}, PNL_SL={pnl_sl_str}")
+    send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], message)
+
+def send_signal_update_telegram(configs: dict, signal_details: dict, update_type: str, message_detail: str, 
+                                current_market_price: float, pnl_estimation_fixed_capital: float | None = None):
+    """
+    Formats and sends a Telegram message for an update on an active signal.
+    """
+    if not configs.get("telegram_bot_token") or not configs.get("telegram_chat_id"):
+        print(f"Telegram not configured. Cannot send signal update for {signal_details.get('symbol')}.")
+        return
+
+    symbol = signal_details.get('symbol', 'N/A')
+    side = signal_details.get('side', 'N/A')
+    entry_price = signal_details.get('entry_price', 0.0)
+    s_info = signal_details.get('symbol_info', {})
+    p_prec = int(s_info.get('pricePrecision', 2))
+
+    title_emoji = "⚙️" # Default
+    if update_type.startswith("TP"): title_emoji = "✅"
+    elif update_type == "SL_HIT": title_emoji = "❌"
+    elif update_type == "SL_ADJUSTED": title_emoji = "🛡️"
+    elif update_type == "CLOSED_ALL_TPS": title_emoji = "🎉"
+    
+    pnl_info_str = ""
+    if pnl_estimation_fixed_capital is not None:
+        pnl_info_str = f"\nEst. P&L ($100 Capital): `{pnl_estimation_fixed_capital:.2f} USDT`"
+
+    message = (
+        f"{title_emoji} *SIGNAL UPDATE* ({signal_details.get('strategy_type', 'Signal')}) {title_emoji}\n\n"
+        f"Symbol: `{symbol}` ({side})\n"
+        f"Entry: `{entry_price:.{p_prec}f}`\n"
+        f"Update Type: `{update_type}`\n"
+        f"Details: _{message_detail}_\n"
+        f"Current Market Price: `{current_market_price:.{p_prec}f}`"
+        f"{pnl_info_str}"
+    )
+    
+    # Avoid sending too many identical messages (e.g. trailing SL not moving but logic runs)
+    # This check is simplified; a more robust check might involve comparing more fields or using timestamps.
+    if signal_details.get("last_update_message_type") == update_type and \
+       signal_details.get("last_update_message_detail_preview") == message_detail[:50]: # Compare preview
+        # print(f"Skipping identical signal update for {symbol}: {update_type}")
+        return
+
+    print(f"Sending SIGNAL UPDATE notification for {symbol}: {update_type} - {message_detail}")
+    send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], message)
+    
+    # Update last message type to prevent spam, store a preview of the detail
+    # This modification should happen on the original dict in active_signals, so caller should handle it or pass mutable dict.
+    # For now, this function doesn't modify signal_details directly. Caller must update.
+    # active_signals[symbol]["last_update_message_type"] = update_type
+    # active_signals[symbol]["last_update_message_detail_preview"] = message_detail[:50]
+
 
 # --- Fibonacci Retracement Strategy Modules (New) ---
 from collections import deque # For 1m candle buffer
@@ -1380,8 +1503,70 @@ def manage_fib_retracement_entry_logic(client, configs: dict, symbol: str, bos_e
     with last_signal_lock:
         last_signal_time[f"{symbol}_fib"] = dt.now()
 
-    # 4. Place Limit Entry Order
-    print(f"{log_prefix} Placing LIMIT {direction.upper()} order: Qty {qty_to_order} @ {entry_price_target:.{p_prec}f}")
+    # --- Mode-Specific Action: Signal or Live/Backtest Order Placement ---
+    if configs['mode'] == 'signal':
+        # --- Signal Mode: Send Telegram Notification, No Real Orders ---
+        print(f"{log_prefix} Signal Mode: Preparing Telegram signal for Fib {symbol} {direction}.")
+        
+        est_pnl_tp1_fib = calculate_pnl_for_fixed_capital(entry_price_target, tp1_price_final, direction, current_leverage_on_symbol, 100.0, symbol_info)
+        est_pnl_sl_fib = calculate_pnl_for_fixed_capital(entry_price_target, sl_price, direction, current_leverage_on_symbol, 100.0, symbol_info)
+
+        send_entry_signal_telegram(
+            configs=configs, symbol=symbol, signal_type_display=f"FIB_RETRACEMENT_{direction.upper()}",
+            leverage=current_leverage_on_symbol, entry_price=entry_price_target,
+            tp1_price=tp1_price_final, tp2_price=tp2_price_final, tp3_price=tp3_price_final, sl_price=sl_price,
+            risk_percentage_config=configs['risk_percent'], est_pnl_tp1=est_pnl_tp1_fib, est_pnl_sl=est_pnl_sl_fib,
+            symbol_info=symbol_info, strategy_name_display="Fibonacci Retracement",
+            signal_timestamp=bos_event.get('timestamp', dt.now(tz=timezone.utc)), # Use BoS event time
+            signal_order_type="LIMIT"
+        )
+        
+        # Use the same timestamp for signal_id and open_timestamp for consistency
+        signal_generation_time = bos_event.get('timestamp', dt.now(tz=timezone.utc))
+        signal_id_fib = f"signal_{symbol}_{int(signal_generation_time.timestamp())}"
+
+        with active_signals_lock:
+            active_signals[symbol] = {
+                "signal_id": signal_id_fib, "entry_price": entry_price_target, "current_sl_price": sl_price,
+                "current_tp1_price": tp1_price_final, "current_tp2_price": tp2_price_final, "current_tp3_price": tp3_price_final,
+                "initial_sl_price": sl_price, "initial_tp1_price": tp1_price_final, "initial_tp2_price": tp2_price_final, "initial_tp3_price": tp3_price_final,
+                "side": direction, "leverage": current_leverage_on_symbol, "symbol_info": symbol_info,
+                "open_timestamp": signal_generation_time, "strategy_type": "FIBONACCI_RETRACEMENT", "sl_management_stage": "initial",
+                "last_update_message_type": "NEW_SIGNAL",
+                "fib_move_sl_after_tp1_config": configs.get("fib_move_sl_after_tp1", DEFAULT_FIB_MOVE_SL_AFTER_TP1),
+                "fib_breakeven_buffer_r_config": configs.get("fib_breakeven_buffer_r", DEFAULT_FIB_BREAKEVEN_BUFFER_R),
+                "fib_sl_adjustment_after_tp2_config": configs.get("fib_sl_adjustment_after_tp2", DEFAULT_FIB_SL_ADJUSTMENT_AFTER_TP2),
+                "initial_risk_per_unit": abs(entry_price_target - sl_price)
+            }
+            print(f"{log_prefix} Signal Mode: Fibonacci signal for {symbol} added to active_signals.")
+
+        tp_notes_fib = f"SL: {sl_price:.{symbol_info.get('pricePrecision', 2)}f}, TP1: {tp1_price_final:.{symbol_info.get('pricePrecision', 2)}f}"
+        if tp2_price_final: tp_notes_fib += f", TP2: {tp2_price_final:.{symbol_info.get('pricePrecision', 2)}f}"
+        if tp3_price_final: tp_notes_fib += f", TP3: {tp3_price_final:.{symbol_info.get('pricePrecision', 2)}f}"
+        log_event_details_fib = {
+            "SignalID": signal_id_fib, "Symbol": symbol, "Strategy": "FIBONACCI_RETRACEMENT", "Side": direction,
+            "Leverage": current_leverage_on_symbol, "SignalOpenPrice": entry_price_target,
+            "EventType": "NEW_SIGNAL", "EventPrice": entry_price_target, "Notes": tp_notes_fib,
+            "EstimatedPNL_USD100": est_pnl_tp1_fib
+        }
+        log_signal_event_to_csv(log_event_details_fib)
+
+        print(f"{log_prefix} Signal Mode: Telegram signal sent, CSV logged, and virtual signal recorded for Fib {symbol}.")
+        with fib_strategy_states_lock: 
+            if symbol in fib_strategy_states: 
+                fib_strategy_states[symbol]['state'] = "IDLE"
+                fib_strategy_states[symbol]['pending_entry_order_id'] = None
+                fib_strategy_states[symbol]['pending_entry_details'] = None
+        
+        with recent_trade_signatures_lock:
+            recent_trade_signatures[trade_sig_fib] = dt.now()
+            print(f"{log_prefix} Signal Mode: Fib Trade signature recorded for {symbol}: {trade_sig_fib}")
+            
+        return # Crucially, return here for signal mode before any order placement logic
+    
+    # --- Live/Backtest Mode: Place Real Limit Order ---
+    # This block executes only if not in 'signal' mode due to the return above.
+    print(f"{log_prefix} Live/Backtest Mode: Placing LIMIT {direction.upper()} order: Qty {qty_to_order} @ {entry_price_target:.{p_prec}f}")
     limit_order_side = "BUY" if direction == "long" else "SELL"
     position_side_trade = "LONG" if direction == "long" else "SHORT"
 
@@ -1392,67 +1577,46 @@ def manage_fib_retracement_entry_logic(client, configs: dict, symbol: str, bos_e
 
     if not entry_limit_order:
         print(f"{log_prefix} Failed to place LIMIT entry order. Error: {entry_limit_error}")
-        # Potentially reset fib_strategy_state here if order placement fails critically
-        with fib_strategy_states_lock:
+        with fib_strategy_states_lock: 
             if symbol in fib_strategy_states: fib_strategy_states[symbol]['state'] = "IDLE"
         return
 
     print(f"{log_prefix} LIMIT entry order placed: ID {entry_limit_order['orderId']}. Status: {entry_limit_order['status']}")
     
-    # Send Telegram notification for new limit order placement
     if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
         side_display = direction.upper()
         limit_price_display = f"{entry_price_target:.{p_prec}f}"
         qty_display = f"{qty_to_order:.{int(symbol_info.get('quantityPrecision', 0))}f}"
-        
         sl_str_limit = f"{sl_price:.{p_prec}f}" if sl_price is not None else "N/A"
         tp1_str_limit = f"{tp1_price_final:.{p_prec}f}" if tp1_price_final is not None else "N/A"
-
         limit_order_msg = (
             f"⏳ FIB LIMIT ORDER PLACED ⏳\n\n"
-            f"Symbol: `{symbol}`\n"
-            f"Side: `{side_display}`\n"
-            f"Type: `LIMIT`\n"
-            f"Quantity: `{qty_display}`\n"
-            f"Limit Price: `{limit_price_display}`\n"
+            f"Symbol: `{symbol}`\nSide: `{side_display}`\nType: `LIMIT`\n"
+            f"Quantity: `{qty_display}`\nLimit Price: `{limit_price_display}`\n"
             f"Order ID: `{entry_limit_order['orderId']}`\n\n"
             f"Associated SL (if filled): `{sl_str_limit}`\n"
-            f"Associated TP1 (if filled): `{tp1_str_limit}`\n\n"
-            f"Monitoring for fill..."
+            f"Associated TP1 (if filled): `{tp1_str_limit}`\n\nMonitoring for fill..."
         )
         send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], limit_order_msg)
         print(f"{log_prefix} Telegram notification sent for new Fib limit order placement.")
 
-    # If order is FILLED immediately (e.g. if limit price crossed spread aggressively)
-    # Or if it's just NEW, we need to store it and monitor.
-    # For now, this function's scope ends at placing the limit order.
-    # The monitoring of this limit order (fill, timeout, SL/TP placement on fill)
-    # needs to be handled by a separate mechanism, likely integrated into `monitor_active_trades`
-    # or a new `monitor_pending_fib_entries`.
-
     with fib_strategy_states_lock:
         if symbol in fib_strategy_states:
-            fib_strategy_states[symbol]['state'] = "PENDING_ENTRY" # New state
+            fib_strategy_states[symbol]['state'] = "PENDING_ENTRY"
             fib_strategy_states[symbol]['pending_entry_order_id'] = entry_limit_order['orderId']
             fib_strategy_states[symbol]['pending_entry_details'] = {
-                "limit_price": entry_price_target,
-                "sl_price": sl_price,
-                # TP prices here are provisional if using extensions, as they depend on actual_entry_price.
-                # If not using extensions, these are the final TP prices from the old logic.
+                "limit_price": entry_price_target, "sl_price": sl_price,
                 "tp1_price_provisional": tp1_price_final, 
                 "tp2_price_provisional": tp2_price_final,
                 "tp3_price_provisional": tp3_price_final,
-                "quantity": qty_to_order, # This is total quantity
-                "side": direction, # "long" or "short"
-                "bos_event_snapshot": bos_event, # Store the BoS that led to this
-                "initial_risk_per_unit": abs(entry_price_target - sl_price) # Provisional, recalculate with actual_entry_price
+                "quantity": qty_to_order, "side": direction,
+                "bos_event_snapshot": bos_event,
+                "initial_risk_per_unit": abs(entry_price_target - sl_price)
             }
-            # Add trade signature *after* successful limit order placement attempt
-            with recent_trade_signatures_lock:
+            with recent_trade_signatures_lock: 
                  recent_trade_signatures[trade_sig_fib] = dt.now()
-        else: # Should not happen if BoS detection set it up
-            print(f"{log_prefix} Error: State for {symbol} not found in fib_strategy_states after placing limit order.")
-            # Attempt to cancel the order if state is inconsistent
+        else: 
+            print(f"{log_prefix} Error: State for {symbol} not found after placing limit order. Cancelling.")
             try: client.futures_cancel_order(symbol=symbol, orderId=entry_limit_order['orderId'])
             except Exception as e_cancel: print(f"{log_prefix} Failed to cancel orphaned limit order {entry_limit_order['orderId']}: {e_cancel}")
 
@@ -1595,15 +1759,18 @@ def monitor_pending_fib_entries(client, configs: dict):
                 if tp3_price_final and qty_tp3 > 0: print(f"  TP3: {tp3_price_final:.{p_prec}f} (Qty: {qty_tp3})")
 
                 sl_ord_details, tp_orders_details_list = None, []
+                
+                if configs['mode'] != 'signal':
+                    # --- Live/Backtest Mode: Place real SL/TP orders ---
+                    print(f"{log_prefix_monitor} Live/Backtest Mode: Placing SL/TP for filled Fib limit order {symbol}.")
+                    # Place SL for the total quantity
+                    sl_ord_obj, sl_err_msg = place_new_order(client, symbol_info,
+                                        "SELL" if trade_side == "long" else "BUY", "STOP_MARKET", total_filled_qty, 
+                                        stop_price=sl_price, position_side=position_side_for_sl_tp, is_closing_order=True)
+                    if not sl_ord_obj: print(f"{log_prefix_monitor} CRITICAL: FAILED TO PLACE SL for {symbol}! Error: {sl_err_msg}")
+                    else: sl_ord_details = {"id": sl_ord_obj.get('orderId'), "price": sl_price, "quantity": total_filled_qty, "status": "OPEN"}
 
-                # Place SL for the total quantity
-                sl_ord_obj, sl_err_msg = place_new_order(client, symbol_info,
-                                     "SELL" if trade_side == "long" else "BUY", "STOP_MARKET", total_filled_qty, 
-                                     stop_price=sl_price, position_side=position_side_for_sl_tp, is_closing_order=True)
-                if not sl_ord_obj: print(f"{log_prefix_monitor} CRITICAL: FAILED TO PLACE SL for {symbol}! Error: {sl_err_msg}")
-                else: sl_ord_details = {"id": sl_ord_obj.get('orderId'), "price": sl_price, "quantity": total_filled_qty, "status": "OPEN"}
-
-                # Place TP orders for each tier
+                    # Place TP orders for each tier
                 tp_target_levels = [ # Use the final calculated prices and quantities
                     {"price": tp1_price_final, "quantity": qty_tp1, "name": "TP1"},
                     {"price": tp2_price_final, "quantity": qty_tp2, "name": "TP2"},
@@ -1627,30 +1794,48 @@ def monitor_pending_fib_entries(client, configs: dict):
                     elif current_tp_price is None and current_tp_qty > 0:
                          print(f"{log_prefix_monitor} Skipping {tp_name} for {symbol} as price is None, but quantity {current_tp_qty} was assigned.")
                     # If qty is zero, skip (already handled by qty_tpX > 0 check)
-
-                # Transition to active_trades
-                with active_trades_lock:
-                    if symbol not in active_trades:
-                        active_trades[symbol] = {
-                            "entry_order_id": order_id,
-                            "sl_order_id": sl_ord_details.get('id') if sl_ord_details else None, # Store SL order ID
-                            "tp_orders": tp_orders_details_list, # List of TP order details
-                            "entry_price": actual_entry_price,
-                            "current_sl_price": sl_price, # Main SL price
-                            # current_tp_price is now a list in tp_orders
-                            "initial_sl_price": sl_price,
-                            "initial_risk_per_unit": abs(actual_entry_price - sl_price), # Store initial risk per unit
-                            # initial_tp_price is implicitly defined by the tp_orders list
-                            "quantity": total_filled_qty, # Total quantity of the trade
-                            "side": trade_side.upper(),
-                            "symbol_info": symbol_info,
-                            "open_timestamp": pd.Timestamp(order_status['updateTime'], unit='ms', tz='UTC'),
-                            "strategy_type": "FIBONACCI_MULTI_TP",
-                            "sl_management_stage": "initial" # Initial SL management stage
-                        }
-                        print(f"{log_prefix_monitor} Fib trade for {symbol} (Multi-TP) moved to active_trades.")
-                        
-                        # Send Telegram notification
+                
+                if configs['mode'] == 'signal':
+                    # --- Signal Mode: Update active_signals, no real trade transition ---
+                    # The initial signal was already added to active_signals.
+                    # Here, we'd confirm its "virtual fill" and potentially update its state if needed,
+                    # e.g., to indicate it's now being monitored as an "active" signal rather than "pending entry signal".
+                    # However, active_signals currently doesn't have a "pending entry" state, signals are added as active.
+                    # We just need to ensure no real SL/TP orders were placed and no transition to `active_trades`.
+                    print(f"{log_prefix_monitor} Signal Mode: Virtual Fib limit order for {symbol} considered FILLED at {actual_entry_price:.{p_prec}f}.")
+                    # Send a specific Telegram update for virtual fill if desired
+                    fill_msg_detail = f"Virtual limit entry order filled at ~{actual_entry_price:.{p_prec}f}. Signal is now active."
+                    # Find the signal in active_signals to pass its details, or construct a temporary one.
+                    temp_signal_details_for_fill_msg = { # Construct enough details for the message
+                        "symbol": symbol, "side": trade_side.upper(), "entry_price": actual_entry_price, 
+                        "strategy_type": "FIBONACCI_RETRACEMENT", "symbol_info": symbol_info,
+                        "current_sl_price": sl_price, "current_tp1_price": tp1_price_final, # Show planned SL/TP1
+                        "leverage": pending_details.get('bos_event_snapshot',{}).get('leverage', configs.get('leverage')) # Approx leverage
+                    }
+                    send_signal_update_telegram(configs, temp_signal_details_for_fill_msg, "VIRTUAL_ENTRY_FILLED", fill_msg_detail, actual_entry_price)
+                    # No transition to active_trades. The signal remains in active_signals.
+                
+                else: # Live or Backtest Mode
+                    # Transition to active_trades
+                    with active_trades_lock:
+                        if symbol not in active_trades:
+                            active_trades[symbol] = {
+                                "entry_order_id": order_id,
+                                "sl_order_id": sl_ord_details.get('id') if sl_ord_details else None, 
+                                "tp_orders": tp_orders_details_list, 
+                                "entry_price": actual_entry_price,
+                                "current_sl_price": sl_price, 
+                                "initial_sl_price": sl_price,
+                                "initial_risk_per_unit": abs(actual_entry_price - sl_price), 
+                                "quantity": total_filled_qty, 
+                                "side": trade_side.upper(),
+                                "symbol_info": symbol_info,
+                                "open_timestamp": pd.Timestamp(order_status['updateTime'], unit='ms', tz='UTC'),
+                                "strategy_type": "FIBONACCI_MULTI_TP",
+                                "sl_management_stage": "initial" 
+                            }
+                            print(f"{log_prefix_monitor} Fib trade for {symbol} (Multi-TP) moved to active_trades.")
+                            
                         if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
                             qty_prec_fib = int(symbol_info.get('quantityPrecision', 0))
                             price_prec_fib = int(symbol_info.get('pricePrecision', 2))
@@ -1673,13 +1858,13 @@ def monitor_pending_fib_entries(client, configs: dict):
                                 f"TP Levels:\n{tp_summary_str}"
                             )
                             send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], fib_trade_msg)
-                    else:
-                        print(f"{log_prefix_monitor} {symbol} already in active_trades. Limit fill for Fib trade {order_id} will not be managed by bot SL/TP. Manual check advised.")
-                        # Cancel newly placed SL/TPs for this orphaned fill
-                        if sl_ord_details and sl_ord_details.get('id'): client.futures_cancel_order(symbol=symbol, orderId=sl_ord_details['id'])
-                        for tp_det in tp_orders_details_list:
-                            if tp_det.get('id'): client.futures_cancel_order(symbol=symbol, orderId=tp_det['id'])
-                
+                        else:
+                            print(f"{log_prefix_monitor} {symbol} already in active_trades. Limit fill for Fib trade {order_id} will not be managed by bot SL/TP. Manual check advised.")
+                            # Cancel newly placed SL/TPs for this orphaned fill
+                            if sl_ord_details and sl_ord_details.get('id'): client.futures_cancel_order(symbol=symbol, orderId=sl_ord_details['id'])
+                            for tp_det in tp_orders_details_list:
+                                if tp_det.get('id'): client.futures_cancel_order(symbol=symbol, orderId=tp_det['id'])
+                    
                 symbols_to_reset_state.append(symbol) 
             
             elif order_status['status'] in ['CANCELED', 'EXPIRED', 'REJECTED']:
@@ -1763,6 +1948,7 @@ def start_telegram_polling(bot_token: str, app_configs: dict):
     application.add_handler(CommandHandler("blacklist", blacklist_handler)) 
     application.add_handler(CommandHandler("restart", restart_handler)) 
     application.add_handler(CommandHandler("set", set_handler)) # Updated command to /set and handler to set_handler
+    application.add_handler(CommandHandler("sum", summary_handler)) # Added /sum command handler
     # Note: command3_handler is removed as it was tied to the old start_command_listener structure
 
     print("Telegram ▶ run_polling() starting…")
@@ -1984,15 +2170,18 @@ def get_user_configurations(load_choice_override: str = None, make_changes_overr
     # Mode
     while True:
         mode_default_display = configs.get("mode", "live")
-        mode_input = input(f"Select mode (1:live / 2:backtest) (current: {mode_default_display}): ").strip()
+        mode_input = input(f"Select mode (1:live / 2:backtest / 3:signal) (current: {mode_default_display}): ").strip()
         chosen_mode = None
-        if not mode_input and "mode" in configs: chosen_mode = configs["mode"]
+        if not mode_input and "mode" in configs: # User hit enter, use CSV value if present
+            chosen_mode = configs["mode"]
         elif mode_input == "1": chosen_mode = "live"
         elif mode_input == "2": chosen_mode = "backtest"
-        if chosen_mode in ["live", "backtest"]:
+        elif mode_input == "3": chosen_mode = "signal"
+        
+        if chosen_mode in ["live", "backtest", "signal"]:
             configs["mode"] = chosen_mode
             break
-        print("Invalid mode. Please enter '1' or '2'.")
+        print("Invalid mode. Please enter '1', '2', or '3'.")
 
     if configs["mode"] == "backtest":
         while True:
@@ -4062,8 +4251,76 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is
         position_side_for_trade = "LONG" if signal == "LONG" else "SHORT"
 
         print(f"{log_prefix} Attempting {signal} ({position_side_for_trade}) {qty_to_order_final} {symbol} @MKT (EP:{entry_p:.{symbol_info['pricePrecision']}f}), SL:{sl_p_calc:.{symbol_info['pricePrecision']}f}, TP:{tp_p_calc:.{symbol_info['pricePrecision']}f}")
-        
-        # Call place_new_order and unpack both order object and potential error message
+
+        if configs['mode'] == 'signal':
+            # --- Signal Mode: Send Telegram Notification, No Real Orders ---
+            print(f"{log_prefix} Signal Mode: Preparing Telegram signal for {symbol} {signal}.")
+            
+            # Calculate P&L estimations for $100 capital
+            est_pnl_tp1 = calculate_pnl_for_fixed_capital(entry_p, tp_p_calc, signal, target_leverage, 100.0, symbol_info)
+            est_pnl_sl = calculate_pnl_for_fixed_capital(entry_p, sl_p_calc, signal, target_leverage, 100.0, symbol_info)
+            
+            send_entry_signal_telegram(
+                configs=configs,
+                symbol=symbol,
+                signal_type_display=f"EMA_CROSS_{signal.upper()}",
+                leverage=target_leverage,
+                entry_price=entry_p,
+                tp1_price=tp_p_calc, # EMA Cross has one TP, pass it as TP1
+                tp2_price=None,      # No TP2 for EMA Cross
+                tp3_price=None,      # No TP3 for EMA Cross
+                sl_price=sl_p_calc,
+                risk_percentage_config=configs['risk_percent'],
+                est_pnl_tp1=est_pnl_tp1,
+                est_pnl_sl=est_pnl_sl,
+                symbol_info=symbol_info,
+                strategy_name_display="EMA Cross",
+                signal_timestamp=dt.now(tz=timezone.utc), # Pass current UTC time
+                signal_order_type="MARKET"
+            )
+            
+            # Add to active_signals for monitoring simulated progression
+            with active_signals_lock:
+                signal_id = f"signal_{symbol}_{int(dt.now().timestamp())}"
+                active_signals[symbol] = {
+                    "signal_id": signal_id, # Unique ID for the signal
+                    "entry_price": entry_p,
+                    "current_sl_price": sl_p_calc,
+                    "current_tp1_price": tp_p_calc, # EMA Cross uses one TP, store as TP1
+                    "current_tp2_price": None,
+                    "current_tp3_price": None,
+                    "initial_sl_price": sl_p_calc,
+                    "initial_tp1_price": tp_p_calc,
+                    "side": signal, # "LONG" or "SHORT"
+                    "leverage": target_leverage,
+                    "symbol_info": symbol_info,
+                    "open_timestamp": dt.now(),
+                    "strategy_type": "EMA_CROSS",
+                    "sl_management_stage": "initial", # For potential future advanced SL simulation
+                    "last_update_message_type": "NEW_SIGNAL" # To avoid spamming identical updates
+                }
+                print(f"{log_prefix} Signal Mode: EMA Cross signal for {symbol} added to active_signals for simulated monitoring.")
+            
+            # Log this new signal event to CSV
+            log_event_details = {
+                "SignalID": signal_id, "Symbol": symbol, "Strategy": "EMA_CROSS", "Side": signal,
+                "Leverage": target_leverage, "SignalOpenPrice": entry_p, 
+                "EventType": "NEW_SIGNAL", "EventPrice": entry_p,
+                "Notes": f"SL: {sl_p_calc:.{symbol_info.get('pricePrecision', 2)}f}, TP: {tp_p_calc:.{symbol_info.get('pricePrecision', 2)}f}",
+                "EstimatedPNL_USD100": est_pnl_tp1 # PNL if TP1 hits
+            }
+            log_signal_event_to_csv(log_event_details)
+
+            # Record trade signature for Signal mode as well
+            with recent_trade_signatures_lock:
+                recent_trade_signatures[trade_sig] = dt.now()
+                print(f"{log_prefix} Signal Mode: Trade signature recorded for {symbol}: {trade_sig}")
+
+            print(f"{log_prefix} Signal Mode: Telegram signal sent, CSV logged, and virtual signal recorded for {symbol}.")
+            # Cooldown (last_signal_time) was updated before this signal mode block.
+            return # End processing for this symbol in signal mode
+
+        # --- Live Mode: Place Real Orders ---
         entry_order, entry_order_error_msg = place_new_order(client, 
                                                               symbol_info, 
                                                               "BUY" if signal=="LONG" else "SELL", 
@@ -4078,8 +4335,7 @@ def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is
             send_trade_rejection_notification(symbol, signal, detailed_reason, entry_p, sl_p_calc, tp_p_calc, qty_to_order_final, symbol_info, configs)
             return
         
-        # --- Final Lock for Order Placement and active_trades update ---
-        # Note: The entry order has already been attempted (and succeeded if we are here)
+        # --- Final Lock for Order Placement and active_trades update (Live Mode) ---
         # The original code had a second call to place_new_order within the lock.
         # This is redundant if the first call succeeds and dangerous if it was meant as a retry without proper state handling.
         # Assuming the first successful entry_order is the one to use.
@@ -5106,46 +5362,64 @@ def trading_loop(client, configs, monitored_symbols):
                     # If none of the above, it implies proceed_with_new_trades was true, so this 'else' shouldn't be hit without a reason.
                     # This block primarily serves to articulate actions when new trades are *not* sought.
 
-                # --- Monitor Existing Trades (Always run, unless specific conditions prevent it) ---
-                # If max drawdown occurred and positions were closed, active_trades should be empty.
-                # If daily SL hit, existing trades are still managed.
-                if not halt_dd_flag: # If not in max drawdown hard stop (where positions are closed)
-                    monitor_active_trades(client, configs) # Monitor after scan or if scan was skipped
-                    print(f"Active trades monitoring complete. {format_elapsed_time(cycle_start_time)}")
-                else:
-                    print(f"Skipping active trade monitoring as Max Drawdown halt is active and positions should be closed. {format_elapsed_time(cycle_start_time)}")
-
-
-                # --- SL/TP Safety Net Check for All Open Positions (Always run) ---
-                # This is important even if halted, to manage any stragglers or manually opened positions,
-                # or if close_all_open_positions had issues.
-                symbol_info_cache_for_safety_net = {} 
-                print(f"Running SL/TP safety net check for all open positions... {format_elapsed_time(cycle_start_time)}")
-                ensure_sl_tp_for_all_open_positions(client, configs, active_trades, symbol_info_cache_for_safety_net)
-                print(f"SL/TP safety net check complete. {format_elapsed_time(cycle_start_time)}")
-                # --- End SL/TP Safety Net Check ---
-
-                # --- Update 1-minute Candle Buffers for Active Trades (for Micro-Pivot SL) ---
-                if configs.get("micro_pivot_trailing_sl", False) and active_trades:
-                    print(f"Updating 1-min candle buffers for {len(active_trades)} active trade(s) eligible for Micro-Pivot SL... {format_elapsed_time(cycle_start_time)}")
-                    active_trade_symbols_list = []
-                    with active_trades_lock: # Access active_trades safely
-                        active_trade_symbols_list = list(active_trades.keys())
-                    
-                    for sym_active in active_trade_symbols_list:
-                        # Fetch the very latest 1-minute kline
-                        # Limit to 2 to get the last closed and current forming (or just last closed if current not formed)
-                        latest_1m_klines_df, err_1m = get_historical_klines_1m(client, sym_active, limit=2)
-                        if not err_1m and not latest_1m_klines_df.empty:
-                            # The last row is the most recent candle (could be open or closed)
-                            # update_1m_candle_buffer handles duplicates and ordering
-                            last_1m_candle_series = latest_1m_klines_df.iloc[-1]
-                            update_1m_candle_buffer(sym_active, last_1m_candle_series, configs.get("fib_1m_buffer_size", DEFAULT_1M_BUFFER_SIZE))
-                            # print(f"Updated 1m buffer for active trade {sym_active} with candle {last_1m_candle_series.name}") # Verbose
-                        elif err_1m:
-                            print(f"Error fetching latest 1m kline for active trade {sym_active} buffer update: {err_1m}")
-                # --- End 1-minute Candle Buffer Update ---
+                # --- Monitor Existing Trades / Signals ---
+                if configs['mode'] == 'signal':
+                    monitor_active_signals(client, configs) 
+                    print(f"Signal Mode: Active signal monitoring complete. {format_elapsed_time(cycle_start_time)}")
+                elif configs['mode'] == 'live':
+                    if not halt_dd_flag: # If not in max drawdown hard stop (where positions are closed)
+                        monitor_active_trades(client, configs)
+                        print(f"Live Mode: Active trades monitoring complete. {format_elapsed_time(cycle_start_time)}")
+                    else: # Max drawdown halt is active in live mode
+                        print(f"Live Mode: Skipping active trade monitoring as Max Drawdown halt is active and positions should be closed. {format_elapsed_time(cycle_start_time)}")
+                # Backtest mode has its own monitor_active_trades_backtest within its loop.
                 
+                # --- SL/TP Safety Net Check (Only for 'live' mode) ---
+                if configs['mode'] == 'live':
+                    # This is important even if halted, to manage any stragglers or manually opened positions,
+                    # or if close_all_open_positions had issues.
+                    symbol_info_cache_for_safety_net = {} 
+                    print(f"Running SL/TP safety net check for all open positions... {format_elapsed_time(cycle_start_time)}")
+                    ensure_sl_tp_for_all_open_positions(client, configs, active_trades, symbol_info_cache_for_safety_net)
+                    print(f"SL/TP safety net check complete. {format_elapsed_time(cycle_start_time)}")
+                elif configs['mode'] == 'signal':
+                    print(f"Signal Mode: Skipping SL/TP safety net for real positions. {format_elapsed_time(cycle_start_time)}")
+                # Backtest mode handles its own position/order simulation, so no explicit safety net call here from trading_loop.
+                
+                # --- Update 1-minute Candle Buffers for Active Trades/Signals (for Micro-Pivot SL) ---
+                # This might be relevant for 'signal' mode too if simulating micro-pivot trailing for signals.
+                # For now, let's assume it's mainly for live trades.
+                # If active_signals store virtual SLs that can be trailed by micro-pivots, this section might need adjustment.
+                # For the current step, we focus on ensuring no REAL orders are placed.
+                # The `active_trades` variable will be empty in "signal" mode for real trades.
+                # We will introduce `active_signals` later.
+                
+                # Check if micro-pivot is enabled and if there are items to monitor (either real trades or virtual signals)
+                items_to_monitor_for_pivot_sl = 0
+                symbols_for_pivot_sl_buffer_update = []
+
+                if configs.get("micro_pivot_trailing_sl", False):
+                    if configs['mode'] == 'live' and active_trades:
+                        with active_trades_lock: # Access active_trades safely
+                            items_to_monitor_for_pivot_sl = len(active_trades)
+                            symbols_for_pivot_sl_buffer_update = list(active_trades.keys())
+                    elif configs['mode'] == 'signal': # and active_signals: (active_signals to be added later)
+                        # items_to_monitor_for_pivot_sl = len(active_signals) # Placeholder for future
+                        # symbols_for_pivot_sl_buffer_update = list(active_signals.keys()) # Placeholder
+                        print(f"Signal Mode: Placeholder for 1m buffer update for virtual signals if micro-pivot trailing is simulated. {format_elapsed_time(cycle_start_time)}")
+                        pass # No active_signals yet
+
+                    if items_to_monitor_for_pivot_sl > 0 and symbols_for_pivot_sl_buffer_update:
+                        print(f"Updating 1-min candle buffers for {items_to_monitor_for_pivot_sl} item(s) eligible for Micro-Pivot SL... {format_elapsed_time(cycle_start_time)}")
+                        for sym_active in symbols_for_pivot_sl_buffer_update:
+                            latest_1m_klines_df, err_1m = get_historical_klines_1m(client, sym_active, limit=2)
+                            if not err_1m and not latest_1m_klines_df.empty:
+                                last_1m_candle_series = latest_1m_klines_df.iloc[-1]
+                                update_1m_candle_buffer(sym_active, last_1m_candle_series, configs.get("fib_1m_buffer_size", DEFAULT_1M_BUFFER_SIZE))
+                            elif err_1m:
+                                print(f"Error fetching latest 1m kline for {sym_active} buffer update ({configs['mode']} mode): {err_1m}")
+                # --- End 1-minute Candle Buffer Update ---
+
                 # --- Loop Delay ---
                 # Determine appropriate sleep time
                 # If any halt is active, or max positions, might use a shorter delay to check for new day or slot availability sooner.
@@ -5212,6 +5486,437 @@ def trading_loop(client, configs, monitored_symbols):
         print("Thread pool executor shut down.")
 
 
+# --- Monitor Active Signals (for 'Signal' Mode) ---
+def monitor_active_signals(client, configs):
+    global active_signals, active_signals_lock
+    
+    if not active_signals:
+        return
+
+    log_prefix = "[SignalMonitor]"
+    print(f"\n{log_prefix} Monitoring {len(active_signals)} active signal(s)... {format_elapsed_time(configs.get('cycle_start_time_ref', time.time()))}")
+    
+    signals_to_remove = []
+
+    # Iterate over a copy of items for safe modification during iteration (though removal happens at the end)
+    active_signals_copy = {}
+    with active_signals_lock:
+        active_signals_copy = active_signals.copy()
+
+    for symbol, signal_details in active_signals_copy.items():
+        s_info = signal_details.get('symbol_info', {})
+        p_prec = int(s_info.get('pricePrecision', 2))
+        
+        current_market_price = get_current_market_price(client, symbol)
+        if current_market_price is None:
+            print(f"{log_prefix} Could not fetch market price for {symbol}. Skipping this signal update cycle.")
+            continue
+
+        print(f"{log_prefix} Checking Signal: {symbol} ({signal_details['side']}), Entry: {signal_details['entry_price']:.{p_prec}f}, SL: {signal_details['current_sl_price']:.{p_prec}f}, TP1: {signal_details.get('current_tp1_price', 0.0):.{p_prec}f}, Market: {current_market_price:.{p_prec}f}")
+
+        # --- Check for SL Hit ---
+        if (signal_details['side'] == "LONG" and current_market_price <= signal_details['current_sl_price']) or \
+           (signal_details['side'] == "SHORT" and current_market_price >= signal_details['current_sl_price']):
+            
+            pnl_sl_hit = calculate_pnl_for_fixed_capital(
+                signal_details['entry_price'], signal_details['current_sl_price'], signal_details['side'],
+                signal_details['leverage'], 100.0, s_info
+            )
+            msg_detail = f"Stop Loss hit at ~{signal_details['current_sl_price']:.{p_prec}f}."
+            send_signal_update_telegram(configs, signal_details, "SL_HIT", msg_detail, current_market_price, pnl_sl_hit)
+            
+            # Log SL hit to CSV
+            log_event_details_sl_hit = {
+                "SignalID": signal_details.get('signal_id'), "Symbol": symbol, "Strategy": signal_details.get('strategy_type'), 
+                "Side": signal_details.get('side'), "Leverage": signal_details.get('leverage'), 
+                "SignalOpenPrice": signal_details.get('entry_price'), "EventType": "SL_HIT", 
+                "EventPrice": signal_details.get('current_sl_price'), "Notes": msg_detail,
+                "EstimatedPNL_USD100": pnl_sl_hit
+            }
+            log_signal_event_to_csv(log_event_details_sl_hit)
+            
+            signals_to_remove.append(symbol)
+            with active_signals_lock: 
+                if symbol in active_signals: 
+                     active_signals[symbol]["last_update_message_type"] = "SL_HIT"
+                     active_signals[symbol]["last_update_message_detail_preview"] = msg_detail[:50]
+            continue # Move to next signal
+
+        # --- Check for TP Hits (Iterate through TPs) ---
+        # For simplicity, this version checks TPs sequentially. If TP1 hits, it doesn't immediately check TP2 in the same cycle for the same signal.
+        # More advanced logic could handle multiple TP hits within one price movement or candle.
+        
+        tp_levels_to_check = []
+        if signal_details.get('current_tp1_price'):
+            tp_levels_to_check.append({'name': 'TP1', 'price': signal_details['current_tp1_price'], 'key': 'current_tp1_price'})
+        if signal_details.get('current_tp2_price'):
+            tp_levels_to_check.append({'name': 'TP2', 'price': signal_details['current_tp2_price'], 'key': 'current_tp2_price'})
+        if signal_details.get('current_tp3_price'):
+            tp_levels_to_check.append({'name': 'TP3', 'price': signal_details['current_tp3_price'], 'key': 'current_tp3_price'})
+
+        any_tp_hit_this_signal = False
+        for tp_info in tp_levels_to_check:
+            if tp_info['price'] is None: continue # Skip if this TP level is not set
+
+            tp_hit = False
+            if signal_details['side'] == "LONG" and current_market_price >= tp_info['price']:
+                tp_hit = True
+            elif signal_details['side'] == "SHORT" and current_market_price <= tp_info['price']:
+                tp_hit = True
+            
+            if tp_hit:
+                any_tp_hit_this_signal = True
+                pnl_tp_hit = calculate_pnl_for_fixed_capital(
+                    signal_details['entry_price'], tp_info['price'], signal_details['side'],
+                    signal_details['leverage'], 100.0, s_info
+                )
+                msg_detail_tp = f"{tp_info['name']} hit at ~{tp_info['price']:.{p_prec}f}."
+                send_signal_update_telegram(configs, signal_details, tp_info['name'] + "_HIT", msg_detail_tp, current_market_price, pnl_tp_hit)
+                
+                # Log TP hit to CSV
+                log_event_details_tp_hit = {
+                    "SignalID": signal_details.get('signal_id'), "Symbol": symbol, "Strategy": signal_details.get('strategy_type'),
+                    "Side": signal_details.get('side'), "Leverage": signal_details.get('leverage'),
+                    "SignalOpenPrice": signal_details.get('entry_price'), "EventType": tp_info['name'] + "_HIT",
+                    "EventPrice": tp_info['price'], "Notes": msg_detail_tp,
+                    "EstimatedPNL_USD100": pnl_tp_hit
+                }
+                log_signal_event_to_csv(log_event_details_tp_hit)
+
+                with active_signals_lock:
+                    if symbol in active_signals:
+                        active_signals[symbol][tp_info['key']] = None 
+                        active_signals[symbol]["last_update_message_type"] = tp_info['name'] + "_HIT"
+                        active_signals[symbol]["last_update_message_detail_preview"] = msg_detail_tp[:50]
+                        
+                        if tp_info['name'] == 'TP1' and signal_details.get('strategy_type') == "FIBONACCI_RETRACEMENT":
+                            if active_signals[symbol].get('fib_move_sl_after_tp1_config') == "breakeven":
+                                buffer_r = active_signals[symbol].get('fib_breakeven_buffer_r_config', 0.0)
+                                initial_risk_pu = active_signals[symbol].get('initial_risk_per_unit', 0)
+                                new_be_sl_price = signal_details['entry_price']
+                                if initial_risk_pu > 0:
+                                    if signal_details['side'] == "LONG":
+                                        new_be_sl_price = signal_details['entry_price'] + (initial_risk_pu * buffer_r)
+                                    else: # SHORT
+                                        new_be_sl_price = signal_details['entry_price'] - (initial_risk_pu * buffer_r)
+                                new_be_sl_price = round(new_be_sl_price, p_prec)
+                                
+                                current_sl = active_signals[symbol]['current_sl_price']
+                                if (signal_details['side'] == "LONG" and new_be_sl_price > current_sl) or \
+                                   (signal_details['side'] == "SHORT" and new_be_sl_price < current_sl):
+                                    active_signals[symbol]['current_sl_price'] = new_be_sl_price
+                                    active_signals[symbol]['sl_management_stage'] = "after_tp1_breakeven"
+                                    be_msg = f"TP1 Hit. SL moved to Breakeven (+{buffer_r}R) at ~{new_be_sl_price:.{p_prec}f}."
+                                    send_signal_update_telegram(configs, active_signals[symbol], "SL_ADJUSTED_BE", be_msg, current_market_price)
+                                    active_signals[symbol]["last_update_message_type"] = "SL_ADJUSTED_BE"
+                                    active_signals[symbol]["last_update_message_detail_preview"] = be_msg[:50]
+                                    
+                                    # Log SL adjustment to CSV
+                                    log_event_sl_adj_be = {
+                                        "SignalID": active_signals[symbol].get('signal_id'), "Symbol": symbol, "Strategy": active_signals[symbol].get('strategy_type'),
+                                        "Side": active_signals[symbol].get('side'), "Leverage": active_signals[symbol].get('leverage'),
+                                        "SignalOpenPrice": active_signals[symbol].get('entry_price'), "EventType": "SL_ADJUSTED_BE",
+                                        "EventPrice": new_be_sl_price, "Notes": be_msg, "EstimatedPNL_USD100": None # PNL not direct for SL adjustment
+                                    }
+                                    log_signal_event_to_csv(log_event_sl_adj_be)
+
+                # TODO: Implement more advanced SL adjustments (trailing, micro-pivot) here if a TP was hit
+                # For now, if any TP hit, we might break or continue to check other TPs depending on strategy rules.
+                # Current logic will check all TPs. If all TPs are hit (become None), the signal should be closed.
+                
+        # Check if all TPs are now None (meaning they've all been "hit" and processed)
+        all_tps_processed = True
+        for tp_key_check in ['current_tp1_price', 'current_tp2_price', 'current_tp3_price']:
+            # Check directly in the potentially updated active_signals dict under lock
+            with active_signals_lock:
+                signal_data_for_all_tp_check = active_signals.get(symbol)
+                if signal_data_for_all_tp_check and signal_data_for_all_tp_check.get(tp_key_check) is not None:
+                    all_tps_processed = False
+                    break
+        
+        if all_tps_processed and any_tp_hit_this_signal: # If any TP was hit this cycle leading to all TPs being processed
+            # Final P&L would be based on the last TP hit.
+            # This is a simplified closure; a real system might average out P&L if TPs had different quantities.
+            # For signals, we assume full quantity at each TP for estimation purposes if not specified otherwise.
+            # The P&L for the *last* TP hit was already sent. Send a general closure message.
+            msg_detail_all_tps = "All Take Profit levels achieved."
+            send_signal_update_telegram(configs, signal_details, "CLOSED_ALL_TPS", msg_detail_all_tps, current_market_price)
+            
+            # Log "CLOSED_ALL_TPS" event to CSV
+            log_event_all_tps = {
+                "SignalID": signal_details.get('signal_id'), "Symbol": symbol, "Strategy": signal_details.get('strategy_type'),
+                "Side": signal_details.get('side'), "Leverage": signal_details.get('leverage'),
+                "SignalOpenPrice": signal_details.get('entry_price'), "EventType": "CLOSED_ALL_TPS",
+                "EventPrice": current_market_price, # Current market price at time of this event
+                "Notes": msg_detail_all_tps,
+                "EstimatedPNL_USD100": None # PNL for final TP was already logged with its specific TP_HIT event
+            }
+            log_signal_event_to_csv(log_event_all_tps)
+
+            signals_to_remove.append(symbol)
+            with active_signals_lock:
+                if symbol in active_signals:
+                     active_signals[symbol]["last_update_message_type"] = "CLOSED_ALL_TPS"
+                     active_signals[symbol]["last_update_message_detail_preview"] = msg_detail_all_tps[:50]
+
+        # TODO: Implement Trailing SL logic here (e.g., based on check_and_adjust_sl_tp_dynamic concepts or micro-pivots)
+        # When implemented, SL_ADJUSTED events from trailing should also be logged to CSV.
+        # Example for a hypothetical trailing SL adjustment:
+        # if trailing_sl_moved:
+        #     log_event_sl_trail = {
+        #         "SignalID": signal_details.get('signal_id'), ..., "EventType": "SL_ADJUSTED_TRAIL",
+        #         "EventPrice": new_trailing_sl_price, "Notes": "Trailing SL updated", ...
+        #     }
+        #     log_signal_event_to_csv(log_event_sl_trail)
+        # This would involve:
+        # 1. Getting 1-min candle buffer if micro-pivot is enabled.
+        # 2. Calculating new potential SL based on rules.
+        # 3. If new SL is an improvement, update signal_details['current_sl_price'] and send a "SL_ADJUSTED" message.
+
+    # Remove closed signals
+    if signals_to_remove:
+        with active_signals_lock:
+            for sym_remove in signals_to_remove:
+                if sym_remove in active_signals:
+                    print(f"{log_prefix} Removing signal for {sym_remove} from active_signals.")
+                    del active_signals[sym_remove]
+    
+    print(f"{log_prefix} Finished monitoring active signals. {len(active_signals_copy) - len(signals_to_remove)} signals remain active.")
+
+# --- CSV Logging for Signal Summary ---
+CSV_SUMMARY_FILENAME = "signal_summary.csv"
+CSV_SUMMARY_HEADERS = [
+    "Timestamp", "Date", "SignalID", "Symbol", "Strategy", "Side", 
+    "Leverage", "SignalOpenPrice", "EventType", "EventPrice", "Notes", "EstimatedPNL_USD100"
+]
+
+def log_signal_event_to_csv(event_details_dict: dict):
+    """
+    Logs a signal event to the CSV_SUMMARY_FILENAME.
+    Manages file creation and header writing.
+    """
+    try:
+        file_exists = os.path.exists(CSV_SUMMARY_FILENAME)
+        
+        # Ensure all header columns are present in the dict, fill with N/A if missing
+        row_data = {header: event_details_dict.get(header, "N/A") for header in CSV_SUMMARY_HEADERS}
+        
+        # Specific formatting for certain fields
+        row_data["Timestamp"] = pd.Timestamp.now(tz='UTC').strftime('%Y-%m-%d %H:%M:%S %Z')
+        row_data["Date"] = pd.Timestamp.now(tz='UTC').strftime('%Y-%m-%d')
+
+        if isinstance(row_data.get("SignalOpenPrice"), (float, int)):
+            row_data["SignalOpenPrice"] = f"{row_data['SignalOpenPrice']:.8g}" # General purpose float formatting
+        if isinstance(row_data.get("EventPrice"), (float, int)):
+            row_data["EventPrice"] = f"{row_data['EventPrice']:.8g}"
+        if isinstance(row_data.get("EstimatedPNL_USD100"), (float, int)):
+             row_data["EstimatedPNL_USD100"] = f"{row_data['EstimatedPNL_USD100']:.2f}"
+
+
+        df_to_append = pd.DataFrame([row_data])
+        
+        if not file_exists:
+            df_to_append.to_csv(CSV_SUMMARY_FILENAME, mode='a', header=True, index=False, columns=CSV_SUMMARY_HEADERS)
+        else:
+            df_to_append.to_csv(CSV_SUMMARY_FILENAME, mode='a', header=False, index=False, columns=CSV_SUMMARY_HEADERS)
+
+        # print(f"Logged signal event to {CSV_SUMMARY_FILENAME}: {row_data.get('SignalID')} - {row_data.get('EventType')}")
+    except Exception as e:
+        print(f"Error logging signal event to CSV: {e}")
+        traceback.print_exc()
+
+def escape_markdown_v1(text: str) -> str:
+    """Escapes characters for Telegram Markdown V1."""
+    if not isinstance(text, str):
+        return ""
+    # Order matters to avoid double escaping if an escape char is part of another
+    text = text.replace('_', r'\_')
+    text = text.replace('*', r'\*')
+    text = text.replace('`', r'\`')
+    text = text.replace('[', r'\[')
+    # text = text.replace(']', r'\]') # Closing bracket usually doesn't need escaping unless in a pair
+    return text
+
+def get_summary_from_csv(target_date_str: str = None, get_last_day: bool = False) -> tuple[str, int]:
+    """
+    Reads signal_summary.csv, filters by date, and formats a summary string.
+
+    Args:
+        target_date_str (str, optional): Specific date YYYY-MM-DD. Defaults to None (today).
+        get_last_day (bool, optional): If True, gets the summary for the last recorded day before today.
+
+    Returns:
+        tuple[str, int]: Formatted summary string and count of events.
+    """
+    if not os.path.exists(CSV_SUMMARY_FILENAME):
+        return "🗓️ Signal summary file (`signal_summary.csv`) not found.", 0
+
+    try:
+        df = pd.read_csv(CSV_SUMMARY_FILENAME)
+        if df.empty:
+            return "🗓️ Signal summary file is empty.", 0
+        
+        # Ensure Timestamp is datetime for sorting, and Date is string for comparison
+        df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+        df['Date'] = df['Date'].astype(str)
+
+        today_utc_str = pd.Timestamp.now(tz='UTC').strftime('%Y-%m-%d')
+        
+        date_to_filter = ""
+        day_description = ""
+
+        if target_date_str:
+            # Validate target_date_str format (basic check)
+            try:
+                pd.to_datetime(target_date_str, format='%Y-%m-%d') # Test conversion
+                date_to_filter = target_date_str
+                day_description = f"for {date_to_filter}"
+            except ValueError:
+                return f"❌ Invalid date format. Please use YYYY-MM-DD. You provided: {target_date_str}", 0
+        elif get_last_day:
+            # Find the latest date in the CSV that is not today
+            available_dates = sorted(df['Date'].unique(), reverse=True)
+            last_recorded_day = None
+            for date_val in available_dates:
+                if date_val < today_utc_str:
+                    last_recorded_day = date_val
+                    break
+            if last_recorded_day:
+                date_to_filter = last_recorded_day
+                day_description = f"for the last recorded day ({date_to_filter})"
+            else:
+                return "🗓️ No entries found for any day before today.", 0
+        else: # Default to today
+            date_to_filter = today_utc_str
+            day_description = "for today"
+
+        filtered_df = df[df['Date'] == date_to_filter].sort_values(by="Timestamp")
+
+        if filtered_df.empty:
+            return f"🗓️ No signal events found {day_description} ({date_to_filter}).", 0
+
+        summary_lines = [f"📊 *Signal Summary {day_description} ({date_to_filter}):*"]
+        
+        # Group by SignalID to consolidate related events
+        for signal_id, group in filtered_df.groupby("SignalID"):
+            group = group.sort_values(by="Timestamp") # Ensure events within a signal are chronological
+            first_event = group.iloc[0]
+            summary_lines.append(
+                f"\n🔹 Signal ID: `{signal_id}`\n"
+                f"   Symbol: `{first_event['Symbol']}` ({first_event['Strategy']}) - {first_event['Side']} @ {first_event['Leverage']}x\n"
+                f"   Opened At: `{pd.to_datetime(first_event['Timestamp']).strftime('%H:%M:%S')}` (Price: {first_event['SignalOpenPrice']})"
+            )
+            
+            for idx, event in group.iterrows():
+                event_time_str = pd.to_datetime(event['Timestamp']).strftime('%H:%M:%S')
+                event_type = event['EventType']
+                event_price = event['EventPrice']
+                notes = event['Notes'] if pd.notna(event['Notes']) and event['Notes'] != "N/A" else ""
+                pnl_est = event['EstimatedPNL_USD100'] if pd.notna(event['EstimatedPNL_USD100']) and event['EstimatedPNL_USD100'] != "N/A" else ""
+
+                emoji = "➡️"
+                if "NEW_SIGNAL" in event_type: emoji = "🔔"
+                elif "TP" in event_type and "HIT" in event_type: emoji = "✅"
+                elif "SL_HIT" in event_type: emoji = "❌"
+                elif "ADJUSTED" in event_type: emoji = "🛡️"
+                elif "CLOSED" in event_type: emoji = "🎉"
+
+                line = f"     {emoji} {event_time_str} - *{event_type}*"
+                if event_price != "N/A" and event_price != first_event['SignalOpenPrice']: # Don't repeat open price for NEW_SIGNAL
+                    line += f" at `{event_price}`"
+                if notes:
+                    line += f" ({escape_markdown_v1(notes)})" # Escape notes
+                if pnl_est:
+                    line += f" | Est. PNL ($100): `{pnl_est}`"
+                summary_lines.append(line)
+        
+        event_count = len(filtered_df)
+        summary_lines.append(f"\nTotal events for this period: {event_count}")
+        
+        full_summary = "\n".join(summary_lines)
+        
+        # Truncate if too long for a single Telegram message (Telegram limit is 4096 chars)
+        # This is a basic truncation; smarter splitting might be needed for very long summaries.
+        if len(full_summary) > 4000: # Leave some buffer
+            full_summary = full_summary[:4000] + "\n\n... (summary truncated due to length)"
+            
+        return full_summary, event_count
+
+    except pd.errors.EmptyDataError:
+        return f"🗓️ Signal summary file is empty or not formatted correctly.", 0
+    except FileNotFoundError: # Should be caught by os.path.exists, but as a fallback.
+        return f"🗓️ Signal summary file (`{CSV_SUMMARY_FILENAME}`) not found.", 0
+    except Exception as e:
+        print(f"Error reading or processing CSV for summary: {e}")
+        traceback.print_exc()
+        return f"❌ Error generating summary: {str(e)}", 0
+
+# --- P&L Calculation Helper for Signals ---
+def calculate_pnl_for_fixed_capital(entry_price: float, exit_price: float, side: str, leverage: int, fixed_capital_usdt: float = 100.0, symbol_info: dict = None) -> float | None:
+    """
+    Calculates the estimated P&L for a trade based on a fixed capital amount (e.g., $100).
+
+    Args:
+        entry_price (float): The entry price.
+        exit_price (float): The exit price (SL or TP).
+        side (str): "LONG" or "SHORT".
+        leverage (int): The leverage used for the trade.
+        fixed_capital_usdt (float): The amount of capital to simulate the trade with.
+        symbol_info (dict): Symbol information (primarily for quantity precision if needed, though less critical for P&L estimation).
+
+    Returns:
+        float | None: Estimated P&L in USDT, or None if inputs are invalid.
+    """
+    if entry_price is None or exit_price is None: # Added check for None prices
+        print(f"Error in P&L calc for signal: Entry price ({entry_price}) or Exit price ({exit_price}) is None.")
+        return None
+    if not all([isinstance(entry_price, (int,float)) and entry_price > 0, 
+                isinstance(exit_price, (int,float)) and exit_price > 0, 
+                leverage > 0, fixed_capital_usdt > 0]):
+        print(f"Error in P&L calc for signal: Invalid inputs (entry_price:{entry_price}, exit_price:{exit_price}, leverage:{leverage}, capital:{fixed_capital_usdt})")
+        return None
+    if side not in ["LONG", "SHORT"]:
+        print(f"Error in P&L calc for signal: Invalid side '{side}'")
+        return None # Added return for invalid side
+    
+    # Additional check: For a LONG, exit_price (TP) should be > entry_price for positive P&L calc,
+    # and exit_price (SL) should be < entry_price. Vice-versa for SHORT.
+    # This function primarily calculates P&L based on values; logical validation of TP/SL placement should be done before calling.
+    # However, if entry and exit are identical, P&L is 0.
+    if entry_price == exit_price:
+        return 0.0
+        return None
+
+    # Calculate position size in base asset based on fixed capital and leverage
+    # Position Value (USDT) = fixed_capital_usdt * leverage
+    # Quantity (Base Asset) = Position Value (USDT) / entry_price
+    position_value_usdt = fixed_capital_usdt * leverage
+    quantity_base_asset = position_value_usdt / entry_price
+
+    # Apply quantity precision if symbol_info is available (optional for estimation, but good for consistency)
+    if symbol_info:
+        q_prec = int(symbol_info.get('quantityPrecision', 8)) # Default to high precision if not found
+        lot_size_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
+        if lot_size_filter:
+            step_size = float(lot_size_filter['stepSize'])
+            if step_size > 0:
+                 quantity_base_asset = math.floor(quantity_base_asset / step_size) * step_size
+        quantity_base_asset = round(quantity_base_asset, q_prec)
+    
+    if quantity_base_asset == 0:
+        # This can happen if fixed_capital is too small for the min_qty or step_size of the symbol.
+        # For a $100 signal, this is less likely for major pairs but possible for very low-priced assets or high min_qty.
+        print(f"Warning in P&L calc for signal: Calculated quantity for ${fixed_capital_usdt} is zero for {symbol_info.get('symbol', 'N/A') if symbol_info else 'N/A'}. Check capital or symbol parameters.")
+        return 0.0 # P&L is 0 if no position can be opened.
+
+    pnl = 0.0
+    if side == "LONG":
+        pnl = (exit_price - entry_price) * quantity_base_asset
+    elif side == "SHORT":
+        pnl = (entry_price - exit_price) * quantity_base_asset
+    
+    return pnl
+
 # --- Main Execution ---
 
 def reset_global_states_for_restart():
@@ -5219,7 +5924,7 @@ def reset_global_states_for_restart():
     global daily_high_equity, day_start_equity, last_trading_day
     global trading_halted_drawdown, trading_halted_daily_loss, daily_realized_pnl
     global symbols_currently_processing, last_signal_time, recent_trade_signatures
-    global active_trades, active_trades_lock # Ensure active_trades is cleared too
+    global active_trades, active_trades_lock, fib_strategy_states, fib_strategy_states_lock # Added fib_strategy_states
 
     print("Resetting global states for bot restart...")
 
@@ -5237,6 +5942,10 @@ def reset_global_states_for_restart():
     with active_trades_lock:
         active_trades.clear()
     
+    with fib_strategy_states_lock: # Also clear fib_strategy_states
+        fib_strategy_states.clear()
+        print("Fibonacci strategy states cleared for restart.")
+
     print("Global states reset complete for restart.")
 
 def main_bot_logic(): # Renamed main to main_bot_logic
@@ -5379,41 +6088,51 @@ def main_bot_logic(): # Renamed main to main_bot_logic
     # confirm = input(f"Found {len(monitored_symbols)} USDT perpetuals. Monitor all for {'live trading' if configs['mode'] == 'live' else 'backtesting'}? (yes/no) [yes]: ").lower().strip()
     # if confirm == 'no': print("Exiting by user choice."); sys.exit(0)
 
-    if configs["mode"] == "live":
+    if configs["mode"] == "live" or configs["mode"] == "signal": # Include "signal" mode here
         try:
-            trading_loop(client, configs, monitored_symbols) # Use global client
+            # For "signal" mode, trading_loop will be adapted not to place real orders
+            # but will perform scanning and (soon) signal notifications.
+            trading_loop(client, configs, monitored_symbols) 
         except KeyboardInterrupt: 
-            print("\nBot stopped by user (Ctrl+C).")
-            # Send a notification for graceful shutdown by user
+            print(f"\nBot stopped by user (Ctrl+C) in {configs['mode']} mode.")
             if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
-                send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], "ℹ️ Bot stopped by user (Ctrl+C).")
+                send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], f"ℹ️ Bot stopped by user (Ctrl+C) in {configs['mode']} mode.")
         except Exception as e: 
-            print(f"\nCRITICAL UNEXPECTED ERROR IN LIVE TRADING: {e}")
+            print(f"\nCRITICAL UNEXPECTED ERROR IN {configs['mode'].upper()} MODE: {e}")
             traceback.print_exc()
-            # Send a notification for critical error
             if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
-                error_message_for_telegram = f"🆘 CRITICAL BOT ERROR 🆘\nBot encountered an unhandled exception and may have stopped.\nError: {str(e)[:1000]}\nCheck logs immediately!"
+                error_message_for_telegram = f"🆘 CRITICAL BOT ERROR ({configs['mode'].upper()} MODE) 🆘\nBot encountered an unhandled exception and may have stopped.\nError: {str(e)[:1000]}\nCheck logs!"
                 send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], error_message_for_telegram)
         finally:
-            print("\n--- Live Trading Bot Shutting Down ---")
+            print(f"\n--- {configs['mode'].title()} Mode Bot Shutting Down ---")
 
-            # Cancel orders if any
-            if client and active_trades: # Use global client
-                print(f"Cancelling {len(active_trades)} bot-managed active SL/TP orders...")
-                with active_trades_lock:
-                    for symbol, trade_details in list(active_trades.items()):
-                        for oid_key in ['sl_order_id', 'tp_order_id']:
-                            oid = trade_details.get(oid_key)
-                            if oid:
-                                try:
-                                    print(f"Cancelling {oid_key} {oid} for {symbol}...")
-                                    client.futures_cancel_order(symbol=symbol, orderId=oid) # Use global client
-                                except Exception as e_c:
-                                    print(f"Failed to cancel {oid_key} {oid} for {symbol}: {e_c}")
+            if configs['mode'] == 'live': # Only cancel real orders if in live mode
+                if client and active_trades: 
+                    print(f"Cancelling {len(active_trades)} bot-managed active SL/TP orders...")
+                    with active_trades_lock:
+                        for symbol, trade_details in list(active_trades.items()):
+                            for oid_key in ['sl_order_id', 'tp_order_id']: # For EMA Cross
+                                oid = trade_details.get(oid_key)
+                                if oid:
+                                    try:
+                                        print(f"Cancelling {oid_key} {oid} for {symbol}...")
+                                        client.futures_cancel_order(symbol=symbol, orderId=oid) 
+                                    except Exception as e_c:
+                                        print(f"Failed to cancel {oid_key} {oid} for {symbol}: {e_c}")
+                            
+                            # For Fib Multi-TP strategy
+                            if trade_details.get('strategy_type') == "FIBONACCI_MULTI_TP" and 'tp_orders' in trade_details:
+                                for tp_order_info in trade_details['tp_orders']:
+                                    tp_id_to_cancel = tp_order_info.get('id')
+                                    if tp_id_to_cancel and tp_order_info.get('status') == "OPEN":
+                                        try:
+                                            print(f"Cancelling Fib TP order {tp_id_to_cancel} ({tp_order_info.get('name')}) for {symbol}...")
+                                            client.futures_cancel_order(symbol=symbol, orderId=tp_id_to_cancel)
+                                        except Exception as e_fib_tp_cancel:
+                                            print(f"Failed to cancel Fib TP order {tp_id_to_cancel} for {symbol}: {e_fib_tp_cancel}")
+            
+            print(f"{configs['mode'].title()} Bot shutdown sequence complete.")
 
-            print("Live Bot shutdown sequence complete.") # This line was duplicated, removing one instance
-
-            # ✅ Send Telegram Shutdown Message
             if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
                 shutdown_time_str = pd.Timestamp.now(tz='UTC').strftime('%Y-%m-%d %H:%M:%S UTC')
                 shutdown_msg = (
@@ -7422,6 +8141,59 @@ async def set_handler(update: Update, context: ContextTypes.DEFAULT_TYPE): # Ren
     print(f"Telegram config choices set: Load='{telegram_load_choice}', Changes='{telegram_make_changes_choice}'")
     await update.message.reply_text(reply_message, parse_mode="Markdown")
 
+async def summary_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the /sum command to retrieve and display signal summaries."""
+    app_configs = context.bot_data.get('configs', {})
+    effective_chat_id = str(update.effective_chat.id)
+    expected_chat_id = str(app_configs.get("telegram_chat_id"))
+
+    if effective_chat_id != expected_chat_id:
+        print(f"Summary command from unauthorized chat ID: {effective_chat_id}")
+        return
+
+    args = context.args
+    summary_text = ""
+    event_count = 0
+
+    if not args: # /sum - today's summary
+        summary_text, event_count = get_summary_from_csv()
+    elif len(args) == 1:
+        arg1 = args[0].lower()
+        if arg1 in ['l', 'last']: # /sum l - yesterday's/last day's summary
+            summary_text, event_count = get_summary_from_csv(get_last_day=True)
+        else: # /sum YYYY-MM-DD or YYYY.MM.DD
+            date_arg = args[0].replace('.', '-') # Normalize to YYYY-MM-DD
+            # Basic validation for date format (more thorough validation in get_summary_from_csv)
+            if len(date_arg) == 10 and date_arg[4] == '-' and date_arg[7] == '-':
+                summary_text, event_count = get_summary_from_csv(target_date_str=date_arg)
+            else:
+                summary_text = "❌ Invalid argument. Usage:\n" \
+                               "/sum (for today)\n" \
+                               "/sum L (for last recorded day before today)\n" \
+                               "/sum YYYY-MM-DD (for a specific date)"
+                event_count = -1 # Indicate error or invalid usage
+    else: # Invalid number of arguments
+        summary_text = "❌ Too many arguments. Usage:\n" \
+                       "/sum (for today)\n" \
+                       "/sum L (for last recorded day before today)\n" \
+                       "/sum YYYY-MM-DD (for a specific date)"
+        event_count = -1
+
+    # Send the summary message
+    # Telegram messages have a limit of 4096 characters.
+    # get_summary_from_csv already truncates, but good to be aware.
+    if summary_text:
+        # Split message if it's too long (though get_summary_from_csv already truncates)
+        max_len = 4096
+        if len(summary_text) > max_len:
+            parts = [summary_text[i:i + max_len] for i in range(0, len(summary_text), max_len)]
+            for part in parts:
+                await update.message.reply_text(part, parse_mode="Markdown")
+        else:
+            await update.message.reply_text(summary_text, parse_mode="Markdown")
+    else: # Should not happen if get_summary_from_csv always returns a string
+        await update.message.reply_text("Could not retrieve summary.", parse_mode="Markdown")
+
 
 if __name__ == "__main__":
     # These globals are directly managed by the main loop or its direct conditions
@@ -7430,10 +8202,24 @@ if __name__ == "__main__":
     # or by the new reset_global_states_for_restart function.
 
     returned_configs = None # Initialize to ensure it exists for the first Telegram message if restart happens early
+    first_run = True
 
     while True:
-        active_trades.clear() # Clear active trades at the beginning of each potential run/restart
+        # Clear critical state at the beginning of each main loop iteration (especially for restarts)
+        # This ensures that stale states from a previous run (e.g. live mode then signal mode) are wiped.
+        with active_trades_lock:
+            active_trades.clear()
+        with active_signals_lock: # Assuming active_signals_lock is defined with active_signals
+            active_signals.clear()
+        with fib_strategy_states_lock:
+            fib_strategy_states.clear()
         
+        if first_run:
+            print("First run: Cleared active_trades, active_signals, and fib_strategy_states.")
+            first_run = False
+        else: # This is a restart
+            print("Bot Restart: Cleared active_trades, active_signals, and fib_strategy_states before restarting main logic.")
+            
         # If this isn't the first iteration (i.e., it's a restart), client might already exist.
         # main_bot_logic is responsible for initializing/re-initializing it.
         # If client becomes None due to an error in main_bot_logic, restart might be problematic
