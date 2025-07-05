@@ -48,6 +48,21 @@ DEFAULT_STRATEGY = "ema_cross"   # Default strategy to run
 DEFAULT_FIB_ORDER_TIMEOUT_MINUTES = 5 # Default timeout for Fib retracement limit orders
 DEFAULT_FIB_ATR_PERIOD = 14          # Default ATR period for Fibonacci strategy SL
 DEFAULT_FIB_SL_ATR_MULTIPLIER = 1.0  # Default ATR multiplier for SL for Fibonacci strategy
+DEFAULT_MICRO_PIVOT_TRAILING_SL = True # Default for enabling micro-pivot trailing SL
+DEFAULT_MICRO_PIVOT_BUFFER_ATR = 0.25  # Default ATR multiplier for micro-pivot SL buffer
+DEFAULT_MICRO_PIVOT_PROFIT_THRESHOLD_R = 0.5 # Default profit threshold (in R) to activate micro-pivot SL
+
+# Fibonacci Strategy Specific TP Scaling and SL Management Defaults
+DEFAULT_FIB_TP_USE_EXTENSIONS = True
+DEFAULT_FIB_TP1_EXTENSION_RATIO = 0.618
+DEFAULT_FIB_TP2_EXTENSION_RATIO = 1.0
+DEFAULT_FIB_TP3_EXTENSION_RATIO = 1.618
+DEFAULT_FIB_TP1_QTY_PCT = 0.25
+DEFAULT_FIB_TP2_QTY_PCT = 0.50
+DEFAULT_FIB_TP3_QTY_PCT = 0.25 # Remainder could also be used
+DEFAULT_FIB_MOVE_SL_AFTER_TP1 = "breakeven"  # Options: "breakeven", "trailing", "original"
+DEFAULT_FIB_BREAKEVEN_BUFFER_R = 0.1         # 0.1R buffer
+DEFAULT_FIB_SL_ADJUSTMENT_AFTER_TP2 = "micro_pivot"  # Options: "micro_pivot", "atr_trailing", "original"
 
 # --- Global State Variables ---
 # Stores details of active trades. Key: symbol (e.g., "BTCUSDT")
@@ -168,7 +183,21 @@ def validate_configurations(loaded_configs: dict) -> tuple[bool, str, dict]:
         "fib_1m_buffer_size": {"type": int, "optional": True, "condition": lambda x: 20 <= x <= 1000}, # For Fibonacci strategy
         "fib_order_timeout_minutes": {"type": int, "optional": True, "condition": lambda x: 1 <= x <= 60}, # For Fibonacci strategy
         "fib_atr_period": {"type": int, "optional": True, "condition": lambda x: x > 0}, # For Fibonacci SL
-        "fib_sl_atr_multiplier": {"type": float, "optional": True, "condition": lambda x: x > 0} # For Fibonacci SL
+        "fib_sl_atr_multiplier": {"type": float, "optional": True, "condition": lambda x: x > 0}, # For Fibonacci SL
+        "micro_pivot_trailing_sl": {"type": bool, "optional": True},
+        "micro_pivot_buffer_atr": {"type": float, "optional": True, "condition": lambda x: x > 0},
+        "micro_pivot_profit_threshold_r": {"type": float, "optional": True, "condition": lambda x: x > 0},
+        # Fib strategy TP scaling and SL management
+        "fib_tp_use_extensions": {"type": bool, "optional": True},
+        "fib_tp1_extension_ratio": {"type": float, "optional": True, "condition": lambda x: x > 0},
+        "fib_tp2_extension_ratio": {"type": float, "optional": True, "condition": lambda x: x > 0},
+        "fib_tp3_extension_ratio": {"type": float, "optional": True, "condition": lambda x: x > 0},
+        "fib_tp1_qty_pct": {"type": float, "optional": True, "condition": lambda x: 0 < x < 1},
+        "fib_tp2_qty_pct": {"type": float, "optional": True, "condition": lambda x: 0 < x < 1},
+        "fib_tp3_qty_pct": {"type": float, "optional": True, "condition": lambda x: 0 < x < 1}, # Validation for sum of pct could be added later
+        "fib_move_sl_after_tp1": {"type": str, "optional": True, "valid_values": ["breakeven", "trailing", "original"]},
+        "fib_breakeven_buffer_r": {"type": float, "optional": True, "condition": lambda x: 0 <= x < 1}, # Buffer can be 0
+        "fib_sl_adjustment_after_tp2": {"type": str, "optional": True, "valid_values": ["micro_pivot", "atr_trailing", "original"]}
         # API keys and telegram details are not part of this CSV validation
     }
     
@@ -1297,7 +1326,9 @@ def manage_fib_retracement_entry_logic(client, configs: dict, symbol: str, bos_e
     # For brevity, assume it passes.
 
     # Use the first valid TP as tp_price for sanity checks and trade signature
-    tp_price = tp1_price_final
+    # If fib_tp_use_extensions is true, tp1_price_final might be based on extensions.
+    # If false, it's based on the old retracement logic. This assignment is okay.
+    tp_price = tp1_price_final 
 
     # Sanity Checks
     passed_sanity, sanity_reason = pre_order_sanity_checks(
@@ -1354,12 +1385,15 @@ def manage_fib_retracement_entry_logic(client, configs: dict, symbol: str, bos_e
             fib_strategy_states[symbol]['pending_entry_details'] = {
                 "limit_price": entry_price_target,
                 "sl_price": sl_price,
-                "tp1_price": tp1_price_final, # Store final validated TPs
-                "tp2_price": tp2_price_final,
-                "tp3_price": tp3_price_final,
+                # TP prices here are provisional if using extensions, as they depend on actual_entry_price.
+                # If not using extensions, these are the final TP prices from the old logic.
+                "tp1_price_provisional": tp1_price_final, 
+                "tp2_price_provisional": tp2_price_final,
+                "tp3_price_provisional": tp3_price_final,
                 "quantity": qty_to_order, # This is total quantity
                 "side": direction, # "long" or "short"
-                "bos_event_snapshot": bos_event # Store the BoS that led to this
+                "bos_event_snapshot": bos_event, # Store the BoS that led to this
+                "initial_risk_per_unit": abs(entry_price_target - sl_price) # Provisional, recalculate with actual_entry_price
             }
             # Add trade signature *after* successful limit order placement attempt
             with recent_trade_signatures_lock:
@@ -1413,40 +1447,76 @@ def monitor_pending_fib_entries(client, configs: dict):
                 total_filled_qty = float(order_status['executedQty']) # Total quantity from the filled limit order
                 
                 sl_price = pending_details['sl_price']
-                tp1_price = pending_details['tp1_price']
-                tp2_price = pending_details['tp2_price']
-                tp3_price = pending_details['tp3_price']
                 trade_side = pending_details['side'] # "long" or "short"
                 position_side_for_sl_tp = "LONG" if trade_side == "long" else "SHORT"
-
+                bos_event_snapshot = pending_details.get('bos_event_snapshot', {})
+                
                 p_prec = int(symbol_info.get('pricePrecision', 2))
                 q_prec = int(symbol_info.get('quantityPrecision', 0))
 
-                # Define TP quantity splits (e.g., 30% TP1, 50% TP2, 20% TP3)
-                # These should be configurable, for now hardcoding.
-                tp1_qty_pct = 0.30
-                tp2_qty_pct = 0.50
-                tp3_qty_pct = 0.20
-
-                # Calculate quantities for each TP, ensuring they sum to total_filled_qty and respect precision
-                qty_tp1 = round(total_filled_qty * tp1_qty_pct, q_prec)
-                qty_tp2 = round(total_filled_qty * tp2_qty_pct, q_prec)
-                # qty_tp3 is the remainder to ensure total matches, adjusted for precision
-                qty_tp3 = round(total_filled_qty - qty_tp1 - qty_tp2, q_prec)
+                # --- TP Price and Quantity Calculation ---
+                tp1_price_final, tp2_price_final, tp3_price_final = None, None, None
                 
-                # Adjust if sum is slightly off due to rounding (distribute remainder to largest portion, e.g. TP2)
-                if abs(qty_tp1 + qty_tp2 + qty_tp3 - total_filled_qty) > (1 / (10**q_prec)) / 2 : # If sum is off by more than half a step
-                    print(f"{log_prefix_monitor} Adjusting TP quantities due to rounding for {symbol}. Initial: Q1={qty_tp1}, Q2={qty_tp2}, Q3={qty_tp3}")
-                    remainder = total_filled_qty - (qty_tp1 + qty_tp2 + qty_tp3)
-                    qty_tp2 = round(qty_tp2 + remainder, q_prec) # Add remainder to TP2 typically
-                    print(f"{log_prefix_monitor} Adjusted: Q1={qty_tp1}, Q2={qty_tp2}, Q3={qty_tp3}. Total: {qty_tp1+qty_tp2+qty_tp3}")
+                if configs.get("fib_tp_use_extensions", DEFAULT_FIB_TP_USE_EXTENSIONS) and bos_event_snapshot:
+                    range_bos = abs(bos_event_snapshot['swing_high_bos_move'] - bos_event_snapshot['swing_low_bos_move'])
+                    tp1_ext_ratio = configs.get("fib_tp1_extension_ratio", DEFAULT_FIB_TP1_EXTENSION_RATIO)
+                    tp2_ext_ratio = configs.get("fib_tp2_extension_ratio", DEFAULT_FIB_TP2_EXTENSION_RATIO)
+                    tp3_ext_ratio = configs.get("fib_tp3_extension_ratio", DEFAULT_FIB_TP3_EXTENSION_RATIO)
 
+                    if trade_side == "long":
+                        tp1_price_final = round(actual_entry_price + (range_bos * tp1_ext_ratio), p_prec)
+                        tp2_price_final = round(actual_entry_price + (range_bos * tp2_ext_ratio), p_prec)
+                        tp3_price_final = round(actual_entry_price + (range_bos * tp3_ext_ratio), p_prec)
+                    else: # SHORT
+                        tp1_price_final = round(actual_entry_price - (range_bos * tp1_ext_ratio), p_prec)
+                        tp2_price_final = round(actual_entry_price - (range_bos * tp2_ext_ratio), p_prec)
+                        tp3_price_final = round(actual_entry_price - (range_bos * tp3_ext_ratio), p_prec)
+                    print(f"{log_prefix_monitor} Calculated Fib Extension TPs for {symbol} ({trade_side}): TP1={tp1_price_final}, TP2={tp2_price_final}, TP3={tp3_price_final}")
+                else: # Use provisional TPs (old logic or if extensions disabled)
+                    tp1_price_final = pending_details.get('tp1_price_provisional')
+                    tp2_price_final = pending_details.get('tp2_price_provisional')
+                    tp3_price_final = pending_details.get('tp3_price_provisional')
+                    print(f"{log_prefix_monitor} Using provisional/original TP logic for {symbol} ({trade_side}): TP1={tp1_price_final}, TP2={tp2_price_final}, TP3={tp3_price_final}")
+
+                # TP Quantity Percentages from config
+                qty_pct_tp1 = configs.get("fib_tp1_qty_pct", DEFAULT_FIB_TP1_QTY_PCT)
+                qty_pct_tp2 = configs.get("fib_tp2_qty_pct", DEFAULT_FIB_TP2_QTY_PCT)
+                # TP3 qty is the remainder to ensure total matches total_filled_qty
+                
+                qty_tp1 = round(total_filled_qty * qty_pct_tp1, q_prec)
+                qty_tp2 = round(total_filled_qty * qty_pct_tp2, q_prec)
+                
+                # Ensure qty_tp1 and qty_tp2 are not zero if their percentages are non-zero, due to small total_filled_qty
+                min_qty_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
+                min_qty_val = float(min_qty_filter['minQty']) if min_qty_filter else 0.0
+                
+                if qty_pct_tp1 > 0 and qty_tp1 < min_qty_val and total_filled_qty >= min_qty_val: qty_tp1 = min_qty_val
+                if qty_pct_tp2 > 0 and qty_tp2 < min_qty_val and total_filled_qty >= min_qty_val: qty_tp2 = min_qty_val
+                
+                # If sum of TP1 and TP2 quantities exceeds total, adjust TP2
+                if (qty_tp1 + qty_tp2) > total_filled_qty:
+                    qty_tp2 = round(total_filled_qty - qty_tp1, q_prec)
+                    if qty_tp2 < 0: qty_tp2 = 0 # Ensure not negative
+
+                qty_tp3 = round(total_filled_qty - qty_tp1 - qty_tp2, q_prec)
+                if qty_tp3 < 0: qty_tp3 = 0 # Safety check
+
+                # Final adjustment if sum is still off due to multiple roundings or min_qty adjustments
+                current_sum_tp_qty = qty_tp1 + qty_tp2 + qty_tp3
+                if abs(current_sum_tp_qty - total_filled_qty) > (1 / (10**q_prec)) / 2 : # If sum is off
+                    print(f"{log_prefix_monitor} Adjusting TP quantities sum for {symbol}. Initial: Q1={qty_tp1}, Q2={qty_tp2}, Q3={qty_tp3}, Sum={current_sum_tp_qty}, Total={total_filled_qty}")
+                    diff = total_filled_qty - current_sum_tp_qty
+                    # Add difference to the largest portion, typically TP2 or TP3 if TP3 exists meaningfully
+                    if qty_tp3 >= abs(diff) and qty_tp3 > 0 : qty_tp3 = round(qty_tp3 + diff, q_prec)
+                    elif qty_tp2 >= abs(diff) and qty_tp2 > 0 : qty_tp2 = round(qty_tp2 + diff, q_prec)
+                    elif qty_tp1 >= abs(diff) and qty_tp1 > 0 : qty_tp1 = round(qty_tp1 + diff, q_prec)
+                    print(f"{log_prefix_monitor} Adjusted: Q1={qty_tp1}, Q2={qty_tp2}, Q3={qty_tp3}. NewSum: {qty_tp1+qty_tp2+qty_tp3}")
 
                 print(f"{log_prefix_monitor} Placing SL for total qty {total_filled_qty} and multi-tier TPs for {symbol}:")
                 print(f"  SL: {sl_price:.{p_prec}f} (Qty: {total_filled_qty})")
-                if tp1_price and qty_tp1 > 0: print(f"  TP1: {tp1_price:.{p_prec}f} (Qty: {qty_tp1})")
-                if tp2_price and qty_tp2 > 0: print(f"  TP2: {tp2_price:.{p_prec}f} (Qty: {qty_tp2})")
-                if tp3_price and qty_tp3 > 0: print(f"  TP3: {tp3_price:.{p_prec}f} (Qty: {qty_tp3})")
+                if tp1_price_final and qty_tp1 > 0: print(f"  TP1: {tp1_price_final:.{p_prec}f} (Qty: {qty_tp1})")
+                if tp2_price_final and qty_tp2 > 0: print(f"  TP2: {tp2_price_final:.{p_prec}f} (Qty: {qty_tp2})")
+                if tp3_price_final and qty_tp3 > 0: print(f"  TP3: {tp3_price_final:.{p_prec}f} (Qty: {qty_tp3})")
 
                 sl_ord_details, tp_orders_details_list = None, []
 
@@ -1458,10 +1528,10 @@ def monitor_pending_fib_entries(client, configs: dict):
                 else: sl_ord_details = {"id": sl_ord_obj.get('orderId'), "price": sl_price, "quantity": total_filled_qty, "status": "OPEN"}
 
                 # Place TP orders for each tier
-                tp_target_levels = [
-                    {"price": tp1_price, "quantity": qty_tp1, "name": "TP1"},
-                    {"price": tp2_price, "quantity": qty_tp2, "name": "TP2"},
-                    {"price": tp3_price, "quantity": qty_tp3, "name": "TP3"}
+                tp_target_levels = [ # Use the final calculated prices and quantities
+                    {"price": tp1_price_final, "quantity": qty_tp1, "name": "TP1"},
+                    {"price": tp2_price_final, "quantity": qty_tp2, "name": "TP2"},
+                    {"price": tp3_price_final, "quantity": qty_tp3, "name": "TP3"}
                 ]
 
                 for tp_info in tp_target_levels:
@@ -1492,13 +1562,15 @@ def monitor_pending_fib_entries(client, configs: dict):
                             "entry_price": actual_entry_price,
                             "current_sl_price": sl_price, # Main SL price
                             # current_tp_price is now a list in tp_orders
-                            "initial_sl_price": sl_price, 
-                            # initial_tp_price is now a list in tp_orders
+                            "initial_sl_price": sl_price,
+                            "initial_risk_per_unit": abs(actual_entry_price - sl_price), # Store initial risk per unit
+                            # initial_tp_price is implicitly defined by the tp_orders list
                             "quantity": total_filled_qty, # Total quantity of the trade
                             "side": trade_side.upper(),
                             "symbol_info": symbol_info,
                             "open_timestamp": pd.Timestamp(order_status['updateTime'], unit='ms', tz='UTC'),
-                            "strategy_type": "FIBONACCI_MULTI_TP" 
+                            "strategy_type": "FIBONACCI_MULTI_TP",
+                            "sl_management_stage": "initial" # Initial SL management stage
                         }
                         print(f"{log_prefix_monitor} Fib trade for {symbol} (Multi-TP) moved to active_trades.")
                         
@@ -2201,7 +2273,147 @@ def get_user_configurations(load_choice_override: str = None, make_changes_overr
     else: # Not fib_retracement strategy, remove if it was in loaded CSV
         configs.pop("fib_atr_period", None)
         configs.pop("fib_sl_atr_multiplier", None)
+        # Also remove new Fib TP/SL management specific configs if not Fib strategy
+        configs.pop("fib_tp_use_extensions", None)
+        configs.pop("fib_tp1_extension_ratio", None)
+        configs.pop("fib_tp2_extension_ratio", None)
+        configs.pop("fib_tp3_extension_ratio", None)
+        configs.pop("fib_tp1_qty_pct", None)
+        configs.pop("fib_tp2_qty_pct", None)
+        configs.pop("fib_tp3_qty_pct", None)
+        configs.pop("fib_move_sl_after_tp1", None)
+        configs.pop("fib_breakeven_buffer_r", None)
+        configs.pop("fib_sl_adjustment_after_tp2", None)
 
+
+    # Fibonacci Strategy Specific: TP Scaling and SL Management (only if Fib strategy is chosen)
+    if configs.get("strategy_choice") == "fib_retracement":
+        print("\n--- Fibonacci Strategy Specific TP & SL Management ---")
+        # fib_tp_use_extensions
+        while True:
+            default_val = configs.get("fib_tp_use_extensions", DEFAULT_FIB_TP_USE_EXTENSIONS)
+            default_disp = 'yes' if default_val else 'no'
+            user_input = input(f"Use Fib Extension TPs for Fib Strategy? (yes/no) (default: {default_disp}): ").lower().strip()
+            chosen_val = None
+            if not user_input: chosen_val = default_val
+            elif user_input in ["yes", "y"]: chosen_val = True
+            elif user_input in ["no", "n"]: chosen_val = False
+            if isinstance(chosen_val, bool): configs["fib_tp_use_extensions"] = chosen_val; break
+            print("Invalid input. Please enter 'yes' or 'no'.")
+
+        if configs.get("fib_tp_use_extensions"):
+            # TP Extension Ratios
+            for i, ratio_key, default_ratio in [
+                (1, "fib_tp1_extension_ratio", DEFAULT_FIB_TP1_EXTENSION_RATIO),
+                (2, "fib_tp2_extension_ratio", DEFAULT_FIB_TP2_EXTENSION_RATIO),
+                (3, "fib_tp3_extension_ratio", DEFAULT_FIB_TP3_EXTENSION_RATIO)
+            ]:
+                while True:
+                    try:
+                        val = get_input_with_default(f"Enter Fib TP{i} Extension Ratio", ratio_key, default_ratio, float)
+                        if val > 0: configs[ratio_key] = val; break
+                        print(f"TP{i} Extension Ratio must be positive.")
+                    except ValueError: print("Invalid input. Please enter a number.")
+            
+            # TP Quantity Percentages
+            # Basic validation for sum of percentages could be added here, or assume user manages it.
+            # For now, individual percentage validation.
+            for i, qty_key, default_qty_pct in [
+                (1, "fib_tp1_qty_pct", DEFAULT_FIB_TP1_QTY_PCT),
+                (2, "fib_tp2_qty_pct", DEFAULT_FIB_TP2_QTY_PCT),
+                (3, "fib_tp3_qty_pct", DEFAULT_FIB_TP3_QTY_PCT) # Ensure sum is 1.0, or TP3 is remainder
+            ]:
+                while True:
+                    try:
+                        # For display, convert 0.25 to 25%
+                        val_pct_display = configs.get(qty_key, default_qty_pct) * 100.0
+                        user_input_pct = input(f"Enter Fib TP{i} Quantity % (e.g., 25 for 25%) (default: {val_pct_display:.0f}%): ")
+                        
+                        final_val_decimal = 0
+                        if not user_input_pct: # User hit enter
+                            final_val_decimal = configs.get(qty_key, default_qty_pct)
+                        else:
+                            val_input_float = float(user_input_pct)
+                            if 0 < val_input_float <= 100:
+                                final_val_decimal = val_input_float / 100.0
+                            else:
+                                print(f"TP{i} Quantity % must be between 0 and 100.")
+                                continue
+                        
+                        configs[qty_key] = final_val_decimal
+                        break
+                    except ValueError: print("Invalid input. Please enter a number for percentage.")
+        
+        # SL Management after TP1
+        while True:
+            default_val = configs.get("fib_move_sl_after_tp1", DEFAULT_FIB_MOVE_SL_AFTER_TP1)
+            user_input = input(f"SL action after Fib TP1 (breakeven/trailing/original) (default: {default_val}): ").lower().strip()
+            chosen_val = default_val if not user_input else user_input
+            if chosen_val in ["breakeven", "trailing", "original"]: configs["fib_move_sl_after_tp1"] = chosen_val; break
+            print("Invalid input. Choose from 'breakeven', 'trailing', 'original'.")
+
+        if configs.get("fib_move_sl_after_tp1") == "breakeven":
+            while True:
+                try:
+                    val = get_input_with_default("Enter Fib Breakeven Buffer (in R, e.g. 0.1 for 0.1R)", "fib_breakeven_buffer_r", DEFAULT_FIB_BREAKEVEN_BUFFER_R, float)
+                    if 0 <= val < 1: configs["fib_breakeven_buffer_r"] = val; break # Buffer can be 0
+                    print("Breakeven Buffer (R) must be between 0 and 1 (e.g., 0.0 to 0.99).")
+                except ValueError: print("Invalid input. Please enter a number.")
+        
+        # SL Management after TP2
+        while True:
+            default_val = configs.get("fib_sl_adjustment_after_tp2", DEFAULT_FIB_SL_ADJUSTMENT_AFTER_TP2)
+            user_input = input(f"SL action after Fib TP2 (micro_pivot/atr_trailing/original) (default: {default_val}): ").lower().strip()
+            chosen_val = default_val if not user_input else user_input
+            if chosen_val in ["micro_pivot", "atr_trailing", "original"]: configs["fib_sl_adjustment_after_tp2"] = chosen_val; break
+            print("Invalid input. Choose from 'micro_pivot', 'atr_trailing', 'original'.")
+
+
+    # Micro-Pivot Trailing SL Configurations (Applicable to any strategy if enabled)
+    print("\n--- General Micro-Pivot Trailing SL ---")
+    while True:
+        # Default display for micro_pivot_trailing_sl
+        mp_default_display = 'yes' if configs.get("micro_pivot_trailing_sl", DEFAULT_MICRO_PIVOT_TRAILING_SL) else 'no'
+        mp_input = input(f"Enable Micro-Pivot Trailing SL? (yes/no) (default: {mp_default_display}): ").lower().strip()
+        
+        chosen_mp_enabled = None
+        if not mp_input: # User hit enter
+            chosen_mp_enabled = configs.get("micro_pivot_trailing_sl", DEFAULT_MICRO_PIVOT_TRAILING_SL)
+        elif mp_input in ["yes", "y"]: chosen_mp_enabled = True
+        elif mp_input in ["no", "n"]: chosen_mp_enabled = False
+        
+        if isinstance(chosen_mp_enabled, bool):
+            configs["micro_pivot_trailing_sl"] = chosen_mp_enabled
+            break
+        print("Invalid input. Please enter 'yes' or 'no'.")
+
+    if configs.get("micro_pivot_trailing_sl"): # Only ask for related params if it's enabled
+        while True:
+            try:
+                mp_buffer = get_input_with_default(
+                    "Enter Micro-Pivot SL ATR Buffer (e.g., 0.25 for 0.25x ATR)",
+                    "micro_pivot_buffer_atr", DEFAULT_MICRO_PIVOT_BUFFER_ATR, float
+                )
+                if mp_buffer > 0:
+                    configs["micro_pivot_buffer_atr"] = mp_buffer
+                    break
+                print("Micro-Pivot SL ATR Buffer must be a positive number.")
+            except ValueError: print("Invalid input. Please enter a number.")
+        
+        while True:
+            try:
+                mp_profit_r = get_input_with_default(
+                    "Enter Micro-Pivot Profit Threshold (in R, e.g., 0.5 for 0.5R profit)",
+                    "micro_pivot_profit_threshold_r", DEFAULT_MICRO_PIVOT_PROFIT_THRESHOLD_R, float
+                )
+                if mp_profit_r > 0:
+                    configs["micro_pivot_profit_threshold_r"] = mp_profit_r
+                    break
+                print("Micro-Pivot Profit Threshold (R) must be a positive number.")
+            except ValueError: print("Invalid input. Please enter a number.")
+    else: # Not enabled, remove related params if they were in loaded CSV
+        configs.pop("micro_pivot_buffer_atr", None)
+        configs.pop("micro_pivot_profit_threshold_r", None)
 
     # Strategy ID and Name are set based on "strategy_choice" earlier.
     
@@ -4009,8 +4221,109 @@ def monitor_active_trades(client, configs): # Needs lock for active_trades acces
             
             # If a TP hit, might need to adjust SL (e.g., to breakeven or for remaining qty)
             # This is part of the adaptive SL logic. For now, just noting the TP hit.
+            
+            # --- Staged SL Management for Fibonacci Multi-TP after a TP is hit ---
+            if is_multi_tp_strategy and any_tp_hit_this_cycle:
+                # Recalculate remaining quantity accurately based on all filled TPs
+                current_total_filled_tp_qty = sum(
+                    tp.get('quantity', 0) for tp in trade_details['tp_orders'] 
+                    if tp.get('status') == "FILLED" and tp.get('id') is not None
+                )
+                current_remaining_qty = round(float(trade_details['quantity']) - current_total_filled_tp_qty, int(trade_details['symbol_info'].get('quantityPrecision',0)))
 
-        # Dynamic SL/TP adjustment logic
+                if current_remaining_qty <= 0: # All parts of TPs might have filled, or remaining is dust
+                    print(f"[{symbol}] All TPs appear filled or remaining quantity is zero/dust after TP hit. Position should be closing.")
+                    # The main pos_exists check at the start of monitor_active_trades will handle full closure.
+                else:
+                    # Determine which TPs have been hit to decide SL adjustment strategy
+                    tp1_hit = any(tp.get('name') == "TP1" and tp.get('status') == "FILLED" for tp in trade_details['tp_orders'])
+                    tp2_hit = any(tp.get('name') == "TP2" and tp.get('status') == "FILLED" for tp in trade_details['tp_orders'])
+                    # TP3 hit implies full closure, handled by pos_exists.
+
+                    new_sl_price_staged = None
+                    sl_adjustment_reason_staged = None
+
+                    if tp1_hit and trade_details.get('sl_management_stage') == "initial":
+                        sl_action_tp1 = configs.get("fib_move_sl_after_tp1", DEFAULT_FIB_MOVE_SL_AFTER_TP1)
+                        print(f"[{symbol}] TP1 hit. SL management stage moving to 'after_tp1'. Action: {sl_action_tp1}")
+                        trade_details['sl_management_stage'] = "after_tp1" # Update state
+                        
+                        if sl_action_tp1 == "breakeven":
+                            buffer_r = configs.get("fib_breakeven_buffer_r", DEFAULT_FIB_BREAKEVEN_BUFFER_R)
+                            initial_risk_pu = trade_details.get('initial_risk_per_unit', 0)
+                            if initial_risk_pu > 0:
+                                if trade_details['side'] == "LONG":
+                                    new_sl_price_staged = trade_details['entry_price'] + (initial_risk_pu * buffer_r)
+                                else: # SHORT
+                                    new_sl_price_staged = trade_details['entry_price'] - (initial_risk_pu * buffer_r)
+                                sl_adjustment_reason_staged = f"TP1_HIT_SL_TO_BREAKEVEN_PLUS_{buffer_r}R"
+                            else: print(f"[{symbol}] Cannot calculate breakeven SL after TP1: initial_risk_per_unit is zero.")
+                        elif sl_action_tp1 == "trailing":
+                            # Micro-pivot logic will be evaluated below, this flag indicates it *can* run.
+                            sl_adjustment_reason_staged = "TP1_HIT_ACTIVATE_TRAILING" 
+                            # No immediate SL price change here; trailing logic will determine it.
+                        elif sl_action_tp1 == "original":
+                            sl_adjustment_reason_staged = "TP1_HIT_SL_ORIGINAL"
+                            new_sl_price_staged = trade_details['initial_sl_price'] # Keep original SL price
+                        
+                        # Update current_sl_for_dynamic_check if SL is moved to BE/Original explicitly here
+                        if new_sl_price_staged is not None: current_sl_for_dynamic_check = new_sl_price_staged
+
+
+                    if tp2_hit and trade_details.get('sl_management_stage') in ["initial", "after_tp1"]: # Can jump to after_tp2 if TP1&2 hit same time
+                        sl_action_tp2 = configs.get("fib_sl_adjustment_after_tp2", DEFAULT_FIB_SL_ADJUSTMENT_AFTER_TP2)
+                        print(f"[{symbol}] TP2 hit. SL management stage moving to 'after_tp2'. Action: {sl_action_tp2}")
+                        trade_details['sl_management_stage'] = "after_tp2" # Update state
+
+                        if sl_action_tp2 == "micro_pivot":
+                            sl_adjustment_reason_staged = "TP2_HIT_ACTIVATE_MICRO_PIVOT"
+                            # Micro-pivot logic will be evaluated below.
+                        elif sl_action_tp2 == "atr_trailing":
+                            sl_adjustment_reason_staged = "TP2_HIT_ACTIVATE_ATR_TRAILING (Not Implemented, fallback to MicroPivot/Original)"
+                             # TODO: Implement standard ATR trailing or fallback
+                        elif sl_action_tp2 == "original":
+                            sl_adjustment_reason_staged = "TP2_HIT_SL_AS_PER_AFTER_TP1_STAGE"
+                            # SL remains as it was after TP1 adjustment (or initial if TP1 was skipped)
+                            new_sl_price_staged = current_sl_for_dynamic_check # Keep SL from previous stage
+                        
+                        # Update current_sl_for_dynamic_check if SL is modified explicitly here
+                        if new_sl_price_staged is not None: current_sl_for_dynamic_check = new_sl_price_staged
+
+
+                    # If an explicit SL price was determined by TP1/TP2 hit logic (e.g. breakeven)
+                    if new_sl_price_staged is not None and abs(new_sl_price_staged - trade_details['current_sl_price']) > 1e-9 :
+                        # This new_sl_price_staged will be a candidate for final_new_sl
+                        # It will be compared against standard dynamic adjustments and micro-pivot adjustments later.
+                        # For now, we make it the baseline if it's better than current.
+                        p_prec_staged = int(trade_details['symbol_info'].get('pricePrecision', 2))
+                        new_sl_price_staged_rounded = round(new_sl_price_staged, p_prec_staged)
+
+                        # Check if this staged SL is an improvement
+                        is_improvement = False
+                        if trade_details['side'] == "LONG" and new_sl_price_staged_rounded > trade_details['current_sl_price']:
+                            is_improvement = True
+                        elif trade_details['side'] == "SHORT" and new_sl_price_staged_rounded < trade_details['current_sl_price']:
+                            is_improvement = True
+                        
+                        if is_improvement:
+                            print(f"[{symbol}] Staged SL after TP hit ({sl_adjustment_reason_staged}): {new_sl_price_staged_rounded}")
+                            # This becomes a candidate for the SL. The main SL update logic later will handle order replacement.
+                            # We update current_sl_for_dynamic_check so subsequent logic uses this new baseline.
+                            current_sl_for_dynamic_check = new_sl_price_staged_rounded
+                            # It will be fed into `potential_new_sl_standard` or `final_new_sl` decision process.
+                            # Forcing it into potential_new_sl_standard to ensure it's considered:
+                            if potential_new_sl_standard is None:
+                                potential_new_sl_standard = new_sl_price_staged_rounded
+                            else:
+                                if trade_details['side'] == "LONG":
+                                    potential_new_sl_standard = max(potential_new_sl_standard, new_sl_price_staged_rounded)
+                                else:
+                                    potential_new_sl_standard = min(potential_new_sl_standard, new_sl_price_staged_rounded)
+                        else:
+                            print(f"[{symbol}] Staged SL after TP hit ({sl_adjustment_reason_staged}) {new_sl_price_staged_rounded} is not an improvement over current SL {trade_details['current_sl_price']}. No explicit change yet.")
+            # --- End Staged SL Management ---
+
+        # Dynamic SL/TP adjustment logic (Standard profit-based and Micro-Pivot)
         try: cur_price = float(client.futures_ticker(symbol=symbol)['lastPrice'])
         except Exception as e: print(f"Error getting ticker for {symbol} in monitor: {e}"); continue
 
@@ -4019,22 +4332,21 @@ def monitor_active_trades(client, configs): # Needs lock for active_trades acces
         position_side_for_sl_tp = original_trade_side
         updated_orders = False
 
-        # Determine current SL and TP(s) for check_and_adjust_sl_tp_dynamic
+        # Determine current SL and TP(s) for dynamic checks
         current_sl_for_dynamic_check = trade_details['current_sl_price']
         current_tp_for_dynamic_check = None 
         initial_sl_for_dynamic_check = trade_details['initial_sl_price']
         initial_tp_for_dynamic_check = None
-
+        
         is_multi_tp_strategy = trade_details.get('strategy_type') == "FIBONACCI_MULTI_TP"
+        # The new Micro-Pivot SL can apply to any strategy type if enabled in configs.
 
-        if not is_multi_tp_strategy: # For single TP strategies
+        if not is_multi_tp_strategy: # For single TP strategies (e.g. EMA Cross)
             current_tp_for_dynamic_check = trade_details.get('current_tp_price')
             initial_tp_for_dynamic_check = trade_details.get('initial_tp_price')
 
-        # Standard dynamic SL/TP adjustment (e.g., based on fixed profit percentages)
-        # `check_and_adjust_sl_tp_dynamic` returns (potential_new_sl, potential_new_tp, adjustment_reason)
-        # where potential_new_tp is None if TPs are not managed by this function (e.g. multi-TP)
-        potential_new_sl, potential_new_tp, _ = check_and_adjust_sl_tp_dynamic(
+        # Standard dynamic SL/TP adjustment (e.g., based on fixed profit percentages like SL to BE+0.2%)
+        potential_new_sl_standard, potential_new_tp_standard, standard_adj_reason = check_and_adjust_sl_tp_dynamic(
             cur_price,
             trade_details['entry_price'],
             initial_sl_for_dynamic_check,
@@ -4043,97 +4355,142 @@ def monitor_active_trades(client, configs): # Needs lock for active_trades acces
             current_tp_for_dynamic_check, 
             trade_details['side']
         )
-        
-        # Initialize final SL to be used; it might be further updated by micro-pivot logic
-        # `potential_new_sl` from the function above is the result of standard profit-based SL adjustment.
-        # If no standard adjustment was made, `potential_new_sl` will be None.
-        # `final_new_sl` will track the SL to actually be set.
-        final_new_sl = potential_new_sl 
+        if standard_adj_reason:
+            print(f"[{symbol}] Standard dynamic adjustment proposed: SL={potential_new_sl_standard}, TP={potential_new_tp_standard}, Reason: {standard_adj_reason}")
 
-        # --- Micro-Pivot SL Adjustment for Fibonacci Multi-TP Strategy ---
-        if is_multi_tp_strategy: 
-            unrealized_pnl = calculate_unrealized_pnl(trade_details, cur_price)
-            # Ensure initial_sl_price exists before calculating initial_risk_amount
-            initial_sl_price_for_risk_calc = trade_details.get('initial_sl_price')
-            if initial_sl_price_for_risk_calc is None:
-                print(f"[{symbol}] Warning: initial_sl_price missing for Fib trade, cannot calculate R for micro-pivot check.")
-                initial_risk_amount = 0 
-            else:
-                initial_risk_amount = abs(trade_details['entry_price'] - initial_sl_price_for_risk_calc) * trade_details['quantity']
-            
-            if initial_risk_amount > 0 and (unrealized_pnl / initial_risk_amount) >= MICRO_PIVOT_PROFIT_THRESHOLD_R:
-                print(f"[{symbol}] Fib trade in profit >= {MICRO_PIVOT_PROFIT_THRESHOLD_R}R. Checking for micro-pivot SL adjustment.")
-                
-                buffer_1m_df = None
-                with symbol_1m_candle_buffers_lock:
-                    if symbol in symbol_1m_candle_buffers and len(symbol_1m_candle_buffers[symbol]) > 0:
-                        records = []
-                        deque_buffer = symbol_1m_candle_buffers[symbol]
-                        for s_candle in deque_buffer:
-                            if isinstance(s_candle, pd.Series) and isinstance(s_candle.name, pd.Timestamp):
-                                record = s_candle.to_dict()
-                                record['timestamp'] = s_candle.name 
-                                records.append(record)
-                            else: print(f"[{symbol}] Warning: Unexpected item in 1m buffer: {type(s_candle)}")
-                        if not records: 
-                            buffer_1m_df = pd.DataFrame()
-                            print(f"[{symbol}] No valid records to form 1m DataFrame for pivot check.")
-                        else: 
-                            try:
-                                buffer_1m_df = pd.DataFrame(records).set_index('timestamp')
-                                if not all(c in buffer_1m_df for c in ['high', 'low', 'close']):
-                                    print(f"[{symbol}] 1m DataFrame missing required columns (high, low, close) after conversion.")
-                                    buffer_1m_df = None 
-                            except Exception as e_df_conv:
-                                print(f"[{symbol}] Error converting 1m buffer records to DataFrame: {e_df_conv}")
-                                buffer_1m_df = None
+        # Initialize final SL to be set; it will be the best of standard adjustment or micro-pivot adjustment.
+        final_new_sl = potential_new_sl_standard # Start with the standard adjustment's proposal (could be None if no change)
+
+        # --- Micro-Pivot Trailing SL (Applies if enabled in config, AND if specific Fib stage allows it or if not a Fib trade) ---
+        apply_micro_pivot_logic = False
+        global_micro_pivot_enabled = configs.get("micro_pivot_trailing_sl", False)
+
+        if global_micro_pivot_enabled:
+            if is_multi_tp_strategy: # Fibonacci strategy with stages
+                sl_stage = trade_details.get('sl_management_stage', 'initial')
+                fib_sl_action_tp1 = configs.get("fib_move_sl_after_tp1", DEFAULT_FIB_MOVE_SL_AFTER_TP1)
+                fib_sl_action_tp2 = configs.get("fib_sl_adjustment_after_tp2", DEFAULT_FIB_SL_ADJUSTMENT_AFTER_TP2)
+
+                if (sl_stage == "after_tp1" and fib_sl_action_tp1 == "trailing") or \
+                   (sl_stage == "after_tp2" and fib_sl_action_tp2 == "micro_pivot"):
+                    apply_micro_pivot_logic = True
+                elif sl_stage == "initial": # If TP1 not hit yet, standard profit threshold applies
+                    pass # apply_micro_pivot_logic remains False unless profit threshold met below
+            else: # Not a Fibonacci strategy, standard profit threshold applies
+                pass # apply_micro_pivot_logic remains False unless profit threshold met below
+
+            # General condition for non-Fib or Fib-initial stage: Profit threshold check
+            if not apply_micro_pivot_logic: # Only check this if not already enabled by Fib stage
+                unrealized_pnl_for_micro_pivot = calculate_unrealized_pnl(trade_details, cur_price)
+                initial_sl_price_for_r_calc = trade_details.get('initial_sl_price')
+                initial_risk_per_unit_for_micro_pivot = 0
+                if initial_sl_price_for_r_calc and trade_details['entry_price'] != initial_sl_price_for_r_calc:
+                    initial_risk_per_unit_for_micro_pivot = abs(trade_details['entry_price'] - initial_sl_price_for_r_calc)
+
+                if initial_risk_per_unit_for_micro_pivot > 0:
+                    current_profit_in_r_for_micro_pivot = unrealized_pnl_for_micro_pivot / (initial_risk_per_unit_for_micro_pivot * trade_details['quantity'])
+                    profit_threshold_r_config = configs.get("micro_pivot_profit_threshold_r", DEFAULT_MICRO_PIVOT_PROFIT_THRESHOLD_R)
+                    if current_profit_in_r_for_micro_pivot >= profit_threshold_r_config:
+                        apply_micro_pivot_logic = True
+                        print(f"[{symbol}] Trade profit ({current_profit_in_r_for_micro_pivot:.2f}R) >= threshold ({profit_threshold_r_config}R). Activating Micro-Pivot SL logic.")
+                elif is_multi_tp_strategy and trade_details.get('sl_management_stage', 'initial') != 'initial':
+                    # If Fib strategy is past TP1/TP2 and specific trailing is enabled, but R calc failed (e.g. SL was at BE)
+                    # We might still want to apply micro-pivot if the stage dictates it.
+                    # This case is covered by the Fib-stage specific checks above.
+                    pass
+
+
+        if apply_micro_pivot_logic:
+            print(f"[{symbol}] Evaluating Micro-Pivot SL logic. Current SL for dynamic check: {current_sl_for_dynamic_check}")
+            # Fetch or get 1-minute candle buffer
+            buffer_1m_df = None
+            with symbol_1m_candle_buffers_lock: # Assuming buffer is populated elsewhere for active trades
+                        if symbol in symbol_1m_candle_buffers and len(symbol_1m_candle_buffers[symbol]) > 0:
+                            # Convert deque of Series to DataFrame for pivot/ATR calculation
+                            # This logic is similar to how it's done for Fib strategy monitoring
+                            records = [s.to_dict() for s in symbol_1m_candle_buffers[symbol] if isinstance(s, pd.Series)]
+                            if records:
+                                temp_df = pd.DataFrame(records)
+                                # Ensure 'timestamp' is the index if not already set by Series name
+                                if 'timestamp' not in temp_df.columns and symbol_1m_candle_buffers[symbol][0].name is not None:
+                                     temp_df.index = [s.name for s in symbol_1m_candle_buffers[symbol]]
+                                elif 'timestamp' in temp_df.columns:
+                                     temp_df.set_index('timestamp', inplace=True)
                                 
-                if buffer_1m_df is not None and not buffer_1m_df.empty and all(c in buffer_1m_df for c in ['high', 'low', 'close']):
-                    fib_atr_period_for_sl_buffer = configs.get("fib_atr_period", DEFAULT_FIB_ATR_PERIOD)
-                    current_atr_1m_for_buffer = 0
-                    if len(buffer_1m_df) >= fib_atr_period_for_sl_buffer:
-                        atr_1m_series = calculate_atr(buffer_1m_df.copy(), period=fib_atr_period_for_sl_buffer)
-                        current_atr_1m_for_buffer = atr_1m_series.iloc[-1] if not atr_1m_series.empty and pd.notna(atr_1m_series.iloc[-1]) else 0
-                    else: print(f"[{symbol}] Insufficient 1m data ({len(buffer_1m_df)}) for ATR ({fib_atr_period_for_sl_buffer}) calc in micro-pivot SL.")
-                    
-                    sl_micro_buffer = current_atr_1m_for_buffer * MICRO_PIVOT_SL_BUFFER_ATR_MULT
-                    if sl_micro_buffer <=0 : sl_micro_buffer = (1 / (10**int(s_info.get('pricePrecision',2)))) * 2
+                                if all(c in temp_df for c in ['high', 'low', 'close']):
+                                    buffer_1m_df = temp_df
+                                else: print(f"[{symbol}] 1m buffer DataFrame missing required columns for Micro-Pivot SL.")
+                            else: print(f"[{symbol}] No valid records in 1m buffer for Micro-Pivot SL.")
+                        else: # If buffer not populated, try to fetch on demand
+                            print(f"[{symbol}] 1m buffer empty or not found. Attempting on-demand fetch for Micro-Pivot SL...")
+                            # Fetch, e.g., last 60 1-min candles. Configurable limit might be needed.
+                            # DEFAULT_1M_BUFFER_SIZE is 200, which is plenty.
+                            fetched_klines_1m_df, fetch_err = get_historical_klines_1m(client, symbol, limit=DEFAULT_1M_BUFFER_SIZE)
+                            if not fetch_err and not fetched_klines_1m_df.empty:
+                                buffer_1m_df = fetched_klines_1m_df
+                                print(f"[{symbol}] Fetched {len(buffer_1m_df)} 1m klines for Micro-Pivot SL.")
+                                # Optionally, update the main buffer here too if design allows/requires
+                                # for s_row_idx in range(len(buffer_1m_df)):
+                                #    update_1m_candle_buffer(symbol, buffer_1m_df.iloc[s_row_idx], DEFAULT_1M_BUFFER_SIZE)
+                            else: print(f"[{symbol}] Failed to fetch 1m klines for Micro-Pivot SL. Error: {fetch_err}")
 
-                    latest_high_time, latest_pivot_high, latest_low_time, latest_pivot_low = get_latest_pivots_from_buffer(
-                        buffer_1m_df, MICRO_PIVOT_N_LEFT_1M, MICRO_PIVOT_N_RIGHT_1M
-                    )
-                    
-                    micro_pivot_sl_candidate = None
-                    if trade_details['side'] == "LONG" and latest_pivot_low is not None:
-                        # Ensure pivot is "new" (e.g. more recent than SL set time, or simply higher than current SL)
-                        # For now, just check if it offers a better SL.
-                        potential_sl = latest_pivot_low - sl_micro_buffer
-                        if potential_sl > current_sl_for_dynamic_check: # If this pivot offers a tighter SL
-                            # SL should be at least breakeven
-                            micro_pivot_sl_candidate = max(trade_details['entry_price'], potential_sl)
-                            print(f"[{symbol}] LONG Micro-pivot SL candidate: {micro_pivot_sl_candidate:.{s_info['pricePrecision']}f} (Pivot Low: {latest_pivot_low} at {latest_low_time})")
+
+                        if buffer_1m_df is not None and not buffer_1m_df.empty and all(c in buffer_1m_df for c in ['high', 'low', 'close']):
+                            # Config for ATR period for micro-pivot SL buffer (can be new or reuse e.g. fib_atr_period)
+                            # Let's assume a default or use fib_atr_period for now.
+                            # For user request: "small ATR buffer (0.25 × ATR)" - implies ATR is from 1-min chart.
+                            micro_pivot_atr_period_1m = configs.get("fib_atr_period", DEFAULT_FIB_ATR_PERIOD) # Re-use for now
                             
-                    elif trade_details['side'] == "SHORT" and latest_pivot_high is not None:
-                        potential_sl = latest_pivot_high + sl_micro_buffer
-                        if potential_sl < current_sl_for_dynamic_check: # Tighter SL
-                            micro_pivot_sl_candidate = min(trade_details['entry_price'], potential_sl)
-                            print(f"[{symbol}] SHORT Micro-pivot SL candidate: {micro_pivot_sl_candidate:.{s_info['pricePrecision']}f} (Pivot High: {latest_pivot_high} at {latest_high_time})")
+                            current_atr_1m_for_buffer = 0
+                            if len(buffer_1m_df) >= micro_pivot_atr_period_1m:
+                                atr_1m_series = calculate_atr(buffer_1m_df.copy(), period=micro_pivot_atr_period_1m)
+                                if not atr_1m_series.empty and pd.notna(atr_1m_series.iloc[-1]):
+                                    current_atr_1m_for_buffer = atr_1m_series.iloc[-1]
+                            else: print(f"[{symbol}] Insufficient 1m data ({len(buffer_1m_df)}) for ATR ({micro_pivot_atr_period_1m}) calc in Micro-Pivot SL.")
+                            
+                            sl_micro_buffer_val = current_atr_1m_for_buffer * configs.get("micro_pivot_buffer_atr", DEFAULT_MICRO_PIVOT_BUFFER_ATR)
+                            # Ensure buffer is at least a few ticks if ATR is tiny or zero
+                            min_tick_val = 1 / (10**int(s_info.get('pricePrecision',2)))
+                            if sl_micro_buffer_val < min_tick_val * 2 : sl_micro_buffer_val = min_tick_val * 2
 
-                    if micro_pivot_sl_candidate is not None:
-                        # Compare with SL from standard adjustment (if any) and current SL
-                        # Prioritize the tightest valid SL
-                        if final_new_sl is not None: # If standard adjustment already proposed an SL
-                            if trade_details['side'] == "LONG": final_new_sl = max(final_new_sl, micro_pivot_sl_candidate)
-                            else: final_new_sl = min(final_new_sl, micro_pivot_sl_candidate)
-                        else: # No standard adjustment, compare with current SL
-                            if (trade_details['side'] == "LONG" and micro_pivot_sl_candidate > current_sl_for_dynamic_check) or \
-                               (trade_details['side'] == "SHORT" and micro_pivot_sl_candidate < current_sl_for_dynamic_check):
-                                final_new_sl = micro_pivot_sl_candidate
-                        print(f"[{symbol}] Micro-pivot logic updated SL to: {final_new_sl:.{s_info['pricePrecision']}f}")
-                else:
-                    print(f"[{symbol}] Could not get valid 1m buffer or ATR for micro-pivot SL check.")
-        
-        # Use `final_new_sl` for SL adjustment logic below. `new_tp_single` is only for non-multi-TP.
+                            # Get latest 1-min pivots
+                            # Using existing constants MICRO_PIVOT_N_LEFT_1M, MICRO_PIVOT_N_RIGHT_1M (3,1)
+                            _, latest_pivot_high_1m, _, latest_pivot_low_1m = get_latest_pivots_from_buffer(
+                                buffer_1m_df, MICRO_PIVOT_N_LEFT_1M, MICRO_PIVOT_N_RIGHT_1M
+                            )
+                            
+                            micro_pivot_sl_candidate = None
+                            if trade_details['side'] == "LONG" and latest_pivot_low_1m is not None:
+                                potential_mp_sl = latest_pivot_low_1m - sl_micro_buffer_val
+                                # SL must be an improvement (higher) and at least breakeven
+                                if potential_mp_sl > current_sl_for_dynamic_check and potential_mp_sl >= trade_details['entry_price']:
+                                    micro_pivot_sl_candidate = potential_mp_sl
+                                    print(f"[{symbol}] LONG Micro-Pivot SL candidate: {micro_pivot_sl_candidate:.{s_info['pricePrecision']}f} (Pivot Low 1m: {latest_pivot_low_1m}, Buffer: {sl_micro_buffer_val:.{s_info['pricePrecision']}f})")
+                                    
+                            elif trade_details['side'] == "SHORT" and latest_pivot_high_1m is not None:
+                                potential_mp_sl = latest_pivot_high_1m + sl_micro_buffer_val
+                                if potential_mp_sl < current_sl_for_dynamic_check and potential_mp_sl <= trade_details['entry_price']:
+                                    micro_pivot_sl_candidate = potential_mp_sl
+                                    print(f"[{symbol}] SHORT Micro-Pivot SL candidate: {micro_pivot_sl_candidate:.{s_info['pricePrecision']}f} (Pivot High 1m: {latest_pivot_high_1m}, Buffer: {sl_micro_buffer_val:.{s_info['pricePrecision']}f})")
+
+                            if micro_pivot_sl_candidate is not None:
+                                # Compare with SL from standard adjustment (if any) and current SL. Prioritize the tightest valid SL.
+                                if final_new_sl is not None: # If standard adjustment already proposed an SL
+                                    if trade_details['side'] == "LONG": final_new_sl = max(final_new_sl, micro_pivot_sl_candidate)
+                                    else: final_new_sl = min(final_new_sl, micro_pivot_sl_candidate) # For SHORT, tighter is smaller
+                                else: # No standard adjustment, compare micro_pivot_sl_candidate with current_sl_for_dynamic_check
+                                    # This condition is already checked when setting micro_pivot_sl_candidate
+                                    final_new_sl = micro_pivot_sl_candidate
+                                print(f"[{symbol}] Micro-Pivot logic updated SL to: {final_new_sl:.{s_info['pricePrecision']}f}")
+                        else:
+                            print(f"[{symbol}] Could not get valid 1m buffer or ATR for Micro-Pivot SL check.")
+        # else: Profit threshold not met for micro-pivot
+        else: # Initial risk per unit is zero (e.g. initial_sl_price was None or at entry)
+            print(f"[{symbol}] Cannot calculate profit in R for Micro-Pivot SL as initial_risk_per_unit is zero.")
+    # --- End Micro-Pivot SL Adjustment ---
+                
+        # Use `final_new_sl` (which is best of standard or micro-pivot) for SL adjustment logic below.
+        # `potential_new_tp_standard` is only for non-multi-TP strategies' TP adjustment.
 
         # Calculate remaining quantity if any TPs have filled (for multi-TP)
         # For single TP, remaining_quantity is just the trade_details['quantity'] unless SL/TP hit.
@@ -4142,46 +4499,84 @@ def monitor_active_trades(client, configs): # Needs lock for active_trades acces
             qty_filled_by_tps = sum(
                 tp.get('quantity', 0) for tp in trade_details['tp_orders'] if tp.get('status') == "FILLED" and tp.get('id') is not None
             )
-            remaining_quantity = trade_details['quantity'] - qty_filled_by_tps
-            if remaining_quantity < 0: remaining_quantity = 0
+            # Ensure qty_filled_by_tps is float for arithmetic operation
+            remaining_quantity = float(trade_details['quantity']) - float(qty_filled_by_tps)
+            if remaining_quantity < 0: remaining_quantity = 0.0
         
+        # Ensure remaining_quantity is correctly rounded to symbol's quantityPrecision before use
+        q_prec_current_trade = int(s_info.get('quantityPrecision', 0))
+        remaining_quantity = round(remaining_quantity, q_prec_current_trade)
+
         min_qty_val = float(s_info.get('filters', [{}])[0].get('minQty', '0.001')) # Simplified minQty fetch
+        
         if remaining_quantity < min_qty_val: # If remaining is dust or zero
-            print(f"Remaining quantity for {symbol} ({remaining_quantity}) is less than minQty ({min_qty_val}). No SL adjustment. Position should close if not already.")
+            print(f"[{symbol}] Remaining quantity ({remaining_quantity}) is less than minQty ({min_qty_val}). No SL adjustment. Position should close if not already.")
         elif final_new_sl is not None and abs(final_new_sl - current_sl_for_dynamic_check) > 1e-9: # If SL needs adjustment
-            print(f"Adjusting SL for {symbol} ({position_side_for_sl_tp}) to {final_new_sl:.{s_info['pricePrecision']}f} for remaining Qty {remaining_quantity}")
-            if trade_details.get('sl_order_id'): # Cancel old SL
-                try: client.futures_cancel_order(symbol=symbol, orderId=trade_details['sl_order_id'])
-                except Exception as e: print(f"Warn: Old SL {trade_details['sl_order_id']} for {symbol} cancel fail: {e}")
-            
-            sl_ord_new, sl_err_msg_new = place_new_order(client,
-                                         s_info,
-                                         "SELL" if original_trade_side == "LONG" else "BUY",
-                                         "STOP_MARKET",
-                                         remaining_quantity, # Use remaining quantity for new SL
-                                         stop_price=final_new_sl,
-                                         position_side=position_side_for_sl_tp,
-                                         is_closing_order=True)
-            if sl_ord_new:
-                with active_trades_lock:
-                    if symbol in active_trades:
-                         active_trades[symbol]['current_sl_price'] = final_new_sl
-                         active_trades[symbol]['sl_order_id'] = sl_ord_new.get('orderId')
-                         # active_trades[symbol]['quantity'] should also be updated if this is due to partial TP.
-                         # This is tricky. For now, 'quantity' in active_trades means original full quantity.
-                         # We'd need a 'remaining_quantity' field or adjust 'quantity'.
-                         # Let's assume `monitor_active_trades` itself will update `active_trades[symbol]['quantity']`
-                         # if a partial TP is detected as filled.
-                         # For now, this SL adjustment uses `remaining_quantity` for the order,
-                         # but `active_trades` quantity field isn't changed here.
-                         updated_orders = True
-            else: 
-                print(f"CRITICAL: FAILED TO PLACE NEW DYNAMIC SL FOR {symbol}! Error: {sl_err_msg_new}")
+            # Ensure final_new_sl is also rounded to pricePrecision
+            p_prec_current_trade = int(s_info.get('pricePrecision', 2))
+            final_new_sl_rounded = round(final_new_sl, p_prec_current_trade)
+
+            # Final check: SL must not cross entry in the wrong direction
+            if (trade_details['side'] == "LONG" and final_new_sl_rounded >= cur_price) or \
+               (trade_details['side'] == "SHORT" and final_new_sl_rounded <= cur_price):
+                print(f"[{symbol}] Proposed new SL {final_new_sl_rounded} would be triggered by current price {cur_price}. SL adjustment SKIPPED.")
+            elif (trade_details['side'] == "LONG" and final_new_sl_rounded >= trade_details['entry_price'] and final_new_sl_rounded < current_sl_for_dynamic_check) or \
+                 (trade_details['side'] == "SHORT" and final_new_sl_rounded <= trade_details['entry_price'] and final_new_sl_rounded > current_sl_for_dynamic_check):
+                 # This condition means SL is being moved to BE or profit, but it's not as good as current SL. This path should be rare if logic is right.
+                 # More importantly, if current SL is already in profit, and new SL is also in profit but worse, we might not want to move it "back".
+                 # The max/min logic when choosing between standard and micro-pivot should handle picking the "better" profitable SL.
+                 # This check is more about ensuring the SL is valid relative to entry if it's being moved towards it.
+                 pass # This is acceptable (e.g. moving to BreakEven)
+
+            else: # SL is valid to be placed
+                print(f"[{symbol}] Adjusting SL for {position_side_for_sl_tp} from {current_sl_for_dynamic_check:.{p_prec_current_trade}f} to {final_new_sl_rounded:.{p_prec_current_trade}f} for remaining Qty {remaining_quantity}")
+                if trade_details.get('sl_order_id'): # Cancel old SL
+                    try: client.futures_cancel_order(symbol=symbol, orderId=trade_details['sl_order_id'])
+                    except Exception as e: print(f"Warn: Old SL {trade_details['sl_order_id']} for {symbol} cancel fail: {e}")
+                
+                sl_ord_new, sl_err_msg_new = place_new_order(client,
+                                             s_info,
+                                             "SELL" if original_trade_side == "LONG" else "BUY",
+                                             "STOP_MARKET",
+                                             remaining_quantity, 
+                                             stop_price=final_new_sl_rounded,
+                                             position_side=position_side_for_sl_tp,
+                                             is_closing_order=True)
+                if sl_ord_new:
+                    with active_trades_lock:
+                        if symbol in active_trades: # Check if trade still exists
+                             active_trades[symbol]['current_sl_price'] = final_new_sl_rounded
+                             active_trades[symbol]['sl_order_id'] = sl_ord_new.get('orderId')
+                             # If remaining_quantity changed due to partial TP, active_trades[symbol]['quantity'] should be updated
+                             # This update should happen where partial TP is detected and processed.
+                             # For now, assuming 'quantity' reflects remaining open quantity for the purpose of new SL order.
+                             updated_orders = True
+                             # Send Telegram notification for SL adjustment
+                             if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+                                 sl_adj_msg = (
+                                     f"⚙️ SL ADJUSTED (Micro-Pivot/Dynamic) ⚙️\n\n"
+                                     f"Symbol: `{symbol}` ({trade_details['side']})\n"
+                                     f"Old SL: `{current_sl_for_dynamic_check:.{p_prec_current_trade}f}`\n"
+                                     f"New SL: `{final_new_sl_rounded:.{p_prec_current_trade}f}`\n"
+                                     f"Quantity: `{remaining_quantity:.{q_prec_current_trade}f}`\n"
+                                     f"Entry: `{trade_details['entry_price']:.{p_prec_current_trade}f}` | Current Price: `{cur_price:.{p_prec_current_trade}f}`"
+                                 )
+                                 send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], sl_adj_msg)
+                else: 
+                    errMsgSL = f"CRITICAL: FAILED TO PLACE NEW DYNAMIC SL FOR {symbol}! Error: {sl_err_msg_new}"
+                    print(errMsgSL)
+                    if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+                        send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], f"🆘 {errMsgSL}")
+
         
         # Dynamic TP adjustment for SINGLE TP strategies (Multi-TP handles TPs via their own orders)
-        if not is_multi_tp_strategy and potential_new_tp is not None and \
-           abs(potential_new_tp - trade_details.get('current_tp_price', 0)) > 1e-9:
-            print(f"Adjusting TP for {symbol} ({position_side_for_sl_tp}) to {potential_new_tp:.{s_info['pricePrecision']}f}")
+        # Uses potential_new_tp_standard from the standard dynamic adjustment logic
+        if not is_multi_tp_strategy and potential_new_tp_standard is not None and \
+           abs(potential_new_tp_standard - trade_details.get('current_tp_price', 0)) > 1e-9: # If TP needs adjustment
+            p_prec_current_trade = int(s_info.get('pricePrecision', 2))
+            potential_new_tp_standard_rounded = round(potential_new_tp_standard, p_prec_current_trade)
+
+            print(f"Adjusting TP for {symbol} ({position_side_for_sl_tp}) to {potential_new_tp_standard_rounded:.{s_info['pricePrecision']}f}")
             if trade_details.get('tp_order_id'): # Cancel old TP
                 try: client.futures_cancel_order(symbol=symbol, orderId=trade_details['tp_order_id'])
                 except Exception as e: print(f"Warn: Old TP {trade_details['tp_order_id']} for {symbol} cancel fail: {e}")
@@ -4191,13 +4586,13 @@ def monitor_active_trades(client, configs): # Needs lock for active_trades acces
                                          "SELL" if original_trade_side == "LONG" else "BUY",
                                          "TAKE_PROFIT_MARKET",
                                          remaining_quantity, # Should be full quantity if single TP
-                                         stop_price=potential_new_tp,
+                                         stop_price=potential_new_tp_standard_rounded,
                                          position_side=position_side_for_sl_tp,
                                          is_closing_order=True)
             if tp_ord_new:
                 with active_trades_lock:
-                     if symbol in active_trades:
-                        active_trades[symbol]['current_tp_price'] = potential_new_tp
+                     if symbol in active_trades: # Check if trade still exists
+                        active_trades[symbol]['current_tp_price'] = potential_new_tp_standard_rounded
                         active_trades[symbol]['tp_order_id'] = tp_ord_new.get('orderId')
                         updated_orders = True
             else: 
@@ -4464,6 +4859,27 @@ def trading_loop(client, configs, monitored_symbols):
                 ensure_sl_tp_for_all_open_positions(client, configs, active_trades, symbol_info_cache_for_safety_net)
                 print(f"SL/TP safety net check complete. {format_elapsed_time(cycle_start_time)}")
                 # --- End SL/TP Safety Net Check ---
+
+                # --- Update 1-minute Candle Buffers for Active Trades (for Micro-Pivot SL) ---
+                if configs.get("micro_pivot_trailing_sl", False) and active_trades:
+                    print(f"Updating 1-min candle buffers for {len(active_trades)} active trade(s) eligible for Micro-Pivot SL... {format_elapsed_time(cycle_start_time)}")
+                    active_trade_symbols_list = []
+                    with active_trades_lock: # Access active_trades safely
+                        active_trade_symbols_list = list(active_trades.keys())
+                    
+                    for sym_active in active_trade_symbols_list:
+                        # Fetch the very latest 1-minute kline
+                        # Limit to 2 to get the last closed and current forming (or just last closed if current not formed)
+                        latest_1m_klines_df, err_1m = get_historical_klines_1m(client, sym_active, limit=2)
+                        if not err_1m and not latest_1m_klines_df.empty:
+                            # The last row is the most recent candle (could be open or closed)
+                            # update_1m_candle_buffer handles duplicates and ordering
+                            last_1m_candle_series = latest_1m_klines_df.iloc[-1]
+                            update_1m_candle_buffer(sym_active, last_1m_candle_series, configs.get("fib_1m_buffer_size", DEFAULT_1M_BUFFER_SIZE))
+                            # print(f"Updated 1m buffer for active trade {sym_active} with candle {last_1m_candle_series.name}") # Verbose
+                        elif err_1m:
+                            print(f"Error fetching latest 1m kline for active trade {sym_active} buffer update: {err_1m}")
+                # --- End 1-minute Candle Buffer Update ---
                 
                 # --- Loop Delay ---
                 # Determine appropriate sleep time
