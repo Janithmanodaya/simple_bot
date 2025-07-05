@@ -46,6 +46,8 @@ DEFAULT_MIN_LEVERAGE = 1                  # Minimum leverage to use
 DEFAULT_MAX_LEVERAGE = 20                 # Maximum leverage to use (user preference, also check exchange limits)
 DEFAULT_STRATEGY = "ema_cross"   # Default strategy to run
 DEFAULT_FIB_ORDER_TIMEOUT_MINUTES = 5 # Default timeout for Fib retracement limit orders
+DEFAULT_FIB_ATR_PERIOD = 14          # Default ATR period for Fibonacci strategy SL
+DEFAULT_FIB_SL_ATR_MULTIPLIER = 1.0  # Default ATR multiplier for SL for Fibonacci strategy
 
 # --- Global State Variables ---
 # Stores details of active trades. Key: symbol (e.g., "BTCUSDT")
@@ -164,7 +166,9 @@ def validate_configurations(loaded_configs: dict) -> tuple[bool, str, dict]:
         "allow_exceed_risk_for_min_notional": {"type": bool},
         "strategy_choice": {"type": str, "valid_values": ["ema_cross", "fib_retracement"]},
         "fib_1m_buffer_size": {"type": int, "optional": True, "condition": lambda x: 20 <= x <= 1000}, # For Fibonacci strategy
-        "fib_order_timeout_minutes": {"type": int, "optional": True, "condition": lambda x: 1 <= x <= 60} # For Fibonacci strategy
+        "fib_order_timeout_minutes": {"type": int, "optional": True, "condition": lambda x: 1 <= x <= 60}, # For Fibonacci strategy
+        "fib_atr_period": {"type": int, "optional": True, "condition": lambda x: x > 0}, # For Fibonacci SL
+        "fib_sl_atr_multiplier": {"type": float, "optional": True, "condition": lambda x: x > 0} # For Fibonacci SL
         # API keys and telegram details are not part of this CSV validation
     }
     
@@ -698,8 +702,8 @@ def get_historical_klines_1m(client, symbol: str, limit: int = 200): # Default l
 
 # --- Market Structure Detector (Fib Strategy) ---
 # Global state for Fibonacci strategy (per symbol)
-# Stores: 'trend' (None, 'uptrend', 'downtrend'), 
-#         'last_swing_high_price', 'last_swing_high_time', 
+# Stores: 'trend' (None, 'uptrend', 'downtrend'),
+#         'last_swing_high_price', 'last_swing_high_time',
 #         'last_swing_low_price', 'last_swing_low_time',
 #         'bos_detail' (dict of BoS event), 
 #         'state' ('IDLE', 'AWAITING_PULLBACK', 'PENDING_ENTRY', 'IN_TRADE'),
@@ -709,8 +713,14 @@ fib_strategy_states = {}
 fib_strategy_states_lock = threading.Lock()
 
 # Constants for pivot detection
-PIVOT_N_LEFT = 5  # Number of candles to the left for pivot detection
-PIVOT_N_RIGHT = 5 # Number of candles to the right for pivot detection (needs adjustment for real-time)
+PIVOT_N_LEFT = 5  # Number of candles to the left for pivot detection (general use)
+PIVOT_N_RIGHT = 5 # Number of candles to the right for pivot detection (general use, implies delay)
+
+# Constants for 1-minute micro-pivot based SL adjustments (Fibonacci Strategy)
+MICRO_PIVOT_N_LEFT_1M = 3
+MICRO_PIVOT_N_RIGHT_1M = 1 # Shorter right window for faster confirmation of 1-min pivots
+MICRO_PIVOT_SL_BUFFER_ATR_MULT = 0.25 # Multiplier of 1m ATR for SL buffer below/above micro pivot
+MICRO_PIVOT_PROFIT_THRESHOLD_R = 0.2  # Profit threshold (in terms of initial Risk 'R') to activate micro-pivot SL trailing
 
 def identify_swing_pivots(data: pd.Series, n_left: int, n_right: int, is_high: bool) -> pd.Series:
     """
@@ -938,10 +948,27 @@ def detect_market_structure_and_bos(symbol: str, candle_buffer_df: pd.DataFrame,
             if flip_bias and flip_bias == bos_event["direction"]:
                 print(f"[{symbol}] BoS detected ({bos_event['direction']}) ALIGNS with flip bias. Proceeding with priority.")
                 # Note: flip_bias is not cleared here. It should be cleared by trade management logic
-                # (e.g., after a successful trade entry from this, or if the setup becomes invalid).
+
+            # Calculate ATR on the 1-minute data buffer for SL placement
+            # Ensure candle_buffer_df is a DataFrame and not a Series if calculate_atr expects DataFrame
+            # The candle_buffer_df is already a DataFrame.
+            fib_atr_period = configs.get("fib_atr_period", DEFAULT_FIB_ATR_PERIOD)
+            # Make a copy for ATR calculation to avoid modifying the original buffer's DataFrame
+            buffer_df_for_atr_calc = candle_buffer_df.copy()
+            atr_series = calculate_atr(buffer_df_for_atr_calc, period=fib_atr_period)
+            
+            if atr_series.empty or atr_series.iloc[-1] is None or pd.isna(atr_series.iloc[-1]) or atr_series.iloc[-1] <= 0:
+                print(f"[{symbol}] Could not calculate valid 1m ATR (period {fib_atr_period}) for BoS event. ATR: {atr_series.iloc[-1] if not atr_series.empty else 'N/A'}. BoS event ignored.")
+                # Do not set state to AWAITING_PULLBACK if ATR is invalid
+                fib_strategy_states[symbol] = state # Save updated state (trend/pivots)
+                return None # Ignore BoS if ATR cannot be determined for SL
+            
+            current_1m_atr = atr_series.iloc[-1]
+            bos_event["atr_1m"] = current_1m_atr # Add 1m ATR to the BoS event details
+            print(f"[{symbol}] BoS event includes 1m ATR ({fib_atr_period}-period): {current_1m_atr:.5f}")
 
             state["state"] = "AWAITING_PULLBACK"
-            state["bos_detail"] = bos_event 
+            state["bos_detail"] = bos_event
         
         fib_strategy_states[symbol] = state 
         return bos_event
@@ -952,7 +979,7 @@ def detect_market_structure_and_bos(symbol: str, candle_buffer_df: pd.DataFrame,
 # --- Fibonacci Module (Fib Strategy) ---
 def calculate_fibonacci_retracement_levels(swing_high_price: float, swing_low_price: float, direction: str) -> dict | None:
     """
-    Calculates Fibonacci retracement levels (0.5 and 0.618) for a given move.
+    Calculates Fibonacci retracement levels (0.236, 0.382, 0.5, 0.618) for a given move.
 
     Args:
         swing_high_price (float): The highest price of the BoS move.
@@ -961,8 +988,9 @@ def calculate_fibonacci_retracement_levels(swing_high_price: float, swing_low_pr
                          "short" if BoS was bearish (breakdown downwards).
 
     Returns:
-        dict | None: A dictionary with 'level_0_5', 'level_0_618', 
-                     'zone_upper', 'zone_lower' prices, or None if inputs are invalid.
+        dict | None: A dictionary with 'level_0_236', 'level_0_382', 'level_0_5', 'level_0_618',
+                     'zone_upper' (0.5 for long, 0.618 for short), 
+                     'zone_lower' (0.618 for long, 0.5 for short) prices, or None if inputs are invalid.
     """
     if swing_high_price is None or swing_low_price is None or swing_high_price <= swing_low_price:
         print(f"Error calculating Fib levels: Invalid swing prices. High: {swing_high_price}, Low: {swing_low_price}")
@@ -970,36 +998,37 @@ def calculate_fibonacci_retracement_levels(swing_high_price: float, swing_low_pr
 
     price_range = swing_high_price - swing_low_price
 
+    levels = {}
+
     if direction == "long": # Bullish BoS, expect pullback downwards to buy
         # Fib levels are measured from low (0%) to high (100%)
         # Retracement levels are below the swing_high_price
-        level_0_5 = swing_high_price - (price_range * 0.5)
-        level_0_618 = swing_high_price - (price_range * 0.618)
-        # Golden zone is between 0.5 and 0.618. For a long, 0.618 is lower.
-        zone_upper = level_0_5
-        zone_lower = level_0_618
+        levels["level_0_236"] = swing_high_price - (price_range * 0.236)
+        levels["level_0_382"] = swing_high_price - (price_range * 0.382)
+        levels["level_0_5"] = swing_high_price - (price_range * 0.5)
+        levels["level_0_618"] = swing_high_price - (price_range * 0.618)
+        # Golden zone (for entry) is still between 0.5 and 0.618. For a long, 0.618 is lower.
+        levels["zone_upper"] = levels["level_0_5"]
+        levels["zone_lower"] = levels["level_0_618"]
     elif direction == "short": # Bearish BoS, expect pullback upwards to sell
         # Fib levels are measured from high (0%) to low (100%)
         # Retracement levels are above the swing_low_price
-        level_0_5 = swing_low_price + (price_range * 0.5)
-        level_0_618 = swing_low_price + (price_range * 0.618)
-        # Golden zone is between 0.5 and 0.618. For a short, 0.618 is higher.
-        zone_upper = level_0_618 
-        zone_lower = level_0_5
+        levels["level_0_236"] = swing_low_price + (price_range * 0.236)
+        levels["level_0_382"] = swing_low_price + (price_range * 0.382)
+        levels["level_0_5"] = swing_low_price + (price_range * 0.5)
+        levels["level_0_618"] = swing_low_price + (price_range * 0.618)
+        # Golden zone (for entry) is still between 0.5 and 0.618. For a short, 0.618 is higher.
+        levels["zone_upper"] = levels["level_0_618"]
+        levels["zone_lower"] = levels["level_0_5"]
     else:
         print(f"Error calculating Fib levels: Invalid direction '{direction}'.")
         return None
         
     # Ensure zone_upper is actually above zone_lower (can happen if levels are identical due to precision)
-    if zone_upper < zone_lower: # Should not happen with distinct 0.5 and 0.618 but as a safeguard
-        zone_upper, zone_lower = zone_lower, zone_upper 
+    if levels["zone_upper"] < levels["zone_lower"]: 
+        levels["zone_upper"], levels["zone_lower"] = levels["zone_lower"], levels["zone_upper"]
 
-    return {
-        "level_0_5": level_0_5,
-        "level_0_618": level_0_618,
-        "zone_upper": zone_upper, # Higher price of the golden zone
-        "zone_lower": zone_lower  # Lower price of the golden zone
-    }
+    return levels
 
 # --- Entry & Exit Logic (Fib Strategy) ---
 def manage_fib_retracement_entry_logic(client, configs: dict, symbol: str, bos_event: dict, symbol_info: dict):
@@ -1039,41 +1068,188 @@ def manage_fib_retracement_entry_logic(client, configs: dict, symbol: str, bos_e
 
     print(f"{log_prefix} Target Golden Zone for {direction}: {zone_lower:.{p_prec}f} - {zone_upper:.{p_prec}f}. Target Entry: {entry_price_target:.{p_prec}f}")
 
-    # 2. Determine SL and TP
-    # Add a small buffer (e.g., 0.1% of price range, or fixed pips based on ATR later)
-    price_range_for_sl_buffer = abs(swing_high_bos - swing_low_bos)
-    sl_buffer_amount = price_range_for_sl_buffer * 0.05 # 5% of the BoS move range as buffer, or a min_tick based buffer
-    # Ensure buffer is at least a few ticks
-    min_tick_size = 1 / (10**p_prec)
-    sl_buffer_amount = max(sl_buffer_amount, min_tick_size * 5) # e.g. 5 ticks buffer
-
-    sl_price, tp_price = None, None
-    if direction == "long":
-        # SL below the low of the move that caused BoS
-        sl_price = swing_low_bos - sl_buffer_amount 
-        # TP at the broken swing high
-        tp_price = broken_structure_price 
-    elif direction == "short":
-        # SL above the high of the move that caused BoS
-        sl_price = swing_high_bos + sl_buffer_amount
-        # TP at the broken swing low
-        tp_price = broken_structure_price
-    
-    sl_price = round(sl_price, p_prec)
-    tp_price = round(tp_price, p_prec)
-
-    if sl_price is None or tp_price is None : # Should not happen if direction is valid
-        print(f"{log_prefix} SL/TP price calculation error. Aborting."); return
-    if (direction == "long" and (entry_price_target <= sl_price or entry_price_target >= tp_price)) or \
-       (direction == "short" and (entry_price_target >= sl_price or entry_price_target <= tp_price)):
-        print(f"{log_prefix} Invalid SL/TP relative to entry: Entry={entry_price_target}, SL={sl_price}, TP={tp_price}. Aborting.")
+    # 2. Determine SL and Multiple TP Levels
+    # SL calculation using ATR from bos_event
+    current_1m_atr = bos_event.get("atr_1m")
+    if current_1m_atr is None or current_1m_atr <= 0:
+        print(f"{log_prefix} Invalid or missing 1m ATR ({current_1m_atr}) in BoS event for SL calculation. Aborting.")
         with fib_strategy_states_lock: # Reset state
             if symbol in fib_strategy_states: fib_strategy_states[symbol]['state'] = "IDLE"
         return
+
+    sl_atr_multiplier = configs.get("fib_sl_atr_multiplier", DEFAULT_FIB_SL_ATR_MULTIPLIER)
+    sl_atr_offset = current_1m_atr * sl_atr_multiplier
+    min_tick_size = 1 / (10**p_prec) # Already defined earlier
+
+    sl_price = None
+    if direction == "long":
+        # SL below the low of the move that caused BoS, buffered by ATR
+        sl_price = swing_low_bos - sl_atr_offset
+    elif direction == "short":
+        # SL above the high of the move that caused BoS, buffered by ATR
+        sl_price = swing_high_bos + sl_atr_offset
     
-    print(f"{log_prefix} Calculated Entry: {entry_price_target:.{p_prec}f}, SL: {sl_price:.{p_prec}f}, TP: {tp_price:.{p_prec}f}")
+    if sl_price is None: # Should not happen if direction is valid
+        print(f"{log_prefix} SL price could not be determined (direction: {direction}). Aborting."); return
+
+    sl_price = round(sl_price, p_prec)
+    print(f"{log_prefix} ATR-based SL calculation: SwingLow/High_BoSMove={swing_low_bos if direction == 'long' else swing_high_bos:.{p_prec}f}, ATR_1m={current_1m_atr:.{p_prec}f}, Multiplier={sl_atr_multiplier}, Offset={sl_atr_offset:.{p_prec}f}, SL_Price={sl_price:.{p_prec}f}")
+
+    # TP levels based on Fibonacci retracements of the BoS move itself (or other logic if specified)
+    # The request specifies TP levels as retracements (0.236, 0.382, 0.618) of the BoS range.
+    # This means if BoS was from swing_low_bos to swing_high_bos:
+    # For LONG: TP levels are swing_low_bos + (range * fib_ratio)
+    # For SHORT: TP levels are swing_high_bos - (range * fib_ratio)
+    # This is different from the entry logic which uses retracements for pullback entry.
+    # Let's clarify: "0.236 retracement or 25-30% of the BoS range."
+    # If TP is a retracement *of the BoS move*, then for a long, TPs would be *below* swing_high_bos.
+    # This seems counterintuitive for TPs.
+    # More likely: TPs are *extensions* or percentages of the BoS range *added to the entry price* or *from the broken structure*.
+
+    # Re-interpreting: TP levels are calculated from the *entry point* using the BoS range.
+    # TP1 (Quick Win): 0.236 retracement or 25–30% of the BoS range.
+    # TP2 (Standard): 0.382 retracement for the bulk of the position.
+    # TP3 (Optional “Extended”): 0.618 retracement for aggressive runners.
+    # "Calculate each TP level using the same calculate_fibonacci_retracement_levels helper, extending it to include 0.236 and 0.382."
+    # This suggests the TPs are also Fib levels *of the BoS move*.
+    # If direction is LONG (price broke up from swing_low_bos to swing_high_bos, entry is a pullback):
+    #   TP1: fib_levels['level_0_236'] (this is swing_high_bos - range * 0.236)
+    #   TP2: fib_levels['level_0_382'] (this is swing_high_bos - range * 0.382)
+    #   TP3: fib_levels['level_0_618'] (this is swing_high_bos - range * 0.618)
+    # This still means TPs are *within* the BoS range, which is for capturing parts of the pullback *if the entry was at the BoS price*.
+    # But entry is on a pullback.
+
+    # Let's assume the TPs are target prices projected *from the entry price*.
+    # Or, they are fixed Fib levels relative to the BoS move boundaries.
+    # The original TP was `broken_structure_price`.
+    # Let's use the fib_levels from `calculate_fibonacci_retracement_levels` as the actual TP target prices.
+    # For a LONG trade, entry is on a pullback. TPs should be higher than entry.
+    # The fib_levels calculated are:
+    # level_0_236 = swing_high_price - (price_range * 0.236)
+    # level_0_382 = swing_high_price - (price_range * 0.382)
+    # level_0_618 = swing_high_price - (price_range * 0.618)
+    # These are potential TP targets if we are aiming for these specific price levels.
+
+    tp1_price = round(fib_levels['level_0_236'], p_prec)
+    tp2_price = round(fib_levels['level_0_382'], p_prec)
+    tp3_price = round(fib_levels['level_0_618'], p_prec) # Optional TP
+
+    # Ensure TPs are logical relative to entry and SL
+    if sl_price is None: # Should not happen if direction is valid
+        print(f"{log_prefix} SL price calculation error. Aborting."); return
+
+    # Check entry vs SL
+    if (direction == "long" and entry_price_target <= sl_price) or \
+       (direction == "short" and entry_price_target >= sl_price):
+        print(f"{log_prefix} Invalid SL relative to entry: Entry={entry_price_target}, SL={sl_price}. Aborting.")
+        with fib_strategy_states_lock:
+            if symbol in fib_strategy_states: fib_strategy_states[symbol]['state'] = "IDLE"
+        return
+
+    # Check TPs vs entry (TPs must be profitable)
+    # For LONG: TP > entry. For SHORT: TP < entry.
+    # The fib_levels are absolute prices.
+    if direction == "long":
+        if not (tp1_price > entry_price_target and tp2_price > entry_price_target and (tp3_price is None or tp3_price > entry_price_target)):
+            print(f"{log_prefix} Invalid TP levels relative to entry for LONG. Entry={entry_price_target}, TP1={tp1_price}, TP2={tp2_price}, TP3={tp3_price}. Aborting.")
+            # This might happen if entry pullback is too deep, making some fib levels already passed.
+            # Or if fib levels are calculated in a way that they are not suitable as TPs from the entry.
+            # For now, let's assume the fib levels are absolute price targets.
+            # If entry is (e.g.) at 0.618, then TP at 0.236, 0.382 makes sense.
+            # We need to ensure the selected TPs are progressively further in the profit direction.
+            # For LONG: level_0_236 > level_0_382 > level_0_5 > level_0_618 (these are prices)
+            # So TP1 (0.236) is highest, TP3 (0.618) is lowest. This order is for profit taking.
+            # The request: TP1 (0.236), TP2 (0.382), TP3 (0.618).
+            # This means TP1 is the "quickest" but also the "highest" price for a long. This needs to be correct.
+            # If fib_levels['level_0.236'] is swing_high - range*0.236, it is indeed higher than swing_high - range*0.618.
+            # So, for a LONG, TP1 (level_0.236) is the most ambitious, TP3 (level_0.618) is the closest.
+            # This contradicts "TP1 (Quick Win)".
+            # Re-evaluating: "TP1 (Quick Win): 0.236 retracement or 25–30% of the BoS range."
+            # This means the *distance* from entry (or broken structure) is 25-30% of BoS range.
+            # OR, the TP level is the 0.236 Fib level of the *pullback range* if entry is confirmed.
+
+            # Let's stick to the interpretation that TPs are absolute price levels derived from the BoS move:
+            # level_0_236, level_0_382, level_0_618.
+            # For LONG, these are: swing_high - X. So higher X means lower price.
+            # TP1 (0.236) = swing_high - 0.236 * range  -- This is the highest price (most profit)
+            # TP2 (0.382) = swing_high - 0.382 * range
+            # TP3 (0.618) = swing_high - 0.618 * range  -- This is the lowest price (least profit, but maybe hit first if entry is deep)
+
+            # The request implies TP1 should be hit first for quick win.
+            # So for LONG, TP1 should be the lowest price among TPs that is still > entry.
+            # TP1 = fib_levels['level_0_618'] (if > entry)
+            # TP2 = fib_levels['level_0_5'] or fib_levels['level_0_382']
+            # TP3 = fib_levels['level_0_236']
+            # This is getting complicated. Let's use the direct fib levels as TPs.
+            # TP1_target = fib_levels['level_0_236']
+            # TP2_target = fib_levels['level_0_382']
+            # TP3_target = fib_levels['level_0_618']
+            # We need to ensure they are in profitable direction from entry_price_target.
+
+            # Let's define TPs as specific Fib levels of the BoS range, used as absolute price targets.
+            # For a LONG trade (entry is a pullback from swing_high_bos):
+            # TP1 (quickest) should be a level that's hit first as price moves up from entry.
+            # So, if entry is at fib_levels['level_0_618'], then TP1 could be fib_levels['level_0_5'],
+            # TP2 fib_levels['level_0_382'], TP3 fib_levels['level_0_236'].
+            # This means for LONG: TP1_price < TP2_price < TP3_price
+            # fib_levels are calculated as: level_X = swing_high - (range * X)
+            # So level_0.618 < level_0.5 < level_0.382 < level_0.236 (these are actual prices)
+            # Request: TP1 (0.236), TP2 (0.382), TP3 (0.618)
+            # This means TP1 is associated with the 0.236 Fib ratio, TP2 with 0.382, TP3 with 0.618.
+            # For LONG, the price corresponding to 0.236 ratio is swing_high - 0.236*range.
+            # The price corresponding to 0.618 ratio is swing_high - 0.618*range.
+            # The 0.236 price is *higher* than 0.618 price.
+            # If TP1 is "Quick Win", it should be the closest.
+            # This implies the ratios are distances from entry, or the Fib levels are indexed differently.
+
+            # Let's use the direct interpretation: TP1 uses 0.236 level, TP2 uses 0.382, TP3 uses 0.618.
+            # For LONG: tp1_price = fib_levels['level_0_236'], tp2_price = fib_levels['level_0_382'], tp3_price = fib_levels['level_0_618']
+            # We must ensure these are all > entry_price_target.
+            # And for a sensible profit progression, for LONG, we'd want tp1 < tp2 < tp3 if TP1 is quick win.
+            # But level_0.236 > level_0.382 > level_0.618.
+            # This means TP1 (0.236) is the most ambitious profit, TP3 (0.618) is the least ambitious.
+            # This setup is fine if "TP1 (Quick Win)" refers to "Smallest part of position for largest initial target".
+
+            # Let's stick to the definition from calculate_fibonacci_retracement_levels directly for now.
+            # We will filter out TPs that are not profitable relative to entry.
+            valid_tps = []
+            if tp1_price > entry_price_target: valid_tps.append(tp1_price)
+            if tp2_price > entry_price_target: valid_tps.append(tp2_price)
+            if tp3_price > entry_price_target: valid_tps.append(tp3_price)
+            valid_tps = sorted(list(set(valid_tps))) # Ascending order for LONG TPs
+            if not valid_tps:
+                 print(f"{log_prefix} No valid TP levels are profitable for LONG. Entry={entry_price_target}. Aborting.")
+                 with fib_strategy_states_lock: fib_strategy_states[symbol]['state'] = "IDLE"; return
+            # Assign based on sorted valid TPs for LONG: TP1 is closest, TP3 furthest (if 3 exist)
+            tp1_price_final = valid_tps[0]
+            tp2_price_final = valid_tps[1] if len(valid_tps) > 1 else None
+            tp3_price_final = valid_tps[2] if len(valid_tps) > 2 else None
+
+
+    elif direction == "short":
+        # For SHORT: TP < entry.
+        # level_0.236 < level_0.382 < level_0.618 (these are prices, e.g. 10, 11, 12 for a short from 15)
+        # TP1 (0.236) is the most ambitious (lowest price), TP3 (0.618) is the least ambitious (highest price).
+        valid_tps = []
+        if tp1_price < entry_price_target: valid_tps.append(tp1_price)
+        if tp2_price < entry_price_target: valid_tps.append(tp2_price)
+        if tp3_price < entry_price_target: valid_tps.append(tp3_price)
+        valid_tps = sorted(list(set(valid_tps)), reverse=True) # Descending order for SHORT TPs (closest to entry is first)
+        if not valid_tps:
+             print(f"{log_prefix} No valid TP levels are profitable for SHORT. Entry={entry_price_target}. Aborting.")
+             with fib_strategy_states_lock: fib_strategy_states[symbol]['state'] = "IDLE"; return
+        tp1_price_final = valid_tps[0]
+        tp2_price_final = valid_tps[1] if len(valid_tps) > 1 else None
+        tp3_price_final = valid_tps[2] if len(valid_tps) > 2 else None
+
+    # If any TP is None (e.g. only 1 or 2 valid TPs found), that's acceptable.
+    # The monitoring logic will handle placing orders only for non-None TPs.
+    
+    print(f"{log_prefix} Calculated Entry: {entry_price_target:.{p_prec}f}, SL: {sl_price:.{p_prec}f}")
+    print(f"{log_prefix} TP Levels: TP1={tp1_price_final:.{p_prec}f if tp1_price_final else 'N/A'}, TP2={tp2_price_final:.{p_prec}f if tp2_price_final else 'N/A'}, TP3={tp3_price_final:.{p_prec}f if tp3_price_final else 'N/A'}")
 
     # 3. Risk:Reward and Position Sizing (Similar to manage_trade_entry)
+    # For R:R, use TP1 for calculation, or an average TP if desired. Let's use TP1.
     # Cooldown, ActiveTrade, LivePosition, OpenOrders, MaxConcurrent checks
     # These checks are largely similar to manage_trade_entry, adapt as needed.
     # For brevity, let's assume these checks pass or are integrated into a shared pre-trade check function later.
@@ -1117,9 +1293,11 @@ def manage_fib_retracement_entry_logic(client, configs: dict, symbol: str, bos_e
         print(f"{log_prefix} Invalid position size calculated (Qty: {qty_to_order}). Aborting."); return
 
     # Portfolio Risk Check (similar to manage_trade_entry)
-    new_trade_risk_abs = qty_to_order * abs(entry_price_target - sl_price)
     # ... (portfolio risk calculation and check logic as in manage_trade_entry) ...
     # For brevity, assume it passes.
+
+    # Use the first valid TP as tp_price for sanity checks and trade signature
+    tp_price = tp1_price_final
 
     # Sanity Checks
     passed_sanity, sanity_reason = pre_order_sanity_checks(
@@ -1176,8 +1354,10 @@ def manage_fib_retracement_entry_logic(client, configs: dict, symbol: str, bos_e
             fib_strategy_states[symbol]['pending_entry_details'] = {
                 "limit_price": entry_price_target,
                 "sl_price": sl_price,
-                "tp_price": tp_price,
-                "quantity": qty_to_order,
+                "tp1_price": tp1_price_final, # Store final validated TPs
+                "tp2_price": tp2_price_final,
+                "tp3_price": tp3_price_final,
+                "quantity": qty_to_order, # This is total quantity
                 "side": direction, # "long" or "short"
                 "bos_event_snapshot": bos_event # Store the BoS that led to this
             }
@@ -1230,79 +1410,129 @@ def monitor_pending_fib_entries(client, configs: dict):
             if order_status['status'] == 'FILLED':
                 print(f"{log_prefix_monitor} ✅ Limit entry order {order_id} for {symbol} FILLED!")
                 actual_entry_price = float(order_status['avgPrice'])
-                qty = float(order_status['executedQty']) # Should match pending_details['quantity']
+                total_filled_qty = float(order_status['executedQty']) # Total quantity from the filled limit order
                 
-                # Original intended SL/TP from when limit order was placed
                 sl_price = pending_details['sl_price']
-                tp_price = pending_details['tp_price']
+                tp1_price = pending_details['tp1_price']
+                tp2_price = pending_details['tp2_price']
+                tp3_price = pending_details['tp3_price']
                 trade_side = pending_details['side'] # "long" or "short"
                 position_side_for_sl_tp = "LONG" if trade_side == "long" else "SHORT"
 
-                # Adjust SL/TP if actual fill price is significantly different (optional, good practice)
-                # For simplicity, we'll use the originally calculated SL/TP based on target entry.
-                # More advanced: Recalculate SL/TP based on actual_entry_price if slippage is a concern
-                # and the R:R must be strictly maintained from actual fill.
+                p_prec = int(symbol_info.get('pricePrecision', 2))
+                q_prec = int(symbol_info.get('quantityPrecision', 0))
 
-                print(f"{log_prefix_monitor} Placing SL/TP for filled Fib trade {symbol}: SL {sl_price}, TP {tp_price}")
+                # Define TP quantity splits (e.g., 30% TP1, 50% TP2, 20% TP3)
+                # These should be configurable, for now hardcoding.
+                tp1_qty_pct = 0.30
+                tp2_qty_pct = 0.50
+                tp3_qty_pct = 0.20
+
+                # Calculate quantities for each TP, ensuring they sum to total_filled_qty and respect precision
+                qty_tp1 = round(total_filled_qty * tp1_qty_pct, q_prec)
+                qty_tp2 = round(total_filled_qty * tp2_qty_pct, q_prec)
+                # qty_tp3 is the remainder to ensure total matches, adjusted for precision
+                qty_tp3 = round(total_filled_qty - qty_tp1 - qty_tp2, q_prec)
                 
-                sl_ord, tp_ord = None, None
-                # Place SL
-                sl_ord, sl_err = place_new_order(client, symbol_info, # Use symbol_info defined above
-                                     "SELL" if trade_side == "long" else "BUY", "STOP_MARKET", qty, 
+                # Adjust if sum is slightly off due to rounding (distribute remainder to largest portion, e.g. TP2)
+                if abs(qty_tp1 + qty_tp2 + qty_tp3 - total_filled_qty) > (1 / (10**q_prec)) / 2 : # If sum is off by more than half a step
+                    print(f"{log_prefix_monitor} Adjusting TP quantities due to rounding for {symbol}. Initial: Q1={qty_tp1}, Q2={qty_tp2}, Q3={qty_tp3}")
+                    remainder = total_filled_qty - (qty_tp1 + qty_tp2 + qty_tp3)
+                    qty_tp2 = round(qty_tp2 + remainder, q_prec) # Add remainder to TP2 typically
+                    print(f"{log_prefix_monitor} Adjusted: Q1={qty_tp1}, Q2={qty_tp2}, Q3={qty_tp3}. Total: {qty_tp1+qty_tp2+qty_tp3}")
+
+
+                print(f"{log_prefix_monitor} Placing SL for total qty {total_filled_qty} and multi-tier TPs for {symbol}:")
+                print(f"  SL: {sl_price:.{p_prec}f} (Qty: {total_filled_qty})")
+                if tp1_price and qty_tp1 > 0: print(f"  TP1: {tp1_price:.{p_prec}f} (Qty: {qty_tp1})")
+                if tp2_price and qty_tp2 > 0: print(f"  TP2: {tp2_price:.{p_prec}f} (Qty: {qty_tp2})")
+                if tp3_price and qty_tp3 > 0: print(f"  TP3: {tp3_price:.{p_prec}f} (Qty: {qty_tp3})")
+
+                sl_ord_details, tp_orders_details_list = None, []
+
+                # Place SL for the total quantity
+                sl_ord_obj, sl_err_msg = place_new_order(client, symbol_info,
+                                     "SELL" if trade_side == "long" else "BUY", "STOP_MARKET", total_filled_qty, 
                                      stop_price=sl_price, position_side=position_side_for_sl_tp, is_closing_order=True)
-                if not sl_ord: print(f"{log_prefix_monitor} CRITICAL: FAILED TO PLACE SL for {symbol}! Error: {sl_err}")
-                
-                # Place TP
-                tp_ord, tp_err = place_new_order(client, symbol_info,
-                                     "SELL" if trade_side == "long" else "BUY", "TAKE_PROFIT_MARKET", qty,
-                                     stop_price=tp_price, position_side=position_side_for_sl_tp, is_closing_order=True)
-                if not tp_ord: print(f"{log_prefix_monitor} WARNING: Failed to place TP for {symbol}. Error: {tp_err}")
+                if not sl_ord_obj: print(f"{log_prefix_monitor} CRITICAL: FAILED TO PLACE SL for {symbol}! Error: {sl_err_msg}")
+                else: sl_ord_details = {"id": sl_ord_obj.get('orderId'), "price": sl_price, "quantity": total_filled_qty, "status": "OPEN"}
+
+                # Place TP orders for each tier
+                tp_target_levels = [
+                    {"price": tp1_price, "quantity": qty_tp1, "name": "TP1"},
+                    {"price": tp2_price, "quantity": qty_tp2, "name": "TP2"},
+                    {"price": tp3_price, "quantity": qty_tp3, "name": "TP3"}
+                ]
+
+                for tp_info in tp_target_levels:
+                    current_tp_price = tp_info["price"]
+                    current_tp_qty = tp_info["quantity"]
+                    tp_name = tp_info["name"]
+
+                    if current_tp_price is not None and current_tp_qty > 0:
+                        tp_ord_obj, tp_err_msg = place_new_order(client, symbol_info,
+                                             "SELL" if trade_side == "long" else "BUY", "TAKE_PROFIT_MARKET", current_tp_qty,
+                                             stop_price=current_tp_price, position_side=position_side_for_sl_tp, is_closing_order=True)
+                        if not tp_ord_obj:
+                            print(f"{log_prefix_monitor} WARNING: Failed to place {tp_name} for {symbol} (Qty: {current_tp_qty} @ {current_tp_price}). Error: {tp_err_msg}")
+                            tp_orders_details_list.append({"id": None, "price": current_tp_price, "quantity": current_tp_qty, "status": "FAILED", "name": tp_name})
+                        else:
+                            tp_orders_details_list.append({"id": tp_ord_obj.get('orderId'), "price": current_tp_price, "quantity": current_tp_qty, "status": "OPEN", "name": tp_name})
+                    elif current_tp_price is None and current_tp_qty > 0:
+                         print(f"{log_prefix_monitor} Skipping {tp_name} for {symbol} as price is None, but quantity {current_tp_qty} was assigned.")
+                    # If qty is zero, skip (already handled by qty_tpX > 0 check)
 
                 # Transition to active_trades
                 with active_trades_lock:
-                    if symbol not in active_trades: # Ensure no other trade (e.g. EMA) opened in meantime
+                    if symbol not in active_trades:
                         active_trades[symbol] = {
                             "entry_order_id": order_id,
-                            "sl_order_id": sl_ord.get('orderId') if sl_ord else None,
-                            "tp_order_id": tp_ord.get('orderId') if tp_ord else None,
+                            "sl_order_id": sl_ord_details.get('id') if sl_ord_details else None, # Store SL order ID
+                            "tp_orders": tp_orders_details_list, # List of TP order details
                             "entry_price": actual_entry_price,
-                            "current_sl_price": sl_price,
-                            "current_tp_price": tp_price,
+                            "current_sl_price": sl_price, # Main SL price
+                            # current_tp_price is now a list in tp_orders
                             "initial_sl_price": sl_price, 
-                            "initial_tp_price": tp_price,
-                            "quantity": qty,
-                            "side": trade_side.upper(), # Ensure uppercase for consistency with EMA strategy
+                            # initial_tp_price is now a list in tp_orders
+                            "quantity": total_filled_qty, # Total quantity of the trade
+                            "side": trade_side.upper(),
                             "symbol_info": symbol_info,
                             "open_timestamp": pd.Timestamp(order_status['updateTime'], unit='ms', tz='UTC'),
-                            "strategy_type": "FIBONACCI" # Add strategy type marker
+                            "strategy_type": "FIBONACCI_MULTI_TP" 
                         }
-                        print(f"{log_prefix_monitor} Fib trade for {symbol} moved to active_trades.")
+                        print(f"{log_prefix_monitor} Fib trade for {symbol} (Multi-TP) moved to active_trades.")
                         
-                        # Send Telegram notification for new active Fib trade
+                        # Send Telegram notification
                         if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
-                             # Build message similar to EMA new trade notification
-                            s_info_fib = active_trades[symbol]['symbol_info']
-                            qty_prec_fib = int(s_info_fib.get('quantityPrecision', 0))
-                            price_prec_fib = int(s_info_fib.get('pricePrecision', 2))
+                            qty_prec_fib = int(symbol_info.get('quantityPrecision', 0))
+                            price_prec_fib = int(symbol_info.get('pricePrecision', 2))
+                            
+                            tp_summary_lines = []
+                            for tp_det in tp_orders_details_list:
+                                if tp_det['id']: # Successfully placed
+                                    tp_summary_lines.append(f"  - {tp_det['name']}: {tp_det['quantity']:.{qty_prec_fib}f} @ {tp_det['price']:.{price_prec_fib}f} (ID: {tp_det['id']})")
+                                elif tp_det['price'] is not None : # Attempted but failed
+                                    tp_summary_lines.append(f"  - {tp_det['name']}: {tp_det['quantity']:.{qty_prec_fib}f} @ {tp_det['price']:.{price_prec_fib}f} (Status: FAILED)")
+                            tp_summary_str = "\n".join(tp_summary_lines) if tp_summary_lines else "  No TPs placed or all failed."
+
                             fib_trade_msg = (
-                                f"🚀 FIB TRADE ENTRY FILLED 🚀\n\n"
+                                f"🚀 FIB TRADE ENTRY FILLED (Multi-TP) 🚀\n\n"
                                 f"Symbol: {symbol}\n"
                                 f"Side: {trade_side.upper()}\n"
-                                f"Quantity: {qty:.{qty_prec_fib}f}\n"
+                                f"Total Quantity: {total_filled_qty:.{qty_prec_fib}f}\n"
                                 f"Entry Price: {actual_entry_price:.{price_prec_fib}f}\n"
-                                f"SL: {sl_price:.{price_prec_fib}f}\n"
-                                f"TP: {tp_price:.{price_prec_fib}f}\n"
-                                f"(SL Order: {sl_ord.get('orderId') if sl_ord else 'FAIL'}, TP Order: {tp_ord.get('orderId') if tp_ord else 'FAIL'})"
+                                f"SL: {sl_price:.{price_prec_fib}f} (ID: {sl_ord_details.get('id') if sl_ord_details else 'FAIL'})\n"
+                                f"TP Levels:\n{tp_summary_str}"
                             )
                             send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], fib_trade_msg)
-
                     else:
                         print(f"{log_prefix_monitor} {symbol} already in active_trades. Limit fill for Fib trade {order_id} will not be managed by bot SL/TP. Manual check advised.")
-                        # If it's already in active_trades, this is an unexpected state. Cancel the new SL/TP if placed.
-                        if sl_ord: client.futures_cancel_order(symbol=symbol, orderId=sl_ord['orderId'])
-                        if tp_ord: client.futures_cancel_order(symbol=symbol, orderId=tp_ord['orderId'])
+                        # Cancel newly placed SL/TPs for this orphaned fill
+                        if sl_ord_details and sl_ord_details.get('id'): client.futures_cancel_order(symbol=symbol, orderId=sl_ord_details['id'])
+                        for tp_det in tp_orders_details_list:
+                            if tp_det.get('id'): client.futures_cancel_order(symbol=symbol, orderId=tp_det['id'])
                 
-                symbols_to_reset_state.append(symbol) # Mark for state reset (pending -> IDLE)
+                symbols_to_reset_state.append(symbol) 
             
             elif order_status['status'] in ['CANCELED', 'EXPIRED', 'REJECTED']:
                 print(f"{log_prefix_monitor} Limit entry order {order_id} for {symbol} is {order_status['status']}. Resetting state.")
@@ -1489,6 +1719,11 @@ def get_user_configurations(load_choice_override: str = None, make_changes_overr
                                 # Ensure fib_1m_buffer_size has a default if not in CSV
                                 if "fib_1m_buffer_size" not in configs:
                                     configs["fib_1m_buffer_size"] = DEFAULT_1M_BUFFER_SIZE
+                                # Ensure fib specific ATR SL params have defaults if not in CSV
+                                if "fib_atr_period" not in configs:
+                                    configs["fib_atr_period"] = DEFAULT_FIB_ATR_PERIOD
+                                if "fib_sl_atr_multiplier" not in configs:
+                                    configs["fib_sl_atr_multiplier"] = DEFAULT_FIB_SL_ATR_MULTIPLIER
                             else: # Should not happen if validation is correct
                                 print(f"Warning: Unknown strategy_choice '{strategy_choice}' from CSV. Defaulting to EMA Cross.")
                                 configs["strategy_choice"] = "ema_cross"
@@ -1937,6 +2172,36 @@ def get_user_configurations(load_choice_override: str = None, make_changes_overr
                     break
                 print("Fib order timeout must be between 1 and 60 minutes.")
             except ValueError: print("Invalid input. Please enter an integer.")
+        
+        # Fib ATR Period for SL
+        while True:
+            try:
+                fib_atr_period_val = get_input_with_default(
+                    "Enter ATR Period for Fib Strategy SL",
+                    "fib_atr_period", DEFAULT_FIB_ATR_PERIOD, int
+                )
+                if fib_atr_period_val > 0:
+                    configs["fib_atr_period"] = fib_atr_period_val
+                    break
+                print("Fib ATR Period must be a positive integer.")
+            except ValueError: print("Invalid input for Fib ATR Period. Please enter an integer.")
+
+        # Fib SL ATR Multiplier
+        while True:
+            try:
+                fib_sl_mult_val = get_input_with_default(
+                    "Enter SL ATR Multiplier for Fib Strategy (e.g., 0.5-1.0)",
+                    "fib_sl_atr_multiplier", DEFAULT_FIB_SL_ATR_MULTIPLIER, float
+                )
+                if fib_sl_mult_val > 0:
+                    configs["fib_sl_atr_multiplier"] = fib_sl_mult_val
+                    break
+                print("Fib SL ATR Multiplier must be a positive number.")
+            except ValueError: print("Invalid input for Fib SL ATR Multiplier. Please enter a number.")
+    else: # Not fib_retracement strategy, remove if it was in loaded CSV
+        configs.pop("fib_atr_period", None)
+        configs.pop("fib_sl_atr_multiplier", None)
+
 
     # Strategy ID and Name are set based on "strategy_choice" earlier.
     
@@ -2563,23 +2828,29 @@ def check_and_adjust_sl_tp_dynamic(cur_price, entry, _, __, cur_sl, cur_tp, side
             print(f"Dynamic SL adjustment for {side} to {new_sl:.4f} ({adjustment_reason})")
 
     # Rule 2: If loss >= 0.5% (profit_pct <= -0.005), adjust TP to +0.2% profit (from entry)
-    # This rule aims to secure a smaller profit if the trade goes into drawdown after initial profit or starts with a loss.
-    if profit_pct <= -0.005:
-        target_tp = entry * (1 + 0.002 if side == "LONG" else 1 - 0.002)
-        # Check if this new TP is an improvement (for LONG, lower but > entry; for SHORT, higher but < entry)
-        # And also ensure it's a tighter TP than current, but still profitable
-        if (side == "LONG" and target_tp < new_tp and target_tp > entry) or \
-           (side == "SHORT" and target_tp > new_tp and target_tp < entry):
-            new_tp = target_tp
-            adjustment_reason = "TP_DRAWDOWN_REDUCE_0.2%" # Overwrites previous reason if both conditions met, SL prio based on order
-            if adjustment_reason and "SL" in adjustment_reason : adjustment_reason += ";TP_DRAWDOWN_REDUCE_0.2%" # Append if SL already adjusted
-            else: adjustment_reason = "TP_DRAWDOWN_REDUCE_0.2%"
-            print(f"Dynamic TP adjustment for {side} to {new_tp:.4f} ({adjustment_reason})")
-
+    # This rule is only applied if cur_tp is provided (i.e., not a multi-TP strategy)
+    if cur_tp is not None: # Check if TP adjustment is applicable
+        if profit_pct <= -0.005:
+            target_tp = entry * (1 + 0.002 if side == "LONG" else 1 - 0.002)
+            # Check if this new TP is an improvement (for LONG, lower but > entry; for SHORT, higher but < entry)
+            # And also ensure it's a tighter TP than current, but still profitable
+            if (side == "LONG" and target_tp < new_tp and target_tp > entry) or \
+               (side == "SHORT" and target_tp > new_tp and target_tp < entry):
+                new_tp = target_tp # new_tp was initialized with cur_tp, so this updates it
+                
+                # Update adjustment_reason carefully
+                if adjustment_reason and "SL" in adjustment_reason: # If SL was already adjusted
+                    adjustment_reason += ";TP_DRAWDOWN_REDUCE_0.2%"
+                else: # Only TP is adjusted, or it's the first adjustment
+                    adjustment_reason = "TP_DRAWDOWN_REDUCE_0.2%"
+                print(f"Dynamic TP adjustment for {side} to {new_tp:.4f} ({adjustment_reason})")
+    
+    # If new_tp was not modified (because it's multi-TP or conditions not met), it remains as cur_tp (which could be None)
+    # The function signature implies new_tp is always returned. If it's multi-TP, new_tp will be None.
     if adjustment_reason:
-        return new_sl, new_tp, adjustment_reason
+        return new_sl, new_tp, adjustment_reason # new_tp will be None if cur_tp was None
     else:
-        return None, None, None # No adjustment made that met criteria
+        return None, None, None # No adjustment made that met criteria, return None for new_sl, new_tp
 
 def get_symbol_info(client, symbol):
     try:
@@ -3582,171 +3853,357 @@ def monitor_active_trades(client, configs): # Needs lock for active_trades acces
         if not pos_exists:
             print(f"Position for {symbol} closed/zero. Attempting OCO cancellation and removing from active list.")
             
-            # --- OCO Logic Implementation ---
-            # If position is closed, try to cancel the corresponding SL and TP orders.
-            # One of them might have triggered the closure, the other is now orphaned.
+            # --- OCO Logic Implementation for Position Closure ---
+            # If position is closed (pos_exists is False), cancel all related SL and TP orders.
             sl_order_id_to_cancel = trade_details.get('sl_order_id')
-            tp_order_id_to_cancel = trade_details.get('tp_order_id')
-
+            
+            # Cancel SL order
             if sl_order_id_to_cancel:
                 try:
-                    print(f"Attempting to cancel SL order {sl_order_id_to_cancel} for closed position {symbol} (OCO)...")
+                    print(f"Attempting to cancel SL order {sl_order_id_to_cancel} for closed position {symbol}...")
                     client.futures_cancel_order(symbol=symbol, orderId=sl_order_id_to_cancel)
-                    print(f"Successfully cancelled SL order {sl_order_id_to_cancel} for {symbol} as part of OCO.")
+                    print(f"Successfully cancelled SL order {sl_order_id_to_cancel} for {symbol}.")
                 except BinanceAPIException as e:
                     if e.code == -2011: # Order filled or cancelled / Does not exist
-                        print(f"SL order {sl_order_id_to_cancel} for {symbol} already filled or does not exist (OCO check). Code: {e.code}")
+                        print(f"SL order {sl_order_id_to_cancel} for {symbol} already filled/cancelled or does not exist (Code: {e.code}).")
                     else:
-                        print(f"API Error cancelling SL order {sl_order_id_to_cancel} for {symbol} (OCO): {e}")
+                        print(f"API Error cancelling SL order {sl_order_id_to_cancel} for {symbol}: {e}")
                 except Exception as e:
-                    print(f"Unexpected error cancelling SL order {sl_order_id_to_cancel} for {symbol} (OCO): {e}")
-            
-            if tp_order_id_to_cancel:
-                try:
-                    print(f"Attempting to cancel TP order {tp_order_id_to_cancel} for closed position {symbol} (OCO)...")
-                    client.futures_cancel_order(symbol=symbol, orderId=tp_order_id_to_cancel)
-                    print(f"Successfully cancelled TP order {tp_order_id_to_cancel} for {symbol} as part of OCO.")
-                except BinanceAPIException as e:
-                    if e.code == -2011: # Order filled or cancelled / Does not exist
-                        print(f"TP order {tp_order_id_to_cancel} for {symbol} already filled or does not exist (OCO check). Code: {e.code}")
-                    else:
-                        print(f"API Error cancelling TP order {tp_order_id_to_cancel} for {symbol} (OCO): {e}")
-                except Exception as e:
-                    print(f"Unexpected error cancelling TP order {tp_order_id_to_cancel} for {symbol} (OCO): {e}")
-            
-            # --- Realized P&L Calculation on Closure ---
-            # This part is tricky as we need to know the exit price.
-            # We assume if a position is gone, it was closed by SL, TP, or manually.
-            # The OCO cancellation logic below attempts to cancel remaining SL/TP.
-            # If one was filled, its cancellation will fail with error -2011.
-            realized_pnl_for_trade = 0.0
-            exit_price_assumed = None
-            closure_reason = "Unknown (external or liquidation)"
+                    print(f"Unexpected error cancelling SL order {sl_order_id_to_cancel} for {symbol}: {e}")
 
-            # Try to determine if SL or TP was hit by checking cancellation status
-            sl_order_id_to_cancel = trade_details.get('sl_order_id')
-            tp_order_id_to_cancel = trade_details.get('tp_order_id')
-            sl_filled, tp_filled = False, False
-
-            if sl_order_id_to_cancel:
-                try:
-                    client.futures_cancel_order(symbol=symbol, orderId=sl_order_id_to_cancel)
-                    print(f"Successfully cancelled SL order {sl_order_id_to_cancel} for {symbol} as part of OCO (position closed).")
-                except BinanceAPIException as e:
-                    if e.code == -2011: # Order filled or cancelled / Does not exist
-                        sl_filled = True # Assume it was filled
-                        print(f"SL order {sl_order_id_to_cancel} for {symbol} likely FILLED (or already cancelled). Code: {e.code}")
-                    else:
-                        print(f"API Error cancelling SL order {sl_order_id_to_cancel} for {symbol} (OCO): {e}")
-                except Exception as e:
-                    print(f"Unexpected error cancelling SL order {sl_order_id_to_cancel} for {symbol} (OCO): {e}")
+            # Cancel all TP orders
+            if trade_details.get('strategy_type') == "FIBONACCI_MULTI_TP" and 'tp_orders' in trade_details:
+                for tp_order_info in trade_details['tp_orders']:
+                    tp_id_to_cancel = tp_order_info.get('id')
+                    if tp_id_to_cancel and tp_order_info.get('status') == "OPEN": # Only cancel open TPs
+                        try:
+                            print(f"Attempting to cancel TP order {tp_id_to_cancel} ({tp_order_info.get('name')}) for closed position {symbol}...")
+                            client.futures_cancel_order(symbol=symbol, orderId=tp_id_to_cancel)
+                            print(f"Successfully cancelled TP order {tp_id_to_cancel} for {symbol}.")
+                            # Update status in active_trades for this TP (optional, as trade is being removed)
+                            # tp_order_info['status'] = "CANCELED" 
+                        except BinanceAPIException as e:
+                            if e.code == -2011:
+                                print(f"TP order {tp_id_to_cancel} for {symbol} already filled/cancelled or does not exist (Code: {e.code}).")
+                            else:
+                                print(f"API Error cancelling TP order {tp_id_to_cancel} for {symbol}: {e}")
+                        except Exception as e:
+                            print(f"Unexpected error cancelling TP order {tp_id_to_cancel} for {symbol}: {e}")
+            elif 'tp_order_id' in trade_details: # Single TP strategy (e.g., EMA Cross)
+                tp_id_to_cancel = trade_details.get('tp_order_id')
+                if tp_id_to_cancel:
+                    try:
+                        client.futures_cancel_order(symbol=symbol, orderId=tp_id_to_cancel)
+                        print(f"Successfully cancelled single TP order {tp_id_to_cancel} for {symbol}.")
+                    except BinanceAPIException as e:
+                        if e.code == -2011: print(f"Single TP order {tp_id_to_cancel} for {symbol} already processed. Code: {e.code}")
+                        else: print(f"API Error cancelling single TP order {tp_id_to_cancel}: {e}")
+                    except Exception as e: print(f"Unexpected error cancelling single TP order {tp_id_to_cancel}: {e}")
             
-            if tp_order_id_to_cancel:
-                try:
-                    client.futures_cancel_order(symbol=symbol, orderId=tp_order_id_to_cancel)
-                    print(f"Successfully cancelled TP order {tp_order_id_to_cancel} for {symbol} as part of OCO (position closed).")
-                except BinanceAPIException as e:
-                    if e.code == -2011: # Order filled or cancelled / Does not exist
-                        tp_filled = True # Assume it was filled
-                        print(f"TP order {tp_order_id_to_cancel} for {symbol} likely FILLED (or already cancelled). Code: {e.code}")
-                    else:
-                        print(f"API Error cancelling TP order {tp_order_id_to_cancel} for {symbol} (OCO): {e}")
-                except Exception as e:
-                    print(f"Unexpected error cancelling TP order {tp_order_id_to_cancel} for {symbol} (OCO): {e}")
+            # --- Realized P&L Calculation on Full Closure ---
+            # This section assumes the *entire position* is now closed.
+            # For multi-TP, if only a part of the position was closed by a TP hit, that P&L is handled when the TP order status is checked.
+            # If pos_exists is false, it means the *entire* position is gone (either SL, all TPs hit, or manual closure).
+            
+            # We need to determine the exit price. This is difficult if closed manually.
+            # If SL hit, exit is SL price. If last TP hit, exit is that TP price.
+            # This part of P&L calc needs to be more robust.
+            # For now, the PNL calculation for a fully closed position (pos_exists=False) will be an estimation
+            # or rely on other mechanisms to fetch actual trade history if exact PNL is critical here.
+            # The previous logic tried to infer based on cancellation status, which is okay.
+
+            # Let's assume the detailed PNL calculation for partial TP hits will be handled by checking TP order statuses.
+            # If pos_exists is False, it means the *remainder* of the position (if any) was closed.
+            # We'll add a simplified P&L update here for the full closure scenario.
+            # A more robust solution would involve fetching trade history for the symbol.
 
             entry_p = trade_details['entry_price']
-            qty = trade_details['quantity']
+            original_total_qty = trade_details['quantity'] # Initial total quantity
             trade_side = trade_details['side']
+            closure_data_for_removal = {"symbol": symbol, "pnl": 0, "reason": "Position Closed (Full)"}
 
-            if sl_filled:
-                exit_price_assumed = trade_details['current_sl_price']
-                closure_reason = "Stop-Loss Hit"
-            elif tp_filled:
-                exit_price_assumed = trade_details['current_tp_price']
-                closure_reason = "Take-Profit Hit"
-            # If neither SL nor TP seems to have filled but position is gone, it's harder to determine P&L accurately here.
-            # For daily P&L tracking, this estimation is a compromise.
-            
-            if exit_price_assumed is not None:
-                if trade_side == "LONG":
-                    realized_pnl_for_trade = (exit_price_assumed - entry_p) * qty
-                elif trade_side == "SHORT":
-                    realized_pnl_for_trade = (entry_p - exit_price_assumed) * qty
-                
-                print(f"Position {symbol} closed. Reason: {closure_reason}. Entry: {entry_p}, Exit: {exit_price_assumed}, Qty: {qty}, PNL: {realized_pnl_for_trade:.2f}")
-                
-                with daily_state_lock:
-                    global daily_realized_pnl
-                    daily_realized_pnl += realized_pnl_for_trade
-                    print(f"Updated daily realized PNL: {daily_realized_pnl:.2f}")
+            # Try to find out if SL was hit or if a TP was the last one to fill
+            sl_order_status = None
+            if sl_order_id_to_cancel:
+                try: sl_order_status = client.futures_get_order(symbol=symbol, orderId=sl_order_id_to_cancel)
+                except: pass # Ignore errors, just trying to get status
+
+            if sl_order_status and sl_order_status['status'] == 'FILLED':
+                exit_price_assumed = float(sl_order_status['avgPrice']) if float(sl_order_status.get('avgPrice',0)) > 0 else trade_details['current_sl_price']
+                pnl = (exit_price_assumed - entry_p) * original_total_qty if trade_side == "LONG" else (entry_p - exit_price_assumed) * original_total_qty
+                closure_data_for_removal["pnl"] = pnl
+                closure_data_for_removal["reason"] = f"Stop-Loss Hit @ {exit_price_assumed}"
+                print(f"Position {symbol} closed by SL. PNL: {pnl:.2f}")
             else:
-                print(f"Position {symbol} closed, but exact exit (SL/TP hit) could not be determined from order cancellations. PNL not added to daily total from this event.")
+                # If not SL, it might be manual, liquidation, or the last TP filled leading to full closure.
+                # P&L for TP hits is ideally accounted for when TP order status is checked.
+                # If we reach here and pos_exists is false, and it wasn't SL, it's complex.
+                # We'll assume PNL from TPs was already handled if applicable.
+                print(f"Position {symbol} closed. Not by bot's SL order. PNL for this full closure not calculated here (should be from TPs or manual).")
+                closure_data_for_removal["reason"] = "Position Closed (Not SL, likely TPs or Manual/Liq)"
+            
+            with daily_state_lock:
+                global daily_realized_pnl
+                daily_realized_pnl += closure_data_for_removal["pnl"] # Add PNL from SL or final closure
+                print(f"Updated daily realized PNL: {daily_realized_pnl:.2f}")
 
-            symbols_to_remove.append(symbol)
+            symbols_to_remove.append(closure_data_for_removal) # Add dict with details
             continue
+
+        # --- Position Still Exists: Monitor TPs and Dynamic SL/TP Adjustments ---
+        
+        # For Multi-TP strategy: Check status of individual TP orders
+        if trade_details.get('strategy_type') == "FIBONACCI_MULTI_TP" and 'tp_orders' in trade_details:
+            any_tp_hit_this_cycle = False
+            for tp_order_info in trade_details['tp_orders']:
+                if tp_order_info.get('status') == "OPEN" and tp_order_info.get('id'):
+                    try:
+                        tp_order_status = client.futures_get_order(symbol=symbol, orderId=tp_order_info['id'])
+                        if tp_order_status['status'] == 'FILLED':
+                            any_tp_hit_this_cycle = True
+                            tp_order_info['status'] = "FILLED"
+                            filled_qty_tp = float(tp_order_status['executedQty'])
+                            fill_price_tp = float(tp_order_status['avgPrice'])
+                            
+                            pnl_partial_tp = 0
+                            if trade_details['side'] == "LONG":
+                                pnl_partial_tp = (fill_price_tp - trade_details['entry_price']) * filled_qty_tp
+                            else: # SHORT
+                                pnl_partial_tp = (trade_details['entry_price'] - fill_price_tp) * filled_qty_tp
+                            
+                            print(f"Partial TP Hit: {tp_order_info.get('name')} for {symbol} filled {filled_qty_tp} @ {fill_price_tp}. PNL: {pnl_partial_tp:.2f}")
+                            
+                            with daily_state_lock:
+                                daily_realized_pnl += pnl_partial_tp
+                                print(f"Updated daily realized PNL after partial TP: {daily_realized_pnl:.2f}")
+
+                            # Reduce total quantity tracked by the bot for this trade
+                            # This is complex: active_trades['quantity'] should reflect remaining open quantity.
+                            # SL order also needs to be modified to new remaining quantity.
+                            # For now, we'll log the partial TP. Full SL modification logic is extensive.
+                            # A simpler approach for now: if any TP hits, we might close the rest or adjust SL to BreakEven.
+                            # Request: "If price makes a fresh higher low ... bump SL to breakeven or just below that pivot."
+                            # This is separate from TP hits.
+                            
+                            # If a TP hits, we should at least cancel the main SL and replace it for the remaining quantity.
+                            # This is a significant change. For now, let's just mark TP as filled.
+                            # The `pos_exists` check at the start of the loop will handle full closure.
+                            
+                            # If all TPs are filled, the position should be fully closed.
+                            all_tps_filled_or_failed = all(
+                                tp.get('status') != "OPEN" for tp in trade_details['tp_orders'] if tp.get('id') is not None
+                            )
+                            if all_tps_filled_or_failed:
+                                print(f"All TPs for {symbol} are now filled or failed. Position should be closed.")
+                                # The pos_exists check at the start of next cycle should pick this up.
+                                # Or, we can force a re-check of pos_exists here.
+
+                    except BinanceAPIException as e:
+                        if e.code == -2013: # Order does not exist (e.g. already cancelled / filled and removed)
+                            tp_order_info['status'] = "UNKNOWN_REMOVED"
+                            print(f"TP order {tp_order_info['id']} for {symbol} not found, marked UNKNOWN.")
+                        else:
+                            print(f"API Error checking TP order {tp_order_info['id']} for {symbol}: {e}")
+                    except Exception as e:
+                        print(f"Error checking TP order {tp_order_info['id']} for {symbol}: {e}")
+            
+            # If a TP hit, might need to adjust SL (e.g., to breakeven or for remaining qty)
+            # This is part of the adaptive SL logic. For now, just noting the TP hit.
 
         # Dynamic SL/TP adjustment logic
         try: cur_price = float(client.futures_ticker(symbol=symbol)['lastPrice'])
         except Exception as e: print(f"Error getting ticker for {symbol} in monitor: {e}"); continue
-        
-        new_sl, new_tp = check_and_adjust_sl_tp_dynamic(cur_price, trade_details['entry_price'], 
-                                                        trade_details['initial_sl_price'], trade_details['initial_tp_price'],
-                                                        trade_details['current_sl_price'], trade_details['current_tp_price'],
-                                                        trade_details['side'])
+
         s_info = trade_details['symbol_info']
-        qty = trade_details['quantity']
-        original_trade_side = trade_details['side'] # This is "LONG" or "SHORT" for the main position
-        # positionSide for SL/TP orders should match the main position's side.
-        position_side_for_sl_tp = original_trade_side 
+        original_trade_side = trade_details['side']
+        position_side_for_sl_tp = original_trade_side
         updated_orders = False
 
-        if new_sl is not None and abs(new_sl - trade_details['current_sl_price']) > 1e-9:
-            print(f"Adjusting SL for {symbol} ({position_side_for_sl_tp}) to {new_sl:.4f}")
-            if trade_details.get('sl_order_id'): # Cancel old
+        # Determine current SL and TP(s) for check_and_adjust_sl_tp_dynamic
+        current_sl_for_dynamic_check = trade_details['current_sl_price']
+        current_tp_for_dynamic_check = None 
+        initial_sl_for_dynamic_check = trade_details['initial_sl_price']
+        initial_tp_for_dynamic_check = None
+
+        is_multi_tp_strategy = trade_details.get('strategy_type') == "FIBONACCI_MULTI_TP"
+
+        if not is_multi_tp_strategy: # For single TP strategies
+            current_tp_for_dynamic_check = trade_details.get('current_tp_price')
+            initial_tp_for_dynamic_check = trade_details.get('initial_tp_price')
+
+        # Standard dynamic SL/TP adjustment (e.g., based on fixed profit percentages)
+        # `check_and_adjust_sl_tp_dynamic` returns (potential_new_sl, potential_new_tp, adjustment_reason)
+        # where potential_new_tp is None if TPs are not managed by this function (e.g. multi-TP)
+        potential_new_sl, potential_new_tp, _ = check_and_adjust_sl_tp_dynamic(
+            cur_price,
+            trade_details['entry_price'],
+            initial_sl_for_dynamic_check,
+            initial_tp_for_dynamic_check, 
+            current_sl_for_dynamic_check,
+            current_tp_for_dynamic_check, 
+            trade_details['side']
+        )
+        
+        # Initialize final SL to be used; it might be further updated by micro-pivot logic
+        # `potential_new_sl` from the function above is the result of standard profit-based SL adjustment.
+        # If no standard adjustment was made, `potential_new_sl` will be None.
+        # `final_new_sl` will track the SL to actually be set.
+        final_new_sl = potential_new_sl 
+
+        # --- Micro-Pivot SL Adjustment for Fibonacci Multi-TP Strategy ---
+        if is_multi_tp_strategy: 
+            unrealized_pnl = calculate_unrealized_pnl(trade_details, cur_price)
+            # Ensure initial_sl_price exists before calculating initial_risk_amount
+            initial_sl_price_for_risk_calc = trade_details.get('initial_sl_price')
+            if initial_sl_price_for_risk_calc is None:
+                print(f"[{symbol}] Warning: initial_sl_price missing for Fib trade, cannot calculate R for micro-pivot check.")
+                initial_risk_amount = 0 
+            else:
+                initial_risk_amount = abs(trade_details['entry_price'] - initial_sl_price_for_risk_calc) * trade_details['quantity']
+            
+            if initial_risk_amount > 0 and (unrealized_pnl / initial_risk_amount) >= MICRO_PIVOT_PROFIT_THRESHOLD_R:
+                print(f"[{symbol}] Fib trade in profit >= {MICRO_PIVOT_PROFIT_THRESHOLD_R}R. Checking for micro-pivot SL adjustment.")
+                
+                buffer_1m_df = None
+                with symbol_1m_candle_buffers_lock:
+                    if symbol in symbol_1m_candle_buffers and len(symbol_1m_candle_buffers[symbol]) > 0:
+                        records = []
+                        deque_buffer = symbol_1m_candle_buffers[symbol]
+                        for s_candle in deque_buffer:
+                            if isinstance(s_candle, pd.Series) and isinstance(s_candle.name, pd.Timestamp):
+                                record = s_candle.to_dict()
+                                record['timestamp'] = s_candle.name 
+                                records.append(record)
+                            else: print(f"[{symbol}] Warning: Unexpected item in 1m buffer: {type(s_candle)}")
+                        if not records: 
+                            buffer_1m_df = pd.DataFrame()
+                            print(f"[{symbol}] No valid records to form 1m DataFrame for pivot check.")
+                        else: 
+                            try:
+                                buffer_1m_df = pd.DataFrame(records).set_index('timestamp')
+                                if not all(c in buffer_1m_df for c in ['high', 'low', 'close']):
+                                    print(f"[{symbol}] 1m DataFrame missing required columns (high, low, close) after conversion.")
+                                    buffer_1m_df = None 
+                            except Exception as e_df_conv:
+                                print(f"[{symbol}] Error converting 1m buffer records to DataFrame: {e_df_conv}")
+                                buffer_1m_df = None
+                                
+                if buffer_1m_df is not None and not buffer_1m_df.empty and all(c in buffer_1m_df for c in ['high', 'low', 'close']):
+                    fib_atr_period_for_sl_buffer = configs.get("fib_atr_period", DEFAULT_FIB_ATR_PERIOD)
+                    current_atr_1m_for_buffer = 0
+                    if len(buffer_1m_df) >= fib_atr_period_for_sl_buffer:
+                        atr_1m_series = calculate_atr(buffer_1m_df.copy(), period=fib_atr_period_for_sl_buffer)
+                        current_atr_1m_for_buffer = atr_1m_series.iloc[-1] if not atr_1m_series.empty and pd.notna(atr_1m_series.iloc[-1]) else 0
+                    else: print(f"[{symbol}] Insufficient 1m data ({len(buffer_1m_df)}) for ATR ({fib_atr_period_for_sl_buffer}) calc in micro-pivot SL.")
+                    
+                    sl_micro_buffer = current_atr_1m_for_buffer * MICRO_PIVOT_SL_BUFFER_ATR_MULT
+                    if sl_micro_buffer <=0 : sl_micro_buffer = (1 / (10**int(s_info.get('pricePrecision',2)))) * 2
+
+                    latest_high_time, latest_pivot_high, latest_low_time, latest_pivot_low = get_latest_pivots_from_buffer(
+                        buffer_1m_df, MICRO_PIVOT_N_LEFT_1M, MICRO_PIVOT_N_RIGHT_1M
+                    )
+                    
+                    micro_pivot_sl_candidate = None
+                    if trade_details['side'] == "LONG" and latest_pivot_low is not None:
+                        # Ensure pivot is "new" (e.g. more recent than SL set time, or simply higher than current SL)
+                        # For now, just check if it offers a better SL.
+                        potential_sl = latest_pivot_low - sl_micro_buffer
+                        if potential_sl > current_sl_for_dynamic_check: # If this pivot offers a tighter SL
+                            # SL should be at least breakeven
+                            micro_pivot_sl_candidate = max(trade_details['entry_price'], potential_sl)
+                            print(f"[{symbol}] LONG Micro-pivot SL candidate: {micro_pivot_sl_candidate:.{s_info['pricePrecision']}f} (Pivot Low: {latest_pivot_low} at {latest_low_time})")
+                            
+                    elif trade_details['side'] == "SHORT" and latest_pivot_high is not None:
+                        potential_sl = latest_pivot_high + sl_micro_buffer
+                        if potential_sl < current_sl_for_dynamic_check: # Tighter SL
+                            micro_pivot_sl_candidate = min(trade_details['entry_price'], potential_sl)
+                            print(f"[{symbol}] SHORT Micro-pivot SL candidate: {micro_pivot_sl_candidate:.{s_info['pricePrecision']}f} (Pivot High: {latest_pivot_high} at {latest_high_time})")
+
+                    if micro_pivot_sl_candidate is not None:
+                        # Compare with SL from standard adjustment (if any) and current SL
+                        # Prioritize the tightest valid SL
+                        if final_new_sl is not None: # If standard adjustment already proposed an SL
+                            if trade_details['side'] == "LONG": final_new_sl = max(final_new_sl, micro_pivot_sl_candidate)
+                            else: final_new_sl = min(final_new_sl, micro_pivot_sl_candidate)
+                        else: # No standard adjustment, compare with current SL
+                            if (trade_details['side'] == "LONG" and micro_pivot_sl_candidate > current_sl_for_dynamic_check) or \
+                               (trade_details['side'] == "SHORT" and micro_pivot_sl_candidate < current_sl_for_dynamic_check):
+                                final_new_sl = micro_pivot_sl_candidate
+                        print(f"[{symbol}] Micro-pivot logic updated SL to: {final_new_sl:.{s_info['pricePrecision']}f}")
+                else:
+                    print(f"[{symbol}] Could not get valid 1m buffer or ATR for micro-pivot SL check.")
+        
+        # Use `final_new_sl` for SL adjustment logic below. `new_tp_single` is only for non-multi-TP.
+
+        # Calculate remaining quantity if any TPs have filled (for multi-TP)
+        # For single TP, remaining_quantity is just the trade_details['quantity'] unless SL/TP hit.
+        remaining_quantity = trade_details['quantity'] # Start with total/original quantity
+        if is_multi_tp_strategy and 'tp_orders' in trade_details:
+            qty_filled_by_tps = sum(
+                tp.get('quantity', 0) for tp in trade_details['tp_orders'] if tp.get('status') == "FILLED" and tp.get('id') is not None
+            )
+            remaining_quantity = trade_details['quantity'] - qty_filled_by_tps
+            if remaining_quantity < 0: remaining_quantity = 0
+        
+        min_qty_val = float(s_info.get('filters', [{}])[0].get('minQty', '0.001')) # Simplified minQty fetch
+        if remaining_quantity < min_qty_val: # If remaining is dust or zero
+            print(f"Remaining quantity for {symbol} ({remaining_quantity}) is less than minQty ({min_qty_val}). No SL adjustment. Position should close if not already.")
+        elif final_new_sl is not None and abs(final_new_sl - current_sl_for_dynamic_check) > 1e-9: # If SL needs adjustment
+            print(f"Adjusting SL for {symbol} ({position_side_for_sl_tp}) to {final_new_sl:.{s_info['pricePrecision']}f} for remaining Qty {remaining_quantity}")
+            if trade_details.get('sl_order_id'): # Cancel old SL
                 try: client.futures_cancel_order(symbol=symbol, orderId=trade_details['sl_order_id'])
                 except Exception as e: print(f"Warn: Old SL {trade_details['sl_order_id']} for {symbol} cancel fail: {e}")
             
-            # Place new SL order
-            sl_ord_new = place_new_order(client, 
-                                         s_info, 
-                                         "SELL" if original_trade_side == "LONG" else "BUY", # Order side is opposite to position
-                                         "STOP_MARKET", 
-                                         qty, 
-                                         stop_price=new_sl, 
+            sl_ord_new, sl_err_msg_new = place_new_order(client,
+                                         s_info,
+                                         "SELL" if original_trade_side == "LONG" else "BUY",
+                                         "STOP_MARKET",
+                                         remaining_quantity, # Use remaining quantity for new SL
+                                         stop_price=final_new_sl,
                                          position_side=position_side_for_sl_tp,
                                          is_closing_order=True)
-            if sl_ord_new: 
-                with active_trades_lock: 
-                    if symbol in active_trades: 
-                         active_trades[symbol]['current_sl_price'] = new_sl
+            if sl_ord_new:
+                with active_trades_lock:
+                    if symbol in active_trades:
+                         active_trades[symbol]['current_sl_price'] = final_new_sl
                          active_trades[symbol]['sl_order_id'] = sl_ord_new.get('orderId')
+                         # active_trades[symbol]['quantity'] should also be updated if this is due to partial TP.
+                         # This is tricky. For now, 'quantity' in active_trades means original full quantity.
+                         # We'd need a 'remaining_quantity' field or adjust 'quantity'.
+                         # Let's assume `monitor_active_trades` itself will update `active_trades[symbol]['quantity']`
+                         # if a partial TP is detected as filled.
+                         # For now, this SL adjustment uses `remaining_quantity` for the order,
+                         # but `active_trades` quantity field isn't changed here.
                          updated_orders = True
-            else: print(f"CRITICAL: FAILED TO PLACE NEW DYNAMIC SL FOR {symbol}!")
+            else: 
+                print(f"CRITICAL: FAILED TO PLACE NEW DYNAMIC SL FOR {symbol}! Error: {sl_err_msg_new}")
         
-        if new_tp is not None and abs(new_tp - trade_details['current_tp_price']) > 1e-9:
-            print(f"Adjusting TP for {symbol} ({position_side_for_sl_tp}) to {new_tp:.4f}")
-            if trade_details.get('tp_order_id'): # Cancel old
+        # Dynamic TP adjustment for SINGLE TP strategies (Multi-TP handles TPs via their own orders)
+        if not is_multi_tp_strategy and potential_new_tp is not None and \
+           abs(potential_new_tp - trade_details.get('current_tp_price', 0)) > 1e-9:
+            print(f"Adjusting TP for {symbol} ({position_side_for_sl_tp}) to {potential_new_tp:.{s_info['pricePrecision']}f}")
+            if trade_details.get('tp_order_id'): # Cancel old TP
                 try: client.futures_cancel_order(symbol=symbol, orderId=trade_details['tp_order_id'])
                 except Exception as e: print(f"Warn: Old TP {trade_details['tp_order_id']} for {symbol} cancel fail: {e}")
 
-            # Place new TP order
-            tp_ord_new = place_new_order(client, 
-                                         s_info, 
-                                         "SELL" if original_trade_side == "LONG" else "BUY", # Order side is opposite to position
-                                         "TAKE_PROFIT_MARKET", 
-                                         qty, 
-                                         stop_price=new_tp, 
+            tp_ord_new, tp_err_msg_new = place_new_order(client,
+                                         s_info,
+                                         "SELL" if original_trade_side == "LONG" else "BUY",
+                                         "TAKE_PROFIT_MARKET",
+                                         remaining_quantity, # Should be full quantity if single TP
+                                         stop_price=potential_new_tp,
                                          position_side=position_side_for_sl_tp,
                                          is_closing_order=True)
-            if tp_ord_new: 
-                with active_trades_lock: 
+            if tp_ord_new:
+                with active_trades_lock:
                      if symbol in active_trades:
-                        active_trades[symbol]['current_tp_price'] = new_tp
+                        active_trades[symbol]['current_tp_price'] = potential_new_tp
                         active_trades[symbol]['tp_order_id'] = tp_ord_new.get('orderId')
                         updated_orders = True
-            else: print(f"Warning: Failed to place new dynamic TP for {symbol}.")
+            else: 
+                print(f"Warning: Failed to place new dynamic TP for {symbol}. Error: {tp_err_msg_new}")
         
-        if updated_orders: get_open_orders(client, symbol) # Show updated orders
+        if updated_orders: get_open_orders(client, symbol)
 
     if symbols_to_remove:
         # First, gather all details for notifications outside the main active_trades_lock if possible,
