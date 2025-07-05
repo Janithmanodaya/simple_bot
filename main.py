@@ -4484,11 +4484,11 @@ def monitor_active_trades(client, configs): # Needs lock for active_trades acces
                                 print(f"[{symbol}] Micro-Pivot logic updated SL to: {final_new_sl:.{s_info['pricePrecision']}f}")
                         else:
                             print(f"[{symbol}] Could not get valid 1m buffer or ATR for Micro-Pivot SL check.")
-        # else: Profit threshold not met for micro-pivot
+                    # else: Profit threshold not met for micro-pivot
         else: # Initial risk per unit is zero (e.g. initial_sl_price was None or at entry)
             print(f"[{symbol}] Cannot calculate profit in R for Micro-Pivot SL as initial_risk_per_unit is zero.")
     # --- End Micro-Pivot SL Adjustment ---
-                
+        
         # Use `final_new_sl` (which is best of standard or micro-pivot) for SL adjustment logic below.
         # `potential_new_tp_standard` is only for non-multi-TP strategies' TP adjustment.
 
