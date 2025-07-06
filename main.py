@@ -2110,21 +2110,34 @@ def get_user_configurations(load_choice_override: str = None, make_changes_overr
                                 break
                             
                             # Set strategy specific details based on choice
-                            strategy_choice = configs.get("strategy_choice", DEFAULT_STRATEGY) # This should be validated now
-                            if strategy_choice == "ema_cross":
+                            # Ensure 'strategy_choice' exists in configs, validated by validate_configurations
+                            current_strategy_choice = configs.get("strategy_choice")
+
+                            if not current_strategy_choice:
+                                # This case should ideally be prevented by validate_configurations making strategy_choice mandatory.
+                                print(f"CRITICAL WARNING: 'strategy_choice' not found in validated configs. Defaulting to {DEFAULT_STRATEGY} for safety.")
+                                current_strategy_choice = DEFAULT_STRATEGY
+                                configs["strategy_choice"] = DEFAULT_STRATEGY # Ensure it's set in configs
+
+                            print(f"[Debug] Inside get_user_configurations (CSV load path), strategy_choice from configs is: '{current_strategy_choice}'")
+
+                            if current_strategy_choice == "ema_cross":
                                 configs["strategy_id"] = 8
                                 configs["strategy_name"] = "Advance EMA Cross"
-                            elif strategy_choice == "fib_retracement":
+                                print(f"[Debug] Set strategy to EMA Cross (ID: 8)")
+                            elif current_strategy_choice == "fib_retracement":
                                 configs["strategy_id"] = 9
                                 configs["strategy_name"] = "Fibonacci Retracement"
+                                print(f"[Debug] Set strategy to Fibonacci Retracement (ID: 9)")
                                 # Ensure fib_1m_buffer_size has a default if not in CSV
                                 if "fib_1m_buffer_size" not in configs: configs["fib_1m_buffer_size"] = DEFAULT_1M_BUFFER_SIZE
                                 # Ensure fib specific ATR SL params have defaults if not in CSV
                                 if "fib_atr_period" not in configs: configs["fib_atr_period"] = DEFAULT_FIB_ATR_PERIOD
                                 if "fib_sl_atr_multiplier" not in configs: configs["fib_sl_atr_multiplier"] = DEFAULT_FIB_SL_ATR_MULTIPLIER
-                            elif strategy_choice == "ict_strategy":
+                            elif current_strategy_choice == "ict_strategy":
                                 configs["strategy_id"] = 10
                                 configs["strategy_name"] = "ICT Strategy"
+                                print(f"[Debug] Set strategy to ICT Strategy (ID: 10)")
                                 # Ensure ICT specific params have defaults if not in CSV (many are now added)
                                 # Basic ones:
                                 if "ict_timeframe" not in configs: configs["ict_timeframe"] = DEFAULT_ICT_TIMEFRAME
@@ -2146,10 +2159,12 @@ def get_user_configurations(load_choice_override: str = None, make_changes_overr
                                     ("ict_kline_limit", DEFAULT_ICT_KLINE_LIMIT)
                                 ]:
                                     if ict_param not in configs: configs[ict_param] = ict_default
-                            # No 'else' here because strategy_choice is now validated to be one of the three.
-                            # else: # Should not happen if validation is correct
-                            #     print(f"Warning: Unknown strategy_choice '{strategy_choice}' from CSV. Defaulting to EMA Cross.")
-                            #     configs["strategy_choice"] = "ema_cross"
+                            else:
+                                # This else block means 'strategy_choice' was something unexpected AFTER validation,
+                                # which should not happen if validation enforces the allowed values.
+                                # Or, it was missing and defaulted to DEFAULT_STRATEGY, and that default isn't one of the three.
+                                print(f"ERROR: Validated 'strategy_choice' ('{current_strategy_choice}') is unknown. Defaulting to EMA Cross strategy settings as a fallback.")
+                                configs["strategy_choice"] = "ema_cross" # Correct the choice itself
                                 configs["strategy_id"] = 8
                                 configs["strategy_name"] = "Advance EMA Cross"
                             
