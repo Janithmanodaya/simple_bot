@@ -3428,6 +3428,32 @@ def calculate_aggregate_open_risk(active_trades_dict, current_balance):
     aggregate_risk_percentage = (total_absolute_risk / current_balance) * 100
     return aggregate_risk_percentage
 
+def load_symbols_from_csv(filepath: str) -> list[str]:
+    """Loads symbols from a CSV file, expecting a single 'symbol' column."""
+    if not os.path.exists(filepath):
+        print(f"Info: Symbol CSV file '{filepath}' not found.")
+        return []
+    try:
+        df = pd.read_csv(filepath)
+        if 'symbol' not in df.columns:
+            print(f"Error: Symbol CSV file '{filepath}' must contain a 'symbol' column.")
+            return []
+        
+        # Ensure symbols are strings, convert to uppercase, handle potential NaN, get unique, and sort
+        symbols_list = sorted(list(set(df['symbol'].dropna().astype(str).str.upper().tolist())))
+        
+        if not symbols_list:
+            print(f"Info: Symbol CSV file '{filepath}' is empty or contains no valid symbols.")
+            return []
+        # print(f"Loaded {len(symbols_list)} unique, sorted symbol(s) from '{filepath}'.") # More verbose, can enable if needed
+        return symbols_list
+    except pd.errors.EmptyDataError:
+        print(f"Info: Symbol CSV file '{filepath}' is empty.")
+        return []
+    except Exception as e:
+        print(f"Error loading symbols from CSV '{filepath}': {e}")
+        return []
+
 # This is the old definition, which has been replaced by the modified one below.
 # def get_account_balance(client, asset="USDT"):
 #     try:
@@ -3731,7 +3757,8 @@ def load_symbol_blacklist(filepath: str) -> list[str]:
             print(f"Info: Symbol blacklist file '{filepath}' is empty or contains no valid symbols.")
             return []
         # This print was moved to main() to avoid repetition if called multiple times by handlers.
-        # print(f"Loaded {len(blacklisted_symbols)} unique, sorted symbol(s) from blacklist file '{filepath}'.")
+        if blacklisted_symbols:  # Only print if some symbols were loaded
+            print(f"Loaded {len(blacklisted_symbols)} unique, sorted symbol(s) from blacklist file '{filepath}'.")
         return blacklisted_symbols
     except pd.errors.EmptyDataError:
         print(f"Info: Symbol blacklist file '{filepath}' is empty. No symbols will be blacklisted.")
@@ -5485,6 +5512,216 @@ def trading_loop(client, configs, monitored_symbols):
         executor.shutdown(wait=True) # Ensure all threads finish before exiting loop/program
         print("Thread pool executor shut down.")
 
+# --- ICT Strategy Core Components ---
+
+def identify_fair_value_gap(df: pd.DataFrame, direction: str = "bullish") -> pd.Series | None:
+    """
+    Identifies Fair Value Gaps (FVGs) in a DataFrame of klines.
+    An FVG is a 3-candle pattern where there's an imbalance.
+
+    Args:
+        df (pd.DataFrame): DataFrame with 'high', 'low', 'close' columns. Index must be DateTimeIndex.
+                           Should contain at least 3 candles.
+        direction (str): "bullish" or "bearish" to specify the type of FVG to look for.
+
+    Returns:
+        pd.Series | None: A Series indicating FVG presence (1 for FVG, 0 otherwise) for each candle.
+                          The FVG is marked on the third candle of the pattern.
+                          Returns None if input conditions are not met.
+    """
+    if not all(col in df.columns for col in ['high', 'low', 'close']):
+        print("Error: DataFrame must contain 'high', 'low', 'close' columns for FVG identification.")
+        return None
+    if len(df) < 3:
+        # print("Info: Data length less than 3, cannot identify FVGs.") # Can be too verbose
+        return None
+
+    fvg_series = pd.Series(0, index=df.index, dtype=int)
+    
+    # For a bullish FVG (price moved up, leaving a gap below):
+    # Candle 1: High
+    # Candle 2: Middle candle, its body and wicks don't fully cover the gap
+    # Candle 3: Low
+    # Gap is between Candle 1's high and Candle 3's low.
+    # Condition: Candle 1 High < Candle 3 Low (for a bullish FVG to exist)
+
+    # For a bearish FVG (price moved down, leaving a gap above):
+    # Candle 1: Low
+    # Candle 2: Middle candle
+    # Candle 3: High
+    # Gap is between Candle 1's low and Candle 3's high.
+    # Condition: Candle 1 Low > Candle 3 High (for a bearish FVG to exist)
+
+    for i in range(2, len(df)): # Iterate from the third candle
+        candle1_high = df['high'].iloc[i-2]
+        candle1_low = df['low'].iloc[i-2]
+        
+        # Candle 2 (middle candle) is df.iloc[i-1]
+        # We need to ensure Candle 2 does not fill the potential gap.
+        candle2_high = df['high'].iloc[i-1]
+        candle2_low = df['low'].iloc[i-1]
+
+        candle3_high = df['high'].iloc[i]
+        candle3_low = df['low'].iloc[i]
+
+        is_fvg = False
+        if direction == "bullish":
+            # Bullish FVG: Candle 1 High is below Candle 3 Low
+            # The gap is formed by the impulse upwards.
+            # Candle 1 creates the bottom of the gap with its high.
+            # Candle 3 creates the top of the gap with its low.
+            # The middle candle (Candle 2) must not have its low go below Candle 1's high,
+            # and its high must not go above Candle 3's low. (This is implicitly handled by the FVG definition)
+            # The key is: Candle 1 High < Candle 3 Low.
+            # And Candle 2's low must be > Candle 1's high. (Wick of candle 2 doesn't fill the gap from below)
+            if candle1_high < candle3_low: # Potential gap
+                # Check if candle 2's low is above candle 1's high (ensuring candle 2 didn't fill it)
+                if candle2_low > candle1_high:
+                    is_fvg = True
+                    # FVG details: (candle1_high, candle3_low) - this is the FVG zone
+                    # print(f"Bullish FVG detected at {df.index[i]}: C1_H={candle1_high}, C3_L={candle3_low}")
+        
+        elif direction == "bearish":
+            # Bearish FVG: Candle 1 Low is above Candle 3 High
+            # The gap is formed by the impulse downwards.
+            # Candle 1 creates the top of the gap with its low.
+            # Candle 3 creates the bottom of the gap with its high.
+            # Candle 2's high must be < Candle 1's low. (Wick of candle 2 doesn't fill the gap from above)
+            if candle1_low > candle3_high: # Potential gap
+                # Check if candle 2's high is below candle 1's low
+                if candle2_high < candle1_low:
+                    is_fvg = True
+                    # FVG details: (candle3_high, candle1_low) - this is the FVG zone
+                    # print(f"Bearish FVG detected at {df.index[i]}: C1_L={candle1_low}, C3_H={candle3_high}")
+
+        if is_fvg:
+            fvg_series.iloc[i] = 1 # Mark FVG on the third candle
+
+    return fvg_series
+
+def identify_order_block(df: pd.DataFrame, direction: str = "bullish", fvg_series: pd.Series = None) -> pd.Series | None:
+    """
+    Identifies Order Blocks (OBs).
+    A bullish OB is typically the last down-candle before a strong up-move that breaks structure.
+    A bearish OB is typically the last up-candle before a strong down-move that breaks structure.
+    Optionally considers if an FVG is present immediately after/within the OB's move.
+
+    Args:
+        df (pd.DataFrame): DataFrame with 'open', 'high', 'low', 'close'. Index DateTimeIndex. Min 3-5 candles.
+        direction (str): "bullish" (looking for bullish OB - last down candle before up move)
+                         "bearish" (looking for bearish OB - last up candle before down move)
+        fvg_series (pd.Series, optional): Series indicating FVG presence, to confirm OB.
+
+    Returns:
+        pd.Series | None: Series indicating OB presence (1 for OB, 0 otherwise) marked on the OB candle itself.
+                          None if input conditions not met.
+    """
+    if not all(col in df.columns for col in ['open', 'high', 'low', 'close']):
+        print("Error: DataFrame must contain 'open', 'high', 'low', 'close' for OB identification.")
+        return None
+    if len(df) < 3: # Need at least a few candles to see a "move"
+        return None
+
+    ob_series = pd.Series(0, index=df.index, dtype=int)
+
+    for i in range(1, len(df) - 1): # Iterate, leaving one candle before and one after for context
+        ob_candle = df.iloc[i]
+        prev_candle = df.iloc[i-1] # For structure break context (optional here, can be separate)
+        next_candle = df.iloc[i+1] # The "strong move" candle after the OB
+
+        is_ob = False
+        if direction == "bullish":
+            # Bullish OB: Last down-candle (close < open) before a strong up-move.
+            # The "strong up-move" is represented by next_candle being strongly bullish
+            # and ideally breaking the high of the OB candle or prior structure.
+            if ob_candle['close'] < ob_candle['open']: # OB candidate is a down-candle
+                # Next candle must be a strong up-move
+                if next_candle['close'] > next_candle['open'] and \
+                   next_candle['close'] > ob_candle['high']: # Closes above the high of the OB candle (break of micro-structure)
+                    
+                    # Optional: Check for FVG after this OB (on next_candle or candle after that)
+                    if fvg_series is not None:
+                        # FVG should be on the candle following the OB candle (i.e., next_candle index, or one after)
+                        fvg_confirmation_index = i + 1 # Index of next_candle in the main df
+                        if fvg_confirmation_index < len(fvg_series) and fvg_series.iloc[fvg_confirmation_index] == 1:
+                            is_ob = True
+                        # Could also check fvg_series.iloc[i+2] if FVG forms on 3rd candle of OB's move
+                    else: # No FVG check, basic OB definition
+                        is_ob = True
+            
+        elif direction == "bearish":
+            # Bearish OB: Last up-candle (close > open) before a strong down-move.
+            if ob_candle['close'] > ob_candle['open']: # OB candidate is an up-candle
+                # Next candle must be a strong down-move
+                if next_candle['close'] < next_candle['open'] and \
+                   next_candle['low'] < ob_candle['low']: # Closes below the low of the OB candle
+                    
+                    if fvg_series is not None:
+                        fvg_confirmation_index = i + 1
+                        if fvg_confirmation_index < len(fvg_series) and fvg_series.iloc[fvg_confirmation_index] == 1:
+                            is_ob = True
+                    else:
+                        is_ob = True
+        
+        if is_ob:
+            ob_series.iloc[i] = 1
+            # print(f"{direction.capitalize()} Order Block identified at {df.index[i]}")
+
+    return ob_series
+
+def identify_liquidity_sweep(df: pd.DataFrame, lookback: int = 20, sweep_type: str = "buyside") -> pd.Series | None:
+    """
+    Identifies liquidity sweeps (stop hunts).
+    - Buyside sweep: Wick goes above a recent high, then price closes back below that high.
+    - Sellside sweep: Wick goes below a recent low, then price closes back above that low.
+
+    Args:
+        df (pd.DataFrame): DataFrame with 'high', 'low', 'close'. Index DateTimeIndex.
+        lookback (int): Period to look back for recent highs/lows.
+        sweep_type (str): "buyside" or "sellside".
+
+    Returns:
+        pd.Series | None: Series indicating sweep (1 for sweep, 0 otherwise) on the sweep candle.
+                          None if input conditions not met.
+    """
+    if not all(col in df.columns for col in ['high', 'low', 'close']):
+        print("Error: DataFrame must contain 'high', 'low', 'close' for liquidity sweep identification.")
+        return None
+    if len(df) < lookback + 1:
+        # print("Info: Data length insufficient for lookback period in liquidity sweep.") # Can be verbose
+        return None
+
+    sweep_series = pd.Series(0, index=df.index, dtype=int)
+
+    for i in range(lookback, len(df)):
+        current_candle = df.iloc[i]
+        history = df.iloc[i-lookback : i] # Lookback period excluding current candle
+
+        is_sweep = False
+        if sweep_type == "buyside":
+            recent_high = history['high'].max()
+            # Sweep: Current candle's high goes above recent_high, but closes below it.
+            if current_candle['high'] > recent_high and current_candle['close'] < recent_high:
+                # Ensure the wick actually went above, not just body
+                if current_candle['open'] < recent_high or current_candle['close'] < current_candle['open']: # If it's a down close or opened below
+                    is_sweep = True
+                    # print(f"Buyside liquidity sweep detected at {df.index[i]}. Recent High: {recent_high}, Candle H: {current_candle['high']}, C: {current_candle['close']}")
+        
+        elif sweep_type == "sellside":
+            recent_low = history['low'].min()
+            # Sweep: Current candle's low goes below recent_low, but closes above it.
+            if current_candle['low'] < recent_low and current_candle['close'] > recent_low:
+                if current_candle['open'] > recent_low or current_candle['close'] > current_candle['open']: # If it's an up close or opened above
+                    is_sweep = True
+                    # print(f"Sellside liquidity sweep detected at {df.index[i]}. Recent Low: {recent_low}, Candle L: {current_candle['low']}, C: {current_candle['close']}")
+        
+        if is_sweep:
+            sweep_series.iloc[i] = 1
+            
+    return sweep_series
+
+# --- End ICT Strategy Core Components ---
+
 
 # --- Monitor Active Signals (for 'Signal' Mode) ---
 def monitor_active_signals(client, configs):
@@ -6035,17 +6272,31 @@ def main_bot_logic(): # Renamed main to main_bot_logic
     if blacklisted_symbols:
         print(f"Loaded {len(blacklisted_symbols)} symbol(s) from blacklist: {', '.join(blacklisted_symbols)}")
 
-    monitored_symbols_all = get_all_usdt_perpetual_symbols(client) # Use global client
+    # --- Load symbols from symbols.csv ---
+    symbols_csv_filepath = "symbols.csv"
+    user_defined_symbols = load_symbols_from_csv(symbols_csv_filepath)
+
+    if not user_defined_symbols:
+        print(f"Warning: '{symbols_csv_filepath}' is empty or not found. Attempting to fall back to all USDT perpetuals.")
+        monitored_symbols_all = get_all_usdt_perpetual_symbols(client) # Fallback
+        if not monitored_symbols_all:
+            print("Exiting: No symbols found from fallback (all USDT perpetuals). Please check symbols.csv or ensure API connectivity.")
+            sys.exit(1)
+        print(f"Using {len(monitored_symbols_all)} symbols from Binance (all USDT perpetuals) as fallback.")
+    else:
+        print(f"Loaded {len(user_defined_symbols)} symbols from '{symbols_csv_filepath}'.")
+        monitored_symbols_all = user_defined_symbols
     
-    # Filter out blacklisted symbols
+    # Filter out blacklisted symbols from the (user-defined or fallback) list
     monitored_symbols = [s for s in monitored_symbols_all if s not in blacklisted_symbols]
     
     excluded_by_blacklist_count = len(monitored_symbols_all) - len(monitored_symbols)
     if excluded_by_blacklist_count > 0:
-        print(f"Excluded {excluded_by_blacklist_count} symbol(s) due to blacklist: {', '.join(sorted(list(set(monitored_symbols_all) - set(monitored_symbols))))}")
+        excluded_symbols_str = ', '.join(sorted(list(set(monitored_symbols_all) - set(monitored_symbols))))
+        print(f"Excluded {excluded_by_blacklist_count} symbol(s) due to blacklist: {excluded_symbols_str}")
     
     if not monitored_symbols: 
-        print("Exiting: No symbols to monitor after applying blacklist (or no symbols found initially).")
+        print("Exiting: No symbols to monitor after applying blacklist (or no symbols found from CSV/fallback).")
         sys.exit(1)
     
     # --- Initial Telegram Notification ---
