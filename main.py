@@ -84,7 +84,7 @@ DEFAULT_ICT_OB_BOS_LOOKBACK = 10 # Lookback for BoS confirmation for an OB
 DEFAULT_ICT_PO3_CONSOLIDATION_LOOKBACK = 10 # Lookback for Po3 consolidation
 DEFAULT_ICT_PO3_ACCELERATION_MIN_CANDLES = 1 # Min candles for Po3 acceleration
 DEFAULT_ICT_LIMIT_SIGNAL_COOLDOWN_SECONDS = 300 # Cooldown for ICT limit signals
-DEFAULT_ICT_LIMIT_SIGNAL_SIGNATURE_BLOCK_SECONDS = 300 # Block duplicate signatures
+DEFAULT_ICT_LIMIT_SIGNAL_SIGNATURE_BLOCK_SECONDS = 60 # Block duplicate signatures (Reduced from 300)
 DEFAULT_ICT_ORDER_TIMEOUT_MINUTES = 15 # Timeout for pending ICT limit orders
 DEFAULT_ICT_KLINE_LIMIT = 300 # Number of klines to fetch for ICT analysis
 
@@ -252,7 +252,7 @@ def validate_configurations(loaded_configs: dict) -> tuple[bool, str, dict]:
         "ict_limit_signal_cooldown_seconds": {"type": int, "optional": True, "condition": lambda x: 0 <= x <= 3600},
         "ict_limit_signal_signature_block_seconds": {"type": int, "optional": True, "condition": lambda x: 0 <= x <= 3600},
         "ict_order_timeout_minutes": {"type": int, "optional": True, "condition": lambda x: 1 <= x <= 1440}, # Up to 1 day
-        "ict_kline_limit": {"type": int, "optional": True, "condition": lambda x: 100 <= x <= 1000}
+        "ict_kline_limit": {"type": int, "optional": True, "condition": lambda x: 300 <= x <= 1000, "condition_desc": "must be between 300 and 1000"}
 
         # API keys and telegram details are not part of this CSV validation
     }
@@ -2763,10 +2763,10 @@ def get_user_configurations(load_choice_override: str = None, make_changes_overr
             except ValueError: print("Invalid input.")
         while True:
             try:
-                val = get_input_with_default("Enter ICT Limit Signal Signature Block (seconds)", "ict_limit_signal_signature_block_seconds", DEFAULT_ICT_LIMIT_SIGNAL_SIGNATURE_BLOCK_SECONDS, int)
+                val = get_input_with_default("Enter ICT Limit Signal Signature Block (seconds, e.g., 60)", "ict_limit_signal_signature_block_seconds", DEFAULT_ICT_LIMIT_SIGNAL_SIGNATURE_BLOCK_SECONDS, int)
                 if 0 <= val <= 3600: configs["ict_limit_signal_signature_block_seconds"] = val; break
                 print("ICT Limit Signal Signature Block must be between 0 and 3600 seconds.")
-            except ValueError: print("Invalid input.")
+            except ValueError: print("Invalid input. Please enter an integer.")
         while True:
             try:
                 val = get_input_with_default("Enter ICT Order Timeout (minutes)", "ict_order_timeout_minutes", DEFAULT_ICT_ORDER_TIMEOUT_MINUTES, int)
@@ -2776,9 +2776,15 @@ def get_user_configurations(load_choice_override: str = None, make_changes_overr
         while True:
             try:
                 val = get_input_with_default("Enter ICT Kline Fetch Limit", "ict_kline_limit", DEFAULT_ICT_KLINE_LIMIT, int)
-                if 100 <= val <= 1000: configs["ict_kline_limit"] = val; break
-                print("ICT Kline Limit must be between 100 and 1000.")
-            except ValueError: print("Invalid input.")
+                if val < 300:
+                    print(f"ICT Kline Limit must be at least 300. Adjusting {val} to 300.")
+                    val = 300
+                elif val > 1000:
+                    print(f"ICT Kline Limit cannot exceed 1000. Adjusting {val} to 1000.")
+                    val = 1000
+                configs["ict_kline_limit"] = val
+                break
+            except ValueError: print("Invalid input. Please enter an integer.")
 
     else: # Not ICT strategy, remove if they were in loaded CSV
         configs.pop("ict_timeframe", None)
@@ -2987,18 +2993,54 @@ def _build_symbol_info_map_from_active_trades(active_trades_dict):
 def initialize_binance_client(configs):
     api_key, api_secret, env = configs["api_key"], configs["api_secret"], configs["environment"]
     try:
-        client = Client(api_key, api_secret, testnet=(env == "testnet"))
-        client.ping() # Verify connection
-        server_time = client.get_server_time() # Get server time for the success message
-        # print(f"\nSuccessfully connected to Binance {env.title()} API. Server Time: {pd.to_datetime(server_time['serverTime'], unit='ms')} UTC")
-        # Return client, environment title, and server time for main() to construct the message
-        return client, env, server_time # Modified return
+        # Initialize a temporary client to get server time first, if needed for offset calculation before full client init
+        # However, python-binance client itself can fetch server time.
+        # Let's increase recvWindow. Default is 5000ms. Let's try 20000ms.
+        # The library handles timestamping internally, so adjusting system time or applying offset manually
+        # to each request is not standard practice with this library.
+        # The primary fix for -1021 is system time sync or a larger recvWindow.
+
+        recv_window_ms = 20000  # Increased recvWindow to 20000ms
+        # Set a reasonable requests timeout, e.g., 10 or 15 seconds. This is separate from recvWindow.
+        requests_timeout_seconds = 15 
+        client = Client(api_key, api_secret, testnet=(env == "testnet"), requests_params={'timeout': requests_timeout_seconds})
+
+        # Set the recvWindow on the client instance
+        client.RECV_WINDOW = recv_window_ms
+
+        # Fetch server time and calculate offset for logging and warning
+        server_time_info = client.get_server_time()
+        server_timestamp_ms = server_time_info['serverTime']
+        local_timestamp_ms = int(time.time() * 1000)
+        time_offset_ms = local_timestamp_ms - server_timestamp_ms
+
+        print(f"Binance Server Time: {pd.to_datetime(server_timestamp_ms, unit='ms')} UTC")
+        print(f"Local System Time: {pd.to_datetime(local_timestamp_ms, unit='ms')} UTC")
+        print(f"Time Offset (Local - Server): {time_offset_ms} ms")
+
+        if abs(time_offset_ms) > 1000: # More than 1 second offset
+            warning_message = (
+                f"⚠️ WARNING: Your system clock is out of sync with Binance server time by {time_offset_ms} ms.\n"
+                f"This can lead to API errors (like -1021).\n"
+                f"Please ensure your system time is synchronized with an NTP server (e.g., time.google.com, pool.ntp.org)."
+            )
+            print(warning_message)
+            # Optionally, send to Telegram if available in configs at this stage (configs might not be fully populated yet)
+            # For now, just printing is fine as this is early in startup.
+
+        client.ping() # Verify connection after setup
+        
+        # Return client, environment title, and server_time_info (which contains serverTime)
+        return client, env, server_time_info
+        
     except BinanceAPIException as e:
         print(f"Binance API Exception (client init): {e}")
-        return None, None, None # Modified return
+        if e.code == -1021: # Specifically catch -1021 here too
+             print("Timestamp error during client initialization. This strongly suggests system time desynchronization.")
+        return None, None, None
     except Exception as e:
         print(f"Error initializing Binance client: {e}")
-        return None, None, None # Modified return
+        return None, None, None
 
 def get_historical_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=500, backtest_days=None):
     """
@@ -5709,7 +5751,7 @@ def trading_loop(client, configs, monitored_symbols):
                 # --- Loop Delay ---
                 # Determine appropriate sleep time
                 # If any halt is active, or max positions, might use a shorter delay to check for new day or slot availability sooner.
-                current_loop_delay_seconds = configs['loop_delay_minutes'] * 25 # Default delay
+                current_loop_delay_seconds = configs['loop_delay_minutes'] # Default delay
                 if halt_dd_flag or halt_dsl_flag or (num_active_trades >= max_pos_limit and proceed_with_new_trades == False) :
                     # Using a shorter delay if halted or at max positions, to check for day reset or position closure sooner
                     current_loop_delay_seconds = 25 
