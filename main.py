@@ -213,7 +213,7 @@ def validate_configurations(loaded_configs: dict) -> tuple[bool, str, dict]:
         "min_leverage": {"type": int, "condition": lambda x: 1 <= x <= 125},
         "max_leverage": {"type": int, "condition": lambda x: 1 <= x <= 125}, # Further check against min_leverage done in input logic
         "allow_exceed_risk_for_min_notional": {"type": bool},
-        "strategy_choice": {"type": str, "valid_values": ["ema_cross", "fib_retracement"]},
+        "strategy_choice": {"type": str, "valid_values": ["ema_cross", "fib_retracement", "ict_strategy"]},
         "fib_1m_buffer_size": {"type": int, "optional": True, "condition": lambda x: 20 <= x <= 1000}, # For Fibonacci strategy
         "fib_order_timeout_minutes": {"type": int, "optional": True, "condition": lambda x: 1 <= x <= 60}, # For Fibonacci strategy
         "fib_atr_period": {"type": int, "optional": True, "condition": lambda x: x > 0}, # For Fibonacci SL
@@ -2110,7 +2110,7 @@ def get_user_configurations(load_choice_override: str = None, make_changes_overr
                                 break
                             
                             # Set strategy specific details based on choice
-                            strategy_choice = configs.get("strategy_choice", DEFAULT_STRATEGY)
+                            strategy_choice = configs.get("strategy_choice", DEFAULT_STRATEGY) # This should be validated now
                             if strategy_choice == "ema_cross":
                                 configs["strategy_id"] = 8
                                 configs["strategy_name"] = "Advance EMA Cross"
@@ -2125,14 +2125,31 @@ def get_user_configurations(load_choice_override: str = None, make_changes_overr
                             elif strategy_choice == "ict_strategy":
                                 configs["strategy_id"] = 10
                                 configs["strategy_name"] = "ICT Strategy"
-                                # Ensure ICT specific params have defaults if not in CSV
+                                # Ensure ICT specific params have defaults if not in CSV (many are now added)
+                                # Basic ones:
                                 if "ict_timeframe" not in configs: configs["ict_timeframe"] = DEFAULT_ICT_TIMEFRAME
                                 if "ict_risk_reward_ratio" not in configs: configs["ict_risk_reward_ratio"] = DEFAULT_ICT_RISK_REWARD_RATIO
                                 if "ict_fvg_freshness_candles" not in configs: configs["ict_fvg_freshness_candles"] = DEFAULT_ICT_FVG_FRESHNESS_CANDLES
                                 if "ict_liquidity_lookback" not in configs: configs["ict_liquidity_lookback"] = DEFAULT_ICT_LIQUIDITY_LOOKBACK
-                            else: # Should not happen if validation is correct
-                                print(f"Warning: Unknown strategy_choice '{strategy_choice}' from CSV. Defaulting to EMA Cross.")
-                                configs["strategy_choice"] = "ema_cross"
+                                # Add defaults for other new ICT params if they are missing from CSV
+                                for ict_param, ict_default in [
+                                    ("ict_sweep_detection_window", DEFAULT_ICT_SWEEP_DETECTION_WINDOW),
+                                    ("ict_entry_type", DEFAULT_ICT_ENTRY_TYPE),
+                                    ("ict_sl_type", DEFAULT_ICT_SL_TYPE),
+                                    ("ict_sl_atr_buffer_multiplier", DEFAULT_ICT_SL_ATR_BUFFER_MULTIPLIER),
+                                    ("ict_ob_bos_lookback", DEFAULT_ICT_OB_BOS_LOOKBACK),
+                                    ("ict_po3_consolidation_lookback", DEFAULT_ICT_PO3_CONSOLIDATION_LOOKBACK),
+                                    ("ict_po3_acceleration_min_candles", DEFAULT_ICT_PO3_ACCELERATION_MIN_CANDLES),
+                                    ("ict_limit_signal_cooldown_seconds", DEFAULT_ICT_LIMIT_SIGNAL_COOLDOWN_SECONDS),
+                                    ("ict_limit_signal_signature_block_seconds", DEFAULT_ICT_LIMIT_SIGNAL_SIGNATURE_BLOCK_SECONDS),
+                                    ("ict_order_timeout_minutes", DEFAULT_ICT_ORDER_TIMEOUT_MINUTES),
+                                    ("ict_kline_limit", DEFAULT_ICT_KLINE_LIMIT)
+                                ]:
+                                    if ict_param not in configs: configs[ict_param] = ict_default
+                            # No 'else' here because strategy_choice is now validated to be one of the three.
+                            # else: # Should not happen if validation is correct
+                            #     print(f"Warning: Unknown strategy_choice '{strategy_choice}' from CSV. Defaulting to EMA Cross.")
+                            #     configs["strategy_choice"] = "ema_cross"
                                 configs["strategy_id"] = 8
                                 configs["strategy_name"] = "Advance EMA Cross"
                             
