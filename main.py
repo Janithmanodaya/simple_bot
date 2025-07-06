@@ -88,6 +88,18 @@ DEFAULT_ICT_LIMIT_SIGNAL_SIGNATURE_BLOCK_SECONDS = 60 # Block duplicate signatur
 DEFAULT_ICT_ORDER_TIMEOUT_MINUTES = 15 # Timeout for pending ICT limit orders
 DEFAULT_ICT_KLINE_LIMIT = 300 # Number of klines to fetch for ICT analysis
 
+# Dynamic Liquidity Zone Defaults for ICT
+DEFAULT_ICT_PRIMARY_LIQUIDITY_LOOKBACK = 50    # Fixed lookback for primary liquidity zones
+DEFAULT_ICT_ADAPTIVE_INITIAL_LOOKBACK = 50     # Initial lookback for secondary adaptive search
+DEFAULT_ICT_ADAPTIVE_INCREMENT_STEP = 10       # Step to increment lookback for secondary adaptive search
+DEFAULT_ICT_ADAPTIVE_MAX_LOOKBACK = 200        # Max lookback for secondary adaptive search
+# PIVOT_N_LEFT, PIVOT_N_RIGHT (used by adaptive secondary) are currently global constants (5,5)
+# They could be made configurable per strategy if needed in the future.
+
+# ICT Sweep Detection Enhancement Defaults
+DEFAULT_ICT_SWEEP_PENETRATION_PERCENT = 0.25   # e.g., 0.25 for 25% penetration of virtual zone width
+DEFAULT_ICT_SWEEP_ZONE_WIDTH_ATR_FACTOR = 0.1  # e.g., 0.1 * ATR for virtual zone width
+DEFAULT_ICT_SWEEP_CLOSE_BACK_WINDOW = 1        # e.g., 1 bar (sweep candle itself), max 3
 
 # --- Global State Variables ---
 # Stores details of active trades. Key: symbol (e.g., "BTCUSDT")
@@ -252,8 +264,17 @@ def validate_configurations(loaded_configs: dict) -> tuple[bool, str, dict]:
         "ict_limit_signal_cooldown_seconds": {"type": int, "optional": True, "condition": lambda x: 0 <= x <= 3600},
         "ict_limit_signal_signature_block_seconds": {"type": int, "optional": True, "condition": lambda x: 0 <= x <= 3600},
         "ict_order_timeout_minutes": {"type": int, "optional": True, "condition": lambda x: 1 <= x <= 1440}, # Up to 1 day
-        "ict_kline_limit": {"type": int, "optional": True, "condition": lambda x: 300 <= x <= 1000, "condition_desc": "must be between 300 and 1000"}
-
+        "ict_kline_limit": {"type": int, "optional": True, "condition": lambda x: 300 <= x <= 1000, "condition_desc": "must be between 300 and 1000"},
+        # Dynamic Liquidity Zone Params for ICT
+        "ict_primary_liquidity_lookback": {"type": int, "optional": True, "condition": lambda x: 10 <= x <= 200, "condition_desc": "must be between 10 and 200"},
+        "ict_secondary_adaptive_initial_lookback": {"type": int, "optional": True, "condition": lambda x: 10 <= x <= 300, "condition_desc": "must be between 10 and 300"},
+        "ict_secondary_adaptive_increment_step": {"type": int, "optional": True, "condition": lambda x: 5 <= x <= 50, "condition_desc": "must be between 5 and 50"},
+        "ict_secondary_adaptive_max_lookback": {"type": int, "optional": True, "condition": lambda x: 50 <= x <= 500, "condition_desc": "must be between 50 and 500"},
+        # ICT Sweep Detection Enhancement Params
+        "ict_sweep_penetration_percentage": {"type": float, "optional": True, "condition": lambda x: 0.0 <= x <= 1.0, "condition_desc": "must be between 0.0 (disabled/full wick) and 1.0 (100%)"},
+        "ict_sweep_zone_width_atr_factor": {"type": float, "optional": True, "condition": lambda x: 0.0 <= x <= 1.0, "condition_desc": "must be between 0.0 (no virtual zone) and 1.0 (1x ATR width)"},
+        "ict_sweep_close_back_window": {"type": int, "optional": True, "condition": lambda x: 1 <= x <= 3, "condition_desc": "must be between 1 and 3 bars"}
+        
         # API keys and telegram details are not part of this CSV validation
     }
     
@@ -2156,7 +2177,16 @@ def get_user_configurations(load_choice_override: str = None, make_changes_overr
                                     ("ict_limit_signal_cooldown_seconds", DEFAULT_ICT_LIMIT_SIGNAL_COOLDOWN_SECONDS),
                                     ("ict_limit_signal_signature_block_seconds", DEFAULT_ICT_LIMIT_SIGNAL_SIGNATURE_BLOCK_SECONDS),
                                     ("ict_order_timeout_minutes", DEFAULT_ICT_ORDER_TIMEOUT_MINUTES),
-                                    ("ict_kline_limit", DEFAULT_ICT_KLINE_LIMIT)
+                                    ("ict_kline_limit", DEFAULT_ICT_KLINE_LIMIT),
+                                    # Dynamic Liquidity Zone Defaults for ICT if not in CSV
+                                    ("ict_primary_liquidity_lookback", DEFAULT_ICT_PRIMARY_LIQUIDITY_LOOKBACK),
+                                    ("ict_secondary_adaptive_initial_lookback", DEFAULT_ICT_ADAPTIVE_INITIAL_LOOKBACK),
+                                    ("ict_secondary_adaptive_increment_step", DEFAULT_ICT_ADAPTIVE_INCREMENT_STEP),
+                                    ("ict_secondary_adaptive_max_lookback", DEFAULT_ICT_ADAPTIVE_MAX_LOOKBACK),
+                                    # ICT Sweep Detection Enhancement Defaults if not in CSV
+                                    ("ict_sweep_penetration_percentage", DEFAULT_ICT_SWEEP_PENETRATION_PERCENT),
+                                    ("ict_sweep_zone_width_atr_factor", DEFAULT_ICT_SWEEP_ZONE_WIDTH_ATR_FACTOR),
+                                    ("ict_sweep_close_back_window", DEFAULT_ICT_SWEEP_CLOSE_BACK_WINDOW)
                                 ]:
                                     if ict_param not in configs: configs[ict_param] = ict_default
                             else:
@@ -2801,11 +2831,60 @@ def get_user_configurations(load_choice_override: str = None, make_changes_overr
                 break
             except ValueError: print("Invalid input. Please enter an integer.")
 
+        # Dynamic Liquidity Zone parameters for ICT
+        while True:
+            try:
+                val = get_input_with_default("Enter ICT Primary Liquidity Lookback (candles, e.g., 10-200)", "ict_primary_liquidity_lookback", DEFAULT_ICT_PRIMARY_LIQUIDITY_LOOKBACK, int)
+                if 10 <= val <= 200: configs["ict_primary_liquidity_lookback"] = val; break
+                print("Primary Liquidity Lookback must be between 10 and 200.")
+            except ValueError: print("Invalid input.")
+        while True:
+            try:
+                val = get_input_with_default("Enter ICT Secondary Adaptive Initial Lookback (candles, e.g., 10-300)", "ict_secondary_adaptive_initial_lookback", DEFAULT_ICT_ADAPTIVE_INITIAL_LOOKBACK, int)
+                if 10 <= val <= 300: configs["ict_secondary_adaptive_initial_lookback"] = val; break
+                print("Secondary Adaptive Initial Lookback must be between 10 and 300.")
+            except ValueError: print("Invalid input.")
+        while True:
+            try:
+                val = get_input_with_default("Enter ICT Secondary Adaptive Increment Step (candles, e.g., 5-50)", "ict_secondary_adaptive_increment_step", DEFAULT_ICT_ADAPTIVE_INCREMENT_STEP, int)
+                if 5 <= val <= 50: configs["ict_secondary_adaptive_increment_step"] = val; break
+                print("Secondary Adaptive Increment Step must be between 5 and 50.")
+            except ValueError: print("Invalid input.")
+        while True:
+            try:
+                val = get_input_with_default("Enter ICT Secondary Adaptive Max Lookback (candles, e.g., 50-500)", "ict_secondary_adaptive_max_lookback", DEFAULT_ICT_ADAPTIVE_MAX_LOOKBACK, int)
+                # Ensure max_lookback is >= initial_lookback for secondary adaptive
+                initial_sec_lookback = configs.get("ict_secondary_adaptive_initial_lookback", DEFAULT_ICT_ADAPTIVE_INITIAL_LOOKBACK)
+                if val >= initial_sec_lookback and val <= 500 : configs["ict_secondary_adaptive_max_lookback"] = val; break
+                print(f"Secondary Adaptive Max Lookback must be between {initial_sec_lookback} (initial) and 500.")
+            except ValueError: print("Invalid input.")
+        
+        # ICT Sweep Detection Enhancement parameters
+        while True:
+            try:
+                val = get_input_with_default("Enter ICT Sweep Penetration % (e.g., 0.25 for 25%, 0 for full wick beyond point)", "ict_sweep_penetration_percentage", DEFAULT_ICT_SWEEP_PENETRATION_PERCENT, float)
+                if 0.0 <= val <= 1.0: configs["ict_sweep_penetration_percentage"] = val; break
+                print("Sweep Penetration Percentage must be between 0.0 and 1.0.")
+            except ValueError: print("Invalid input.")
+        while True:
+            try:
+                val = get_input_with_default("Enter ICT Sweep Zone Width ATR Factor (e.g., 0.1 for 0.1*ATR virtual zone width)", "ict_sweep_zone_width_atr_factor", DEFAULT_ICT_SWEEP_ZONE_WIDTH_ATR_FACTOR, float)
+                if 0.0 <= val <= 1.0: configs["ict_sweep_zone_width_atr_factor"] = val; break # Allow 0 if user wants no virtual zone width based on ATR
+                print("Sweep Zone Width ATR Factor must be between 0.0 and 1.0.")
+            except ValueError: print("Invalid input.")
+        while True:
+            try:
+                val = get_input_with_default("Enter ICT Sweep Close-Back Window (bars, e.g., 1-3)", "ict_sweep_close_back_window", DEFAULT_ICT_SWEEP_CLOSE_BACK_WINDOW, int)
+                if 1 <= val <= 3: configs["ict_sweep_close_back_window"] = val; break
+                print("Sweep Close-Back Window must be between 1 and 3 bars.")
+            except ValueError: print("Invalid input.")
+
+
     else: # Not ICT strategy, remove if they were in loaded CSV
         configs.pop("ict_timeframe", None)
         configs.pop("ict_risk_reward_ratio", None)
         configs.pop("ict_fvg_freshness_candles", None)
-        configs.pop("ict_liquidity_lookback", None)
+        configs.pop("ict_liquidity_lookback", None) # Old fixed lookback, will be replaced by new tiered ones if ICT chosen
         configs.pop("ict_sweep_detection_window", None)
         configs.pop("ict_entry_type", None)
         configs.pop("ict_sl_type", None)
@@ -2817,6 +2896,16 @@ def get_user_configurations(load_choice_override: str = None, make_changes_overr
         configs.pop("ict_limit_signal_signature_block_seconds", None)
         configs.pop("ict_order_timeout_minutes", None)
         configs.pop("ict_kline_limit", None)
+        # New dynamic liquidity zone params
+        configs.pop("ict_primary_liquidity_lookback", None)
+        configs.pop("ict_secondary_adaptive_initial_lookback", None)
+        configs.pop("ict_secondary_adaptive_increment_step", None)
+        configs.pop("ict_secondary_adaptive_max_lookback", None)
+        # ICT Sweep Detection Enhancement Params
+        configs.pop("ict_sweep_penetration_percentage", None)
+        configs.pop("ict_sweep_zone_width_atr_factor", None)
+        configs.pop("ict_sweep_close_back_window", None)
+
 
     # Fibonacci Strategy Specific: TP Scaling and SL Management (only if Fib strategy is chosen)
     if configs.get("strategy_choice") == "fib_retracement":
@@ -6089,42 +6178,217 @@ def identify_market_structure_ict(df: pd.DataFrame, swing_lookback: int = 10, pi
     return "range/consolidation"
 
 
-def identify_liquidity_zones_ict(df: pd.DataFrame, lookback_period: int = 20) -> dict:
+def identify_liquidity_zones_ict(
+    df: pd.DataFrame,
+    primary_lookback: int,
+    secondary_initial_lookback: int,
+    secondary_increment_step: int,
+    secondary_max_lookback: int,
+    pivot_n_left: int,
+    pivot_n_right: int
+) -> dict:
     """
-    Identifies recent swing highs and lows as potential liquidity zones.
+    Identifies multi-tier liquidity zones (Primary and Secondary).
+    Primary zones use a fixed lookback.
+    Secondary zones use an adaptive lookback window to find fresh swing points.
     Args:
-        df (pd.DataFrame): DataFrame with 'high', 'low'.
-        lookback_period (int): Number of candles to look back for swings.
+        df (pd.DataFrame): DataFrame with 'high', 'low', 'close'.
+        primary_lookback (int): Fixed lookback period for primary zones.
+        secondary_initial_lookback (int): Starting lookback for secondary adaptive search.
+        secondary_increment_step (int): Increment for secondary adaptive search.
+        secondary_max_lookback (int): Maximum lookback for secondary adaptive search.
+        pivot_n_left (int): Left window for pivot detection (for secondary zones).
+        pivot_n_right (int): Right window for pivot detection (for secondary zones).
     Returns:
-        dict: {'buyside': float | None, 'sellside': float | None}
+        dict: {
+            'primary_buyside_liq': float | None, 'primary_sellside_liq': float | None,
+            'secondary_buyside_liq': float | None, 'secondary_sellside_liq': float | None,
+            'effective_secondary_lookback_buyside': int,
+            'effective_secondary_lookback_sellside': int
+        }
     """
-    if len(df) < lookback_period:
-        return {'buyside': None, 'sellside': None}
-    
-    recent_data = df.iloc[-lookback_period:]
-    buyside_liq = recent_data['high'].max()
-    sellside_liq = recent_data['low'].min()
-    
-    return {'buyside': buyside_liq, 'sellside': sellside_liq}
+    primary_buyside_liq, primary_sellside_liq = None, None
+    secondary_buyside_liq, secondary_sellside_liq = None, None
+    effective_secondary_lookback_buyside = secondary_initial_lookback
+    effective_secondary_lookback_sellside = secondary_initial_lookback
+
+    # --- Primary Liquidity Zones (Fixed Lookback) ---
+    if len(df) >= primary_lookback and primary_lookback > 0:
+        primary_slice = df.iloc[-primary_lookback:]
+        primary_buyside_liq = primary_slice['high'].max()
+        primary_sellside_liq = primary_slice['low'].min()
+    elif len(df) > 0 and primary_lookback > 0 : # Not enough for full primary, use available
+        primary_buyside_liq = df['high'].max()
+        primary_sellside_liq = df['low'].min()
+        # print(f"LIQ_ZONES_ICT: Primary lookback ({primary_lookback}) > df length ({len(df)}). Using available data for primary zones.")
+
+    # --- Secondary Liquidity Zones (Adaptive Search) ---
+    min_data_needed_for_pivots = pivot_n_left + pivot_n_right + 1
+
+    # Buyside Secondary
+    current_lookback_bs = secondary_initial_lookback
+    found_secondary_buyside_pivot = False
+    while current_lookback_bs <= secondary_max_lookback:
+        if len(df) < current_lookback_bs or len(df) < min_data_needed_for_pivots:
+            current_lookback_bs += secondary_increment_step
+            continue
+        lookback_slice_df = df.iloc[-current_lookback_bs:]
+        if len(lookback_slice_df) < min_data_needed_for_pivots:
+            current_lookback_bs += secondary_increment_step
+            continue
+        
+        latest_high_time, _, _, _ = get_latest_pivots_from_buffer(
+            lookback_slice_df, pivot_n_left, pivot_n_right
+        )
+        if latest_high_time is not None:
+            secondary_buyside_liq = lookback_slice_df['high'].max()
+            effective_secondary_lookback_buyside = current_lookback_bs
+            found_secondary_buyside_pivot = True
+            break
+        current_lookback_bs += secondary_increment_step
+
+    if not found_secondary_buyside_pivot:
+        fallback_lookback = min(len(df), secondary_max_lookback)
+        if fallback_lookback > 0:
+            secondary_buyside_liq = df.iloc[-fallback_lookback:]['high'].max()
+            effective_secondary_lookback_buyside = fallback_lookback
+        # else: secondary_buyside_liq remains None if df is empty
+
+    # Sellside Secondary
+    current_lookback_ss = secondary_initial_lookback
+    found_secondary_sellside_pivot = False
+    while current_lookback_ss <= secondary_max_lookback:
+        if len(df) < current_lookback_ss or len(df) < min_data_needed_for_pivots:
+            current_lookback_ss += secondary_increment_step
+            continue
+        lookback_slice_df = df.iloc[-current_lookback_ss:]
+        if len(lookback_slice_df) < min_data_needed_for_pivots:
+            current_lookback_ss += secondary_increment_step
+            continue
+            
+        _, _, latest_low_time, _ = get_latest_pivots_from_buffer(
+            lookback_slice_df, pivot_n_left, pivot_n_right
+        )
+        if latest_low_time is not None:
+            secondary_sellside_liq = lookback_slice_df['low'].min()
+            effective_secondary_lookback_sellside = current_lookback_ss
+            found_secondary_sellside_pivot = True
+            break
+        current_lookback_ss += secondary_increment_step
+
+    if not found_secondary_sellside_pivot:
+        fallback_lookback = min(len(df), secondary_max_lookback)
+        if fallback_lookback > 0:
+            secondary_sellside_liq = df.iloc[-fallback_lookback:]['low'].min()
+            effective_secondary_lookback_sellside = fallback_lookback
+        # else: secondary_sellside_liq remains None if df is empty
+        
+    return {
+        'primary_buyside_liq': primary_buyside_liq, 
+        'primary_sellside_liq': primary_sellside_liq,
+        'secondary_buyside_liq': secondary_buyside_liq, 
+        'secondary_sellside_liq': secondary_sellside_liq,
+        'effective_secondary_lookback_buyside': effective_secondary_lookback_buyside,
+        'effective_secondary_lookback_sellside': effective_secondary_lookback_sellside
+    }
 
 
-def detect_liquidity_grab_ict(candle: pd.Series, liquidity_price: float, side: str) -> bool:
+def detect_liquidity_grab_ict(
+    df: pd.DataFrame, 
+    candle_index: int, 
+    liquidity_price: float, 
+    side: str,
+    sweep_penetration_percentage_config: float,
+    zone_width_atr_factor_config: float,
+    close_back_window_config: int,
+    atr_period_config: int,
+    symbol_info: dict # For price precision in logging/min_tick
+) -> bool:
     """
-    Detects if a single candle performed a liquidity grab.
+    Detects if a liquidity grab occurred, considering partial sweep and multi-bar close-back.
     Args:
-        candle (pd.Series): The candle to check (must have 'high', 'low', 'close', 'open').
-        liquidity_price (float): The price level of the liquidity zone.
-        side (str): "buyside" (grab above high) or "sellside" (grab below low).
+        df (pd.DataFrame): Kline data.
+        candle_index (int): Index of the sweep candidate candle in df.
+        liquidity_price (float): The price level of the liquidity (e.g., swing high/low).
+        side (str): "buyside" or "sellside".
+        sweep_penetration_percentage_config (float): Min penetration of virtual zone (0.0 to 1.0).
+        zone_width_atr_factor_config (float): Factor of ATR to define virtual zone width.
+        close_back_window_config (int): How many bars (1 to N) to check for close back inside.
+        atr_period_config (int): ATR period for dynamic zone width.
+        symbol_info (dict): Contains pricePrecision.
     Returns:
         bool: True if a liquidity grab is detected.
     """
-    if not all(k in candle for k in ['high', 'low', 'close', 'open']): return False
-    if liquidity_price is None: return False
+    if candle_index < 0 or candle_index >= len(df):
+        # print(f"DETECT_GRAB_ICT: Invalid candle_index {candle_index} for df length {len(df)}")
+        return False
+    if liquidity_price is None:
+        # print("DETECT_GRAB_ICT: liquidity_price is None.")
+        return False
 
-    if side == "buyside": # Price wicks above liquidity_price then closes below it
-        return candle['high'] > liquidity_price and candle['close'] < liquidity_price
-    elif side == "sellside": # Price wicks below liquidity_price then closes above it
-        return candle['low'] < liquidity_price and candle['close'] > liquidity_price
+    sweep_candidate_candle = df.iloc[candle_index]
+    if not all(k in sweep_candidate_candle for k in ['high', 'low', 'close', 'open']):
+        # print("DETECT_GRAB_ICT: Sweep candidate candle missing H/L/C/O data.")
+        return False
+
+    # 1. Calculate Virtual Zone Width & Required Penetration
+    atr_value_at_candle = 0.0
+    required_penetration_amount = 0.0
+    
+    # Calculate ATR on a slice of df up to the current candle_index to avoid future data leakage for ATR
+    # Ensure there's enough data for ATR calculation.
+    if zone_width_atr_factor_config > 0 and len(df.iloc[:candle_index+1]) >= atr_period_config :
+        atr_series = calculate_atr(df.iloc[:candle_index+1].copy(), period=atr_period_config) # Use .copy()
+        if not atr_series.empty and pd.notna(atr_series.iloc[-1]) and atr_series.iloc[-1] > 0:
+            atr_value_at_candle = atr_series.iloc[-1]
+            virtual_zone_width = atr_value_at_candle * zone_width_atr_factor_config
+            required_penetration_amount = virtual_zone_width * sweep_penetration_percentage_config
+            # print(f"DETECT_GRAB_ICT [{df.index[candle_index]}]: ATR={atr_value_at_candle:.4f}, VZW={virtual_zone_width:.4f}, ReqPenAmt={required_penetration_amount:.4f}")
+        # else: print(f"DETECT_GRAB_ICT [{df.index[candle_index]}]: ATR calc failed or zero for zone width.")
+    # else: print(f"DETECT_GRAB_ICT [{df.index[candle_index]}]: ATR factor is 0 or not enough data for ATR. ReqPenAmt will be 0.")
+
+
+    # 2. Wick Penetration Check
+    wick_penetrated = False
+    if side == "buyside":
+        # If penetration_percentage is 0, any move beyond liquidity_price counts.
+        # Otherwise, check against liquidity_price + required_penetration_amount.
+        target_penetration_price = liquidity_price + required_penetration_amount
+        wick_penetrated = sweep_candidate_candle['high'] >= target_penetration_price
+        # if wick_penetrated: print(f"DETECT_GRAB_ICT [{df.index[candle_index]}]: Buyside wick penetrated. High: {sweep_candidate_candle['high']:.4f} >= TargetPenPrice: {target_penetration_price:.4f} (LiqPx: {liquidity_price:.4f}, ReqPenAmt: {required_penetration_amount:.4f})")
+        # else: print(f"DETECT_GRAB_ICT [{df.index[candle_index]}]: Buyside wick NOT penetrated. High: {sweep_candidate_candle['high']:.4f} < TargetPenPrice: {target_penetration_price:.4f}")
+    elif side == "sellside":
+        target_penetration_price = liquidity_price - required_penetration_amount
+        wick_penetrated = sweep_candidate_candle['low'] <= target_penetration_price
+        # if wick_penetrated: print(f"DETECT_GRAB_ICT [{df.index[candle_index]}]: Sellside wick penetrated. Low: {sweep_candidate_candle['low']:.4f} <= TargetPenPrice: {target_penetration_price:.4f} (LiqPx: {liquidity_price:.4f}, ReqPenAmt: {required_penetration_amount:.4f})")
+        # else: print(f"DETECT_GRAB_ICT [{df.index[candle_index]}]: Sellside wick NOT penetrated. Low: {sweep_candidate_candle['low']:.4f} > TargetPenPrice: {target_penetration_price:.4f}")
+
+
+    if not wick_penetrated:
+        return False
+
+    # 3. Close-Back-Inside Check (within Configurable Window)
+    for j in range(close_back_window_config):
+        check_candle_idx = candle_index + j
+        if check_candle_idx >= len(df): # Ensure we don't go out of bounds
+            # print(f"DETECT_GRAB_ICT [{df.index[candle_index]}]: Close-back check window exceeds df length at index {check_candle_idx}.")
+            break 
+        
+        candle_for_close_check = df.iloc[check_candle_idx]
+
+        if side == "buyside":
+            if candle_for_close_check['close'] < liquidity_price:
+                # print(f"DETECT_GRAB_ICT [{df.index[candle_index]}]: Buyside GRAB CONFIRMED. Close back at candle {check_candle_idx} (Close: {candle_for_close_check['close']:.4f} < LiqPx: {liquidity_price:.4f})")
+                return True
+            # else: print(f"DETECT_GRAB_ICT [{df.index[candle_index]}]: Buyside close-back check on candle {check_candle_idx}: Close {candle_for_close_check['close']:.4f} not < LiqPx {liquidity_price:.4f}")
+        elif side == "sellside":
+            if candle_for_close_check['close'] > liquidity_price:
+                # print(f"DETECT_GRAB_ICT [{df.index[candle_index]}]: Sellside GRAB CONFIRMED. Close back at candle {check_candle_idx} (Close: {candle_for_close_check['close']:.4f} > LiqPx: {liquidity_price:.4f})")
+                return True
+            # else: print(f"DETECT_GRAB_ICT [{df.index[candle_index]}]: Sellside close-back check on candle {check_candle_idx}: Close {candle_for_close_check['close']:.4f} not > LiqPx {liquidity_price:.4f}")
+            
+    # If loop completes and no close-back confirmed
+    # print(f"DETECT_GRAB_ICT [{df.index[candle_index]}]: Wick penetrated for {side}, but NO close-back confirmation within {close_back_window_config} bar(s).")
     return False
 
 
@@ -6398,7 +6662,9 @@ def manage_ict_trade_entry(client, configs, symbol, klines_df, symbol_info, lock
     global active_signals, active_signals_lock, ict_strategy_states, ict_strategy_states_lock
 
     log_prefix = f"[{threading.current_thread().name}] {symbol} ICTEntry:"
-    # print(f"{log_prefix} ▶️ ICT entry logic triggered for {symbol}.") # Reduce verbosity
+    current_time_for_log = dt.now().strftime('%Y-%m-%d %H:%M:%S')
+    failure_reasons = [] # Initialize list to collect failure reasons
+    print(f"{log_prefix} [{current_time_for_log}] ▶️ ICT entry logic triggered for {symbol}.")
 
     # --- Basic Validations & Halt Checks ---
     min_candles_needed = max(
@@ -6408,269 +6674,407 @@ def manage_ict_trade_entry(client, configs, symbol, klines_df, symbol_info, lock
         configs.get("ict_po3_acceleration_min_candles", DEFAULT_ICT_PO3_ACCELERATION_MIN_CANDLES) + 1 # Po3 needs consolidation, manip, accel
     ) + 20 # General buffer
     if klines_df.empty or len(klines_df) < min_candles_needed:
-        # print(f"{log_prefix} Insufficient kline data ({len(klines_df)} needed {min_candles_needed}).")
+        failure_reasons.append(f"Insufficient kline data ({len(klines_df)}/{min_candles_needed})")
+        # This is a fundamental failure, so exit early after logging
+        if failure_reasons: print(f"{log_prefix} Failed ICT Entry. Reasons: {failure_reasons}")
         return
 
     with daily_state_lock:
-        if trading_halted_drawdown or trading_halted_daily_loss: return
-    if trading_halted_manual: return
+        if trading_halted_drawdown: failure_reasons.append("Trading halted (Max Drawdown)")
+        if trading_halted_daily_loss: failure_reasons.append("Trading halted (Daily Loss)")
+    if trading_halted_manual: failure_reasons.append("Trading halted (Manual)")
+    
+    if failure_reasons: # If any halt is active
+        print(f"{log_prefix} Failed ICT Entry. Reasons: {failure_reasons}")
+        return
     
     # --- ICT Strategy Sequential Logic ---
+    # Initialize fvg, order_block, po3_confirmed to None or False for clarity if grab fails
+    fvg = None
+    order_block = None
+    po3_confirmed = False
+    grab_details = None # Initialize grab_details
+
     # 1. Market Structure (Optional for now, focus on core pattern first)
     # market_structure = identify_market_structure_ict(klines_df, ...)
     # print(f"{log_prefix} Market Structure: {market_structure}")
 
-    # 2. Detect Liquidity Sweep
-    liquidity_lookback_cfg = configs.get("ict_liquidity_lookback", DEFAULT_ICT_LIQUIDITY_LOOKBACK)
-    liquidity_zones = identify_liquidity_zones_ict(klines_df, lookback_period=liquidity_lookback_cfg)
-    if not liquidity_zones: # Should not happen if klines_df is valid
-        # print(f"{log_prefix} Could not identify liquidity zones.")
-        return
+    # 2. Identify Multi-Tier Liquidity Zones
+    primary_lookback_cfg = configs.get("ict_primary_liquidity_lookback", DEFAULT_ICT_PRIMARY_LIQUIDITY_LOOKBACK)
+    secondary_initial_cfg = configs.get("ict_secondary_adaptive_initial_lookback", DEFAULT_ICT_ADAPTIVE_INITIAL_LOOKBACK)
+    secondary_increment_cfg = configs.get("ict_secondary_adaptive_increment_step", DEFAULT_ICT_ADAPTIVE_INCREMENT_STEP)
+    secondary_max_cfg = configs.get("ict_secondary_adaptive_max_lookback", DEFAULT_ICT_ADAPTIVE_MAX_LOOKBACK)
+    # Assuming PIVOT_N_LEFT and PIVOT_N_RIGHT are globally defined or accessible. For now, use defaults.
+    pivot_left_cfg = PIVOT_N_LEFT 
+    pivot_right_cfg = PIVOT_N_RIGHT
 
-    grab_details = None
-    # Iterate backwards from the most recent candle to find a sweep
-    # Limit search to recent candles, e.g., last 5-10 candles for the sweep itself.
-    max_sweep_lookback_candles = configs.get("ict_sweep_detection_window", DEFAULT_ICT_SWEEP_DETECTION_WINDOW) # How many recent candles to check for a sweep
+    print(f"{log_prefix} Liquidity Zone Identification - Primary Lookback: {primary_lookback_cfg}, Secondary Adaptive: Initial={secondary_initial_cfg}, Step={secondary_increment_cfg}, Max={secondary_max_cfg}")
     
-    # Ensure we don't go out of bounds and have enough history for liquidity_zones
-    start_idx_sweep_search = len(klines_df) - 1
-    end_idx_sweep_search = max(0, len(klines_df) - max_sweep_lookback_candles -1, liquidity_lookback_cfg)
+    multi_tier_zones = identify_liquidity_zones_ict(
+        df=klines_df,
+        primary_lookback=primary_lookback_cfg,
+        secondary_initial_lookback=secondary_initial_cfg,
+        secondary_increment_step=secondary_increment_cfg,
+        secondary_max_lookback=secondary_max_cfg,
+        pivot_n_left=pivot_left_cfg,
+        pivot_n_right=pivot_right_cfg
+    )
 
+    if not multi_tier_zones: # Should not happen if identify_liquidity_zones_ict always returns a dict
+        failure_reasons.append("LQC_CRITICAL_FAIL: Failed to get any liquidity zones from identify_liquidity_zones_ict.")
+    else:
+        print(f"{log_prefix} LQC_INFO: Primary Zones: Buyside@{multi_tier_zones.get('primary_buyside_liq', 'N/A')}, Sellside@{multi_tier_zones.get('primary_sellside_liq', 'N/A')}")
+        print(f"{log_prefix} LQC_INFO: Secondary Zones: Buyside@{multi_tier_zones.get('secondary_buyside_liq', 'N/A')} (Eff.Lookback:{multi_tier_zones.get('effective_secondary_lookback_buyside','N/A')}), Sellside@{multi_tier_zones.get('secondary_sellside_liq', 'N/A')} (Eff.Lookback:{multi_tier_zones.get('effective_secondary_lookback_sellside','N/A')})")
 
-    for i in range(start_idx_sweep_search, end_idx_sweep_search -1, -1): # Iterate backwards over recent candles
-        if i < 0 or i >= len(klines_df): continue 
-        current_candle_for_sweep = klines_df.iloc[i]
+        # --- Liquidity-Grab Validation Data Dump ---
+        num_candles_to_dump = configs.get("ict_sweep_detection_window", DEFAULT_ICT_SWEEP_DETECTION_WINDOW) 
+        actual_candles_to_dump = min(num_candles_to_dump, len(klines_df))
+        if actual_candles_to_dump > 0:
+            recent_candles_df = klines_df.iloc[-actual_candles_to_dump:]
+            print(f"{log_prefix} LQC_DUMP: Last {actual_candles_to_dump} Candles:")
+            for idx, row in recent_candles_df.iterrows():
+                print(f"{log_prefix}   TS: {idx}, O: {row['open']:.{symbol_info.get('pricePrecision',2)}f}, H: {row['high']:.{symbol_info.get('pricePrecision',2)}f}, L: {row['low']:.{symbol_info.get('pricePrecision',2)}f}, C: {row['close']:.{symbol_info.get('pricePrecision',2)}f}")
+        # --- End Liquidity-Grab Validation Data Dump ---
+
+        # --- Attempt Grab Detection ---
+        # Fetch new sweep detection parameters from configs
+        sweep_pen_pct_cfg = configs.get("ict_sweep_penetration_percentage", DEFAULT_ICT_SWEEP_PENETRATION_PERCENT)
+        zone_width_atr_factor_cfg = configs.get("ict_sweep_zone_width_atr_factor", DEFAULT_ICT_SWEEP_ZONE_WIDTH_ATR_FACTOR)
+        close_back_window_cfg = configs.get("ict_sweep_close_back_window", DEFAULT_ICT_SWEEP_CLOSE_BACK_WINDOW)
+        atr_period_for_sweep_cfg = configs.get("atr_period", DEFAULT_ATR_PERIOD) # Use general ATR period for now
+
+        max_sweep_lookback_candles = configs.get("ict_sweep_detection_window", DEFAULT_ICT_SWEEP_DETECTION_WINDOW)
+        start_idx_sweep_search = len(klines_df) - 1
+        min_hist_for_sweep_search = max(secondary_max_cfg, primary_lookback_cfg, 1) 
+        end_idx_sweep_search = max(0, len(klines_df) - max_sweep_lookback_candles, min_hist_for_sweep_search)
+
+        print(f"{log_prefix} LQC_ATTEMPT_PRIMARY: Checking for grab against Primary Zones. Configs: PenPct={sweep_pen_pct_cfg}, ATRFactor={zone_width_atr_factor_cfg}, CloseWindow={close_back_window_cfg}")
+        for i in range(start_idx_sweep_search, end_idx_sweep_search -1, -1): 
+            if i < 0 or i >= len(klines_df): continue 
+            # current_candle_for_sweep is now implicitly df.iloc[i] inside detect_liquidity_grab_ict
+            
+            # Primary Buyside
+            if multi_tier_zones.get('primary_buyside_liq') is not None and \
+               detect_liquidity_grab_ict(klines_df, i, multi_tier_zones['primary_buyside_liq'], "buyside",
+                                         sweep_pen_pct_cfg, zone_width_atr_factor_cfg, close_back_window_cfg, atr_period_for_sweep_cfg, symbol_info):
+                grab_details = {"type": "buyside_grab", "zone_type": "primary", "candle_index": i, 
+                                  "price_swept": multi_tier_zones['primary_buyside_liq'], 
+                                  "candle_timestamp": klines_df.index[i], "trigger_candle_data": klines_df.iloc[i].to_dict()}
+                print(f"{log_prefix} LQC_PASS_PRIMARY: Buyside Grab (Primary Zone) DETECTED at index {i}. Swept: {grab_details['price_swept']:.{symbol_info.get('pricePrecision',2)}f}")
+                break
+            # Primary Sellside
+            if multi_tier_zones.get('primary_sellside_liq') is not None and \
+               detect_liquidity_grab_ict(klines_df, i, multi_tier_zones['primary_sellside_liq'], "sellside",
+                                         sweep_pen_pct_cfg, zone_width_atr_factor_cfg, close_back_window_cfg, atr_period_for_sweep_cfg, symbol_info):
+                grab_details = {"type": "sellside_grab", "zone_type": "primary", "candle_index": i, 
+                                  "price_swept": multi_tier_zones['primary_sellside_liq'],
+                                  "candle_timestamp": klines_df.index[i], "trigger_candle_data": klines_df.iloc[i].to_dict()}
+                print(f"{log_prefix} LQC_PASS_PRIMARY: Sellside Grab (Primary Zone) DETECTED at index {i}. Swept: {grab_details['price_swept']:.{symbol_info.get('pricePrecision',2)}f}")
+                break
+            if grab_details: break 
+
+        # If No Grab on Primary, Check Secondary Zones
+        if not grab_details:
+            print(f"{log_prefix} LQC_ATTEMPT_SECONDARY: No grab on Primary Zones. Checking Secondary Zones. Configs: PenPct={sweep_pen_pct_cfg}, ATRFactor={zone_width_atr_factor_cfg}, CloseWindow={close_back_window_cfg}")
+            for i in range(start_idx_sweep_search, end_idx_sweep_search -1, -1): 
+                if i < 0 or i >= len(klines_df): continue 
+                # current_candle_for_sweep is implicitly df.iloc[i]
+
+                # Secondary Buyside
+                if multi_tier_zones.get('secondary_buyside_liq') is not None and \
+                   detect_liquidity_grab_ict(klines_df, i, multi_tier_zones['secondary_buyside_liq'], "buyside",
+                                             sweep_pen_pct_cfg, zone_width_atr_factor_cfg, close_back_window_cfg, atr_period_for_sweep_cfg, symbol_info):
+                    grab_details = {"type": "buyside_grab", "zone_type": "secondary", "candle_index": i, 
+                                      "price_swept": multi_tier_zones['secondary_buyside_liq'],
+                                      "candle_timestamp": klines_df.index[i], "trigger_candle_data": klines_df.iloc[i].to_dict()}
+                    print(f"{log_prefix} LQC_PASS_SECONDARY: Buyside Grab (Secondary Zone) DETECTED at index {i}. Swept: {grab_details['price_swept']:.{symbol_info.get('pricePrecision',2)}f}")
+                    break
+                # Secondary Sellside
+                if multi_tier_zones.get('secondary_sellside_liq') is not None and \
+                   detect_liquidity_grab_ict(klines_df, i, multi_tier_zones['secondary_sellside_liq'], "sellside",
+                                             sweep_pen_pct_cfg, zone_width_atr_factor_cfg, close_back_window_cfg, atr_period_for_sweep_cfg, symbol_info):
+                    grab_details = {"type": "sellside_grab", "zone_type": "secondary", "candle_index": i, 
+                                      "price_swept": multi_tier_zones['secondary_sellside_liq'],
+                                      "candle_timestamp": klines_df.index[i], "trigger_candle_data": klines_df.iloc[i].to_dict()}
+                    print(f"{log_prefix} LQC_PASS_SECONDARY: Sellside Grab (Secondary Zone) DETECTED at index {i}. Swept: {grab_details['price_swept']:.{symbol_info.get('pricePrecision',2)}f}")
+                    break
+                if grab_details: break 
         
-        # Check for Buyside Sweep
-        if liquidity_zones.get('buyside') and \
-           detect_liquidity_grab_ict(current_candle_for_sweep, liquidity_zones['buyside'], "buyside"):
-            grab_details = {"type": "buyside_grab", "candle_index": i, "price_swept": liquidity_zones['buyside'], 
-                              "candle_timestamp": klines_df.index[i], "trigger_candle": current_candle_for_sweep.to_dict()}
-            print(f"{log_prefix} Potential Buyside Liquidity Grab detected at index {i} (Price: {liquidity_zones['buyside']:.4f})")
-            break 
+        if not grab_details:
+            failure_reasons.append(f"LQC_FAIL: No liquidity grab detected on Primary or Secondary zones in last {max_sweep_lookback_candles} candles.")
+    
+    # Logging after all liquidity-grab checks
+    print(f"{log_prefix} LQC_POST_CHECK: Grab Details: {grab_details if grab_details else 'None'}. Current Failures: {len(failure_reasons)}")
+
+
+    # 3. Find Fresh FVG on the return move (Only if grab was detected)
+    if grab_details:
+        fvg_search_direction = "bearish" if grab_details["type"] == "buyside_grab" else "bullish"
+        fvg_freshness_cfg = configs.get("ict_fvg_freshness_candles", DEFAULT_ICT_FVG_FRESHNESS_CANDLES)
+        # Logging before FVG detection
+        print(f"{log_prefix} FVG_PRE_CHECK: Config: SearchDirection='{fvg_search_direction}', Freshness={fvg_freshness_cfg} candles. GrabIndex: {grab_details['candle_index']}. Trigger Candle (H/L/C): {grab_details['trigger_candle_data']['high']:.{symbol_info.get('pricePrecision',2)}f}/{grab_details['trigger_candle_data']['low']:.{symbol_info.get('pricePrecision',2)}f}/{grab_details['trigger_candle_data']['close']:.{symbol_info.get('pricePrecision',2)}f}")
         
-        # Check for Sellside Sweep
-        if liquidity_zones.get('sellside') and \
-           detect_liquidity_grab_ict(current_candle_for_sweep, liquidity_zones['sellside'], "sellside"):
-            grab_details = {"type": "sellside_grab", "candle_index": i, "price_swept": liquidity_zones['sellside'],
-                              "candle_timestamp": klines_df.index[i], "trigger_candle": current_candle_for_sweep.to_dict()}
-            print(f"{log_prefix} Potential Sellside Liquidity Grab detected at index {i} (Price: {liquidity_zones['sellside']:.4f})")
-            break
+        fvg = identify_fair_value_gap_ict(klines_df, 
+                                          candle_index_after_grab=grab_details["candle_index"], 
+                                          direction=fvg_search_direction, 
+                                          freshness_candles=fvg_freshness_cfg)
+        if not fvg:
+            failure_reasons.append(f"FVG_FAIL: No fresh '{fvg_search_direction}' FVG found after {grab_details['type']}")
+        else:
+            print(f"{log_prefix} FVG_PASS: FVG ({fvg['direction']}) DETECTED: Range=[{fvg['fvg_bottom']:.{symbol_info.get('pricePrecision',2)}f} - {fvg['fvg_top']:.{symbol_info.get('pricePrecision',2)}f}], Mid={fvg['fvg_mid']:.{symbol_info.get('pricePrecision',2)}f}. FVG C1 Idx: {fvg['index_c1']} (TS: {fvg['timestamp_c1']}), C3 Idx: {fvg['index_c3']} (TS: {fvg['timestamp_c3']})")
+    else: # No grab_details, so cannot search for FVG in context
+        if not any("LQC_FAIL" in reason for reason in failure_reasons): # Only add if LQC didn't already fail
+            failure_reasons.append("FVG_SKIP: Liquidity grab not detected, skipping FVG search.")
+
+
+    # 4. Validate Order Block (overlapping/aligned with FVG) - Only if FVG was found
+    if fvg: # Only proceed if FVG was identified
+        ob_search_direction = fvg['direction'] 
+        ob_bos_lookback_cfg = configs.get("ict_ob_bos_lookback", DEFAULT_ICT_OB_BOS_LOOKBACK)
+        # Logging before Order-Block overlap check
+        print(f"{log_prefix} OB_PRE_CHECK: Config: SearchDirection='{ob_search_direction}', BoSLookback={ob_bos_lookback_cfg}. FVG C1 Idx: {fvg['index_c1']}, Grab Idx: {grab_details['candle_index'] if grab_details else 'N/A'}. FVG Range: [{fvg['fvg_bottom']:.{symbol_info.get('pricePrecision',2)}f} - {fvg['fvg_top']:.{symbol_info.get('pricePrecision',2)}f}]")
+        
+        order_block = identify_order_block_ict(klines_df, 
+                                               fvg_details=fvg, 
+                                               manipulation_candle_index=grab_details["candle_index"] if grab_details else -1, # Pass valid index or handle if None
+                                               direction=ob_search_direction,
+                                               lookback_bos=ob_bos_lookback_cfg)
+        if not order_block:
+            failure_reasons.append(f"OB_FAIL: No valid Order Block found overlapping FVG for '{ob_search_direction}' setup")
+        elif not order_block.get('bos_confirmed'):
+            failure_reasons.append(f"OB_FAIL: Order Block found at index {order_block['index']} but BoS not confirmed")
+        else:
+            print(f"{log_prefix} OB_PASS: Order Block ({order_block['direction']}) VALIDATED at index {order_block['index']} (TS: {order_block['timestamp']}): Range=[{order_block['ob_bottom']:.{symbol_info.get('pricePrecision',2)}f} - {order_block['ob_top']:.{symbol_info.get('pricePrecision',2)}f}], BoS: True.")
+    else: # No FVG, so cannot search for OB in context
+        if not any("FVG_FAIL" in reason for reason in failure_reasons) and not any("FVG_SKIP" in reason for reason in failure_reasons):
+             failure_reasons.append("OB_SKIP: FVG not identified, skipping Order Block search.")
+
+
+    # 5. Check for Power of Three Confirmation - Only if OB was found and valid
+    if order_block and grab_details: # Requires both OB and grab_details to be valid
+        po3_consol_lookback_cfg = configs.get("ict_po3_consolidation_lookback", DEFAULT_ICT_PO3_CONSOLIDATION_LOOKBACK)
+        po3_accel_candles_cfg = configs.get("ict_po3_acceleration_min_candles", DEFAULT_ICT_PO3_ACCELERATION_MIN_CANDLES)
+        # Logging before Power-of-Three confirmation
+        print(f"{log_prefix} PO3_PRE_CHECK: Config: ConsolLookback={po3_consol_lookback_cfg}, AccelMinCandles={po3_accel_candles_cfg}. ManipIdx: {grab_details['candle_index']}. OB Idx: {order_block['index']}")
+        
+        po3_confirmed = confirm_power_of_three_ict(klines_df, 
+                                                   manipulation_candle_index=grab_details["candle_index"],
+                                                   lookback_consolidation=po3_consol_lookback_cfg,
+                                                   min_acceleration_candles=po3_accel_candles_cfg)
+        if not po3_confirmed:
+            failure_reasons.append(f"PO3_FAIL: Power of Three pattern not confirmed for manipulation at index {grab_details['candle_index']}")
+        else:
+            print(f"{log_prefix} PO3_PASS: Power of Three dynamic CONFIRMED around manipulation at index {grab_details['candle_index']}.")
+    elif not grab_details:
+        if not any("LQC_FAIL" in reason for reason in failure_reasons):
+            failure_reasons.append("PO3_SKIP: Liquidity grab not detected, skipping PO3 check.")
+    elif not order_block : # No OB or FVG context for PO3
+        if not any("OB_FAIL" in reason for reason in failure_reasons) and not any("OB_SKIP" in reason for reason in failure_reasons):
+             failure_reasons.append("PO3_SKIP: Order Block not identified, skipping PO3 check.")
     
-    if not grab_details:
-        # print(f"{log_prefix} No liquidity grab detected in the last {max_sweep_lookback_candles} candles.")
+    # --- Final check: if any core ICT component failed, log all reasons and exit ---
+    # Core components are: grab_details, fvg, order_block (with BoS), po3_confirmed
+    if not grab_details or not fvg or not order_block or not order_block.get('bos_confirmed') or not po3_confirmed:
+        # Ensure a failure reason exists if a core component is missing, even if not explicitly added above
+        if not grab_details and not any("LQC_FAIL" in r for r in failure_reasons): failure_reasons.append("LQC_FAIL: Core liquidity grab missing (implicit).")
+        if not fvg and not any("FVG_FAIL" in r for r in failure_reasons) and not any("FVG_SKIP" in r for r in failure_reasons): failure_reasons.append("FVG_FAIL: Core FVG missing (implicit).")
+        if not order_block and not any("OB_FAIL" in r for r in failure_reasons) and not any("OB_SKIP" in r for r in failure_reasons): failure_reasons.append("OB_FAIL: Core Order Block missing (implicit).")
+        if order_block and not order_block.get('bos_confirmed') and not any("OB_FAIL" in r for r in failure_reasons if "BoS not confirmed" in r) : failure_reasons.append("OB_FAIL: Core Order Block BoS missing (implicit).")
+        if not po3_confirmed and not any("PO3_FAIL" in r for r in failure_reasons) and not any("PO3_SKIP" in r for r in failure_reasons): failure_reasons.append("PO3_FAIL: Core PO3 confirmation missing (implicit).")
+        
+        print(f"{log_prefix} Failed ICT Entry for {symbol} due to missing core components. Reasons: {failure_reasons}")
         return
 
-    # 3. Find Fresh FVG on the return move
-    # Direction of FVG is opposite to the grab type
-    fvg_search_direction = "bearish" if grab_details["type"] == "buyside_grab" else "bullish"
-    fvg_freshness_cfg = configs.get("ict_fvg_freshness_candles", DEFAULT_ICT_FVG_FRESHNESS_CANDLES)
-    
-    fvg = identify_fair_value_gap_ict(klines_df, 
-                                      candle_index_after_grab=grab_details["candle_index"], 
-                                      direction=fvg_search_direction, 
-                                      freshness_candles=fvg_freshness_cfg)
-    if not fvg:
-        # print(f"{log_prefix} No fresh {fvg_search_direction} FVG found after {grab_details['type']}.")
-        return
-    print(f"{log_prefix} FVG ({fvg['direction']}) found: [{fvg['fvg_bottom']:.4f} - {fvg['fvg_top']:.4f}], Mid: {fvg['fvg_mid']:.4f}. C1 Idx: {fvg['index_c1']}, C3 Idx: {fvg['index_c3']}")
+    # --- All core ICT conditions aligned, Calculate Signal Parameters ---
+    # This section is reached ONLY if all prior checks passed (failure_reasons is empty)
+    # OR if we are collecting all reasons and will check failure_reasons list at the end.
+    # For the "soft-fail" approach, we assume calculation can proceed even if some prior reasons exist,
+    # as the final decision to trade or not happens after all checks and calculations.
 
-    # 4. Validate Order Block (overlapping/aligned with FVG)
-    ob_search_direction = fvg['direction'] # OB direction matches FVG direction
-    order_block = identify_order_block_ict(klines_df, 
-                                           fvg_details=fvg, 
-                                           manipulation_candle_index=grab_details["candle_index"], 
-                                           direction=ob_search_direction,
-                                           lookback_bos=configs.get("ict_ob_bos_lookback", DEFAULT_ICT_OB_BOS_LOOKBACK))
-    if not order_block:
-        # print(f"{log_prefix} No valid Order Block found overlapping FVG for {ob_search_direction} setup.")
-        return
-    if not order_block.get('bos_confirmed'):
-        print(f"{log_prefix} Order Block found but BoS not confirmed. OB Index: {order_block['index']}")
-        return
-    print(f"{log_prefix} Order Block ({order_block['direction']}) validated at index {order_block['index']}: [{order_block['ob_bottom']:.4f} - {order_block['ob_top']:.4f}], BoS: True.")
-
-    # 5. Check for Power of Three Confirmation
-    po3_confirmed = confirm_power_of_three_ict(klines_df, 
-                                               manipulation_candle_index=grab_details["candle_index"],
-                                               lookback_consolidation=configs.get("ict_po3_consolidation_lookback", DEFAULT_ICT_PO3_CONSOLIDATION_LOOKBACK),
-                                               min_acceleration_candles=configs.get("ict_po3_acceleration_min_candles", DEFAULT_ICT_PO3_ACCELERATION_MIN_CANDLES))
-    if not po3_confirmed:
-        # print(f"{log_prefix} Power of Three pattern not confirmed for manipulation at index {grab_details['candle_index']}.")
-        return
-    print(f"{log_prefix} Power of Three dynamic confirmed around manipulation at index {grab_details['candle_index']}.")
-
-    # --- All conditions aligned, Calculate Signal Parameters ---
     p_prec = int(symbol_info['pricePrecision'])
+    # Ensure fvg and order_block are not None before accessing attributes
+    if not fvg or not order_block or not grab_details:
+        if not fvg and not any("FVG_" in r for r in failure_reasons): failure_reasons.append("CALC_FAIL: FVG details missing for parameter calculation.")
+        if not order_block and not any("OB_" in r for r in failure_reasons): failure_reasons.append("CALC_FAIL: Order Block details missing for parameter calculation.")
+        if not grab_details and not any("LQC_" in r for r in failure_reasons): failure_reasons.append("CALC_FAIL: Grab details missing for parameter calculation.")
+        # If any of these critical components for calculation are missing, further calculation is not meaningful.
+        # Log all failures and return.
+        if failure_reasons: print(f"{log_prefix} Failed ICT Entry for {symbol}. Reasons: {failure_reasons}")
+        return
+
     signal_side = "LONG" if fvg['direction'] == "bullish" else "SHORT"
 
-    # Entry Price Logic (as per user spec: FVG.50 or OB related)
-    # Defaulting to FVG.50 for this implementation phase.
+    # Entry Price Logic
     entry_type_config = configs.get("ict_entry_type", DEFAULT_ICT_ENTRY_TYPE)
     entry_price = round(fvg['fvg_mid'], p_prec) 
     entry_type_used = "FVG Midpoint"
-    if entry_type_config == "ob_open": entry_price = round(order_block['open'], p_prec); entry_type_used = "OB Open"
-    elif entry_type_config == "ob_mean": entry_price = round(order_block['ob_mid'], p_prec); entry_type_used = "OB Mean"
-    # Hybrid logic would be more complex, find overlap and take its mid.
-
+    if entry_type_config == "ob_open" and order_block.get('open') is not None: entry_price = round(order_block['open'], p_prec); entry_type_used = "OB Open"
+    elif entry_type_config == "ob_mean" and order_block.get('ob_mid') is not None: entry_price = round(order_block['ob_mid'], p_prec); entry_type_used = "OB Mean"
+    
     # Stop Loss Logic
     sl_type_config = configs.get("ict_sl_type", DEFAULT_ICT_SL_TYPE)
     sl_atr_buffer_mult = configs.get("ict_sl_atr_buffer_multiplier", DEFAULT_ICT_SL_ATR_BUFFER_MULTIPLIER) 
-    atr_period_for_sl = configs.get("atr_period", DEFAULT_ATR_PERIOD) # Use general ATR period
-    
+    atr_period_for_sl = configs.get("atr_period", DEFAULT_ATR_PERIOD)
     sl_atr_val = 0
-    if sl_atr_buffer_mult > 0 and len(klines_df) > atr_period_for_sl: # Only calc ATR if multiplier is positive
+    if sl_atr_buffer_mult > 0 and len(klines_df) > atr_period_for_sl:
         atr_s = calculate_atr(klines_df.copy(), period=atr_period_for_sl)
         if not atr_s.empty and pd.notna(atr_s.iloc[-1]):
             sl_atr_val = atr_s.iloc[-1] * sl_atr_buffer_mult
     
     stop_loss_price = None
+    sl_base_component_fvg_bottom = fvg.get('fvg_bottom')
+    sl_base_component_ob_bottom = order_block.get('ob_bottom')
+    sl_base_component_fvg_top = fvg.get('fvg_top')
+    sl_base_component_ob_top = order_block.get('ob_top')
+    price_swept_for_sl = grab_details.get('price_swept')
+
     if sl_type_config == "ob_fvg_zone":
         if signal_side == "LONG":
-            stop_loss_price = round(min(fvg['fvg_bottom'], order_block['ob_bottom']) - sl_atr_val, p_prec)
+            if sl_base_component_fvg_bottom is not None and sl_base_component_ob_bottom is not None:
+                stop_loss_price = round(min(sl_base_component_fvg_bottom, sl_base_component_ob_bottom) - sl_atr_val, p_prec)
+            else: failure_reasons.append("SL_CALC_FAIL: Missing FVG/OB bottom for ob_fvg_zone SL (LONG).")
         else: # SHORT
-            stop_loss_price = round(max(fvg['fvg_top'], order_block['ob_top']) + sl_atr_val, p_prec)
+            if sl_base_component_fvg_top is not None and sl_base_component_ob_top is not None:
+                stop_loss_price = round(max(sl_base_component_fvg_top, sl_base_component_ob_top) + sl_atr_val, p_prec)
+            else: failure_reasons.append("SL_CALC_FAIL: Missing FVG/OB top for ob_fvg_zone SL (SHORT).")
     elif sl_type_config == "swept_point":
-        # SL beyond the swept liquidity point, plus optional buffer
-        if signal_side == "LONG": # Swept sellside liquidity, SL goes below it
-            stop_loss_price = round(grab_details['price_swept'] - sl_atr_val, p_prec)
-        else: # Swept buyside liquidity, SL goes above it
-            stop_loss_price = round(grab_details['price_swept'] + sl_atr_val, p_prec)
-    elif sl_type_config == "atr_buffered_zone": # Similar to ob_fvg_zone but emphasizes ATR buffer more explicitly
-        # This logic is effectively the same as ob_fvg_zone if sl_atr_val is used.
-        # Could be refined to use a different base point for ATR buffer if needed.
-        # For now, assume it's like ob_fvg_zone with a mandatory ATR buffer if sl_atr_buffer_mult > 0
+        if price_swept_for_sl is not None:
+            if signal_side == "LONG": stop_loss_price = round(price_swept_for_sl - sl_atr_val, p_prec)
+            else: stop_loss_price = round(price_swept_for_sl + sl_atr_val, p_prec)
+        else: failure_reasons.append("SL_CALC_FAIL: Missing swept price for swept_point SL.")
+    elif sl_type_config == "atr_buffered_zone": # Effectively same as ob_fvg_zone with current logic
         if signal_side == "LONG":
-            stop_loss_price = round(min(fvg['fvg_bottom'], order_block['ob_bottom']) - sl_atr_val, p_prec)
+            if sl_base_component_fvg_bottom is not None and sl_base_component_ob_bottom is not None:
+                stop_loss_price = round(min(sl_base_component_fvg_bottom, sl_base_component_ob_bottom) - sl_atr_val, p_prec)
+            else: failure_reasons.append("SL_CALC_FAIL: Missing FVG/OB bottom for atr_buffered_zone SL (LONG).")
         else: # SHORT
-            stop_loss_price = round(max(fvg['fvg_top'], order_block['ob_top']) + sl_atr_val, p_prec)
-    else: # Fallback or error
-        print(f"{log_prefix} Unknown ict_sl_type: {sl_type_config}. Defaulting SL logic.")
-        if signal_side == "LONG": stop_loss_price = round(min(fvg['fvg_bottom'], order_block['ob_bottom']) - sl_atr_val, p_prec)
-        else: stop_loss_price = round(max(fvg['fvg_top'], order_block['ob_top']) + sl_atr_val, p_prec)
+            if sl_base_component_fvg_top is not None and sl_base_component_ob_top is not None:
+                stop_loss_price = round(max(sl_base_component_fvg_top, sl_base_component_ob_top) + sl_atr_val, p_prec)
+            else: failure_reasons.append("SL_CALC_FAIL: Missing FVG/OB top for atr_buffered_zone SL (SHORT).")
+    else:
+        failure_reasons.append(f"SL_CALC_FAIL: Unknown ict_sl_type: {sl_type_config}.")
+        # Fallback SL if type is unknown but other components exist
+        if signal_side == "LONG" and sl_base_component_fvg_bottom is not None and sl_base_component_ob_bottom is not None:
+            stop_loss_price = round(min(sl_base_component_fvg_bottom, sl_base_component_ob_bottom) - sl_atr_val, p_prec)
+        elif signal_side == "SHORT" and sl_base_component_fvg_top is not None and sl_base_component_ob_top is not None:
+            stop_loss_price = round(max(sl_base_component_fvg_top, sl_base_component_ob_top) + sl_atr_val, p_prec)
 
 
-    if stop_loss_price is None: # Should be set by one of the SL types
-        print(f"{log_prefix} CRITICAL: Stop loss price not set for ICT signal. Aborting."); return
-
-    if entry_price == stop_loss_price: # Prevent zero risk
-        print(f"{log_prefix} Entry and SL are identical ({entry_price}). Adjusting SL slightly."); 
+    if stop_loss_price is None and not any("SL_CALC_FAIL" in r for r in failure_reasons):
+        failure_reasons.append("SL_CALC_FAIL: Stop loss price could not be determined.")
+    elif stop_loss_price is not None and entry_price == stop_loss_price:
         min_tick = 1 / (10**p_prec)
         stop_loss_price = stop_loss_price - min_tick if signal_side == "LONG" else stop_loss_price + min_tick
         stop_loss_price = round(stop_loss_price, p_prec)
+        print(f"{log_prefix} SL_ADJUST: Entry and SL were identical, adjusted SL to {stop_loss_price:.{p_prec}f}.")
 
-    risk_per_unit = abs(entry_price - stop_loss_price)
-    if risk_per_unit <= 1e-9: # Effectively zero risk
-        print(f"{log_prefix} Calculated risk per unit is zero or negligible. Entry: {entry_price}, SL: {stop_loss_price}. Aborting.")
-        return
+    risk_per_unit = 0
+    if entry_price is not None and stop_loss_price is not None:
+        risk_per_unit = abs(entry_price - stop_loss_price)
+        if risk_per_unit <= 1e-9: # Effectively zero risk
+            failure_reasons.append(f"RISK_CALC_FAIL: Calculated risk per unit is zero or negligible. Entry: {entry_price}, SL: {stop_loss_price}.")
+    elif not any("RISK_CALC_FAIL" in r for r in failure_reasons): # Add reason if not already due to SL calc fail
+         failure_reasons.append("RISK_CALC_FAIL: Cannot calculate risk per unit due to missing entry/SL.")
 
     # Take Profit Logic
-    tp1_rr = 1.0
-    tp2_rr = configs.get("ict_risk_reward_ratio", DEFAULT_ICT_RISK_REWARD_RATIO) # Default is 2.0R
-    tp3_rr = tp2_rr + 1.0 # Example: 3R if TP2 is 2R. This needs better logic based on liquidity.
-    # TODO: Implement TP3 based on opposing liquidity or next structure. For now, fixed R.
+    tp1_price, tp2_price, tp3_price = None, None, None
+    if risk_per_unit > 1e-9 : # Only calculate TPs if risk is valid
+        tp1_rr = 1.0
+        tp2_rr = configs.get("ict_risk_reward_ratio", DEFAULT_ICT_RISK_REWARD_RATIO)
+        tp3_rr = tp2_rr + 1.0 # Placeholder
+        tp1_price = round(entry_price + (risk_per_unit * tp1_rr * (1 if signal_side == "LONG" else -1)), p_prec)
+        tp2_price = round(entry_price + (risk_per_unit * tp2_rr * (1 if signal_side == "LONG" else -1)), p_prec)
+        tp3_price = round(entry_price + (risk_per_unit * tp3_rr * (1 if signal_side == "LONG" else -1)), p_prec)
+    elif not any("TP_CALC_FAIL" in r for r in failure_reasons) and not any("RISK_CALC_FAIL" in r for r in failure_reasons) :
+         failure_reasons.append("TP_CALC_FAIL: Cannot calculate TPs due to invalid risk per unit.")
 
-    tp1_price = round(entry_price + (risk_per_unit * tp1_rr * (1 if signal_side == "LONG" else -1)), p_prec)
-    tp2_price = round(entry_price + (risk_per_unit * tp2_rr * (1 if signal_side == "LONG" else -1)), p_prec)
-    tp3_price = round(entry_price + (risk_per_unit * tp3_rr * (1 if signal_side == "LONG" else -1)), p_prec) # Placeholder
+    print(f"{log_prefix} PARAM_CALC: Calculated ICT Signal Parameters for {symbol} ({signal_side}):")
+    print(f"  Entry ({entry_type_used}): {entry_price:.{p_prec}f if entry_price else 'N/A'}")
+    print(f"  Stop Loss: {stop_loss_price:.{p_prec}f if stop_loss_price else 'N/A'} (Risk/Unit: {risk_per_unit:.{p_prec}f if risk_per_unit > 0 else 'N/A'})")
+    print(f"  TP1 (1R): {tp1_price:.{p_prec}f if tp1_price else 'N/A'}")
+    print(f"  TP2 ({configs.get('ict_risk_reward_ratio', DEFAULT_ICT_RISK_REWARD_RATIO)}R): {tp2_price:.{p_prec}f if tp2_price else 'N/A'}")
+    print(f"  TP3 (Placeholder): {tp3_price:.{p_prec}f if tp3_price else 'N/A'}")
+    if grab_details and fvg and order_block: # Only print context if all parts available
+        print(f"  Context: Grab @ {grab_details.get('candle_timestamp', 'N/A')}, FVG C3 @ {fvg.get('timestamp_c3','N/A')}, OB @ {order_block.get('timestamp','N/A')}")
 
-    print(f"{log_prefix} Calculated ICT Limit Signal Parameters for {symbol} ({signal_side}):")
-    print(f"  Entry ({entry_type_used}): {entry_price:.{p_prec}f}")
-    print(f"  Stop Loss: {stop_loss_price:.{p_prec}f} (Risk/Unit: {risk_per_unit:.{p_prec}f})")
-    print(f"  TP1 (1R): {tp1_price:.{p_prec}f}")
-    print(f"  TP2 ({tp2_rr}R): {tp2_price:.{p_prec}f}")
-    print(f"  TP3 ({tp3_rr}R): {tp3_price:.{p_prec}f} (Placeholder - Opposing Liq. TBD)")
-    print(f"  Context: Grab Candle @ {grab_details['candle_timestamp']}, FVG C3 @ {fvg['timestamp_c3']}, OB @ {order_block['timestamp']}")
-
-    # --- Standard Pre-Trade Checks (Cooldown, Active Trade, Max Positions, Sizing, Sanity) ---
+    # --- Standard Pre-Trade Checks ---
+    # Cooldown Check
+    cooldown_seconds_ict = configs.get("ict_limit_signal_cooldown_seconds", DEFAULT_ICT_LIMIT_SIGNAL_COOLDOWN_SECONDS)
     with last_signal_lock:
-        cooldown_seconds_ict = configs.get("ict_limit_signal_cooldown_seconds", DEFAULT_ICT_LIMIT_SIGNAL_COOLDOWN_SECONDS) # Separate cooldown for limit signals
         if symbol in last_signal_time and (dt.now() - last_signal_time.get(f"{symbol}_ict_limit", dt.min())).total_seconds() < cooldown_seconds_ict:
-            # print(f"{log_prefix} Cooldown active for ICT Limit Signal on {symbol}. Skipping.")
-            return
+            failure_reasons.append(f"COOLDOWN_FAIL: Cooldown active for ICT Limit Signal ({cooldown_seconds_ict}s)")
 
-    with active_trades_lock: # Check against live trades
+    # Active Trade / Pending Order Checks
+    with active_trades_lock:
         if symbol in active_trades:
-            # print(f"{log_prefix} Symbol {symbol} already has an active LIVE trade. Skipping ICT Limit Signal.")
-            return
-        # Check against pending ICT limit orders in ict_strategy_states to avoid duplicate signals for same setup
+            failure_reasons.append("ACTIVE_TRADE_FAIL: Symbol already has an active LIVE trade")
         with ict_strategy_states_lock:
             if symbol in ict_strategy_states and ict_strategy_states[symbol].get('state') == "PENDING_ICT_ENTRY":
-                # This check might need to be more sophisticated, e.g., comparing parameters if a new setup is truly different.
-                # For now, if a pending order exists, don't send another signal.
-                # print(f"{log_prefix} Symbol {symbol} already has a PENDING ICT limit order/signal. Skipping new signal.")
-                return
-        if len(active_trades) + len([s for s, st in ict_strategy_states.items() if st.get('state') == "PENDING_ICT_ENTRY"]) >= configs.get("max_concurrent_positions", DEFAULT_MAX_CONCURRENT_POSITIONS):
-            # print(f"{log_prefix} Max concurrent positions (live + pending ICT signals) reached. Cannot generate ICT Limit Signal for {symbol}.")
-            return
+                failure_reasons.append("PENDING_ORDER_FAIL: Symbol already has a PENDING ICT limit order/signal")
+        
+        num_current_ict_pending = len([s for s, st in ict_strategy_states.items() if st.get('state') == "PENDING_ICT_ENTRY"])
+        is_new_potential_trade = not (symbol in active_trades or (symbol in ict_strategy_states and ict_strategy_states[symbol].get('state') == "PENDING_ICT_ENTRY"))
+        if (len(active_trades) + num_current_ict_pending + (1 if is_new_potential_trade else 0)) > configs.get("max_concurrent_positions", DEFAULT_MAX_CONCURRENT_POSITIONS):
+            failure_reasons.append(f"MAX_POS_FAIL: Max concurrent positions ({configs.get('max_concurrent_positions')}) would be exceeded.")
             
+    # Account Balance Check
     acc_bal = get_account_balance(client, configs)
-    if acc_bal is None or acc_bal <= 0: 
-        # print(f"{log_prefix} Invalid account balance ({acc_bal}) for ICT signal generation checks."); 
-        return
-
-    # Leverage for sanity checks and P&L estimation (not for placing order yet)
-    current_leverage_on_symbol = configs.get('leverage') 
-    try:
-        pos_info_lev = client.futures_position_information(symbol=symbol)
-        if pos_info_lev and isinstance(pos_info_lev, list) and pos_info_lev[0]:
-            current_leverage_on_symbol = int(pos_info_lev[0].get('leverage', configs.get('leverage')))
-    except Exception: pass # Ignore error, use default
+    if acc_bal is None or acc_bal <= 0:
+        failure_reasons.append(f"BALANCE_FAIL: Invalid account balance ({acc_bal}) for ICT signal.")
     
-    # Calculate a hypothetical quantity for sanity checks and P&L estimation for the signal message
-    hypothetical_qty = calculate_position_size(acc_bal, configs['risk_percent'], entry_price, stop_loss_price, symbol_info, configs)
-    if hypothetical_qty is None or hypothetical_qty <= 0: 
-        # print(f"{log_prefix} Hypothetical position size calculation failed for ICT signal (Qty: {hypothetical_qty}).")
+    # Calculate Hypothetical Quantity for further checks (only if balance is valid)
+    hypothetical_qty = None
+    if acc_bal is not None and acc_bal > 0 and entry_price is not None and stop_loss_price is not None and risk_per_unit > 1e-9:
+        hypothetical_qty = calculate_position_size(acc_bal, configs['risk_percent'], entry_price, stop_loss_price, symbol_info, configs)
+        if hypothetical_qty is None or hypothetical_qty <= 0: 
+            failure_reasons.append(f"POS_SIZE_FAIL: Hypothetical position size calculation failed (Qty: {hypothetical_qty}).")
+    elif not any(r.startswith("BALANCE_FAIL") or r.startswith("RISK_CALC_FAIL") or r.startswith("SL_CALC_FAIL") for r in failure_reasons): # Avoid redundant error if already failed
+        failure_reasons.append("POS_SIZE_FAIL: Cannot calculate position size due to missing balance or valid risk parameters.")
+
+    # Sanity Checks (only if qty could be calculated)
+    if hypothetical_qty is not None and hypothetical_qty > 0 and tp1_price is not None:
+        current_leverage_on_symbol = configs.get('leverage') 
+        try:
+            pos_info_lev = client.futures_position_information(symbol=symbol)
+            if pos_info_lev and isinstance(pos_info_lev, list) and pos_info_lev[0]:
+                current_leverage_on_symbol = int(pos_info_lev[0].get('leverage', configs.get('leverage')))
+        except Exception: pass # Ignore error, use default
+        
+        passed_sanity, sanity_reason = pre_order_sanity_checks(
+            symbol, signal_side, entry_price, stop_loss_price, tp1_price, hypothetical_qty,
+            symbol_info, acc_bal, configs['risk_percent'], configs, specific_leverage_for_trade=current_leverage_on_symbol
+        )
+        if not passed_sanity: 
+            failure_reasons.append(f"SANITY_FAIL: Pre-signal sanity checks FAILED: {sanity_reason}")
+    elif not any(r.startswith("POS_SIZE_FAIL") or r.startswith("TP_CALC_FAIL") for r in failure_reasons):
+         failure_reasons.append("SANITY_SKIP: Cannot perform sanity checks due to missing quantity or TP1 price.")
+
+    # Trade Signature Check (only if all params for signature are valid)
+    if entry_price and stop_loss_price and tp1_price and hypothetical_qty and p_prec:
+        trade_sig_ict_limit = generate_trade_signature(symbol, f"ICT_LIMIT_{signal_side}", entry_price, stop_loss_price, tp1_price, hypothetical_qty, p_prec)
+        with recent_trade_signatures_lock:
+            if trade_sig_ict_limit in recent_trade_signatures and \
+               (dt.now() - recent_trade_signatures[trade_sig_ict_limit]).total_seconds() < configs.get("ict_limit_signal_signature_block_seconds", DEFAULT_ICT_LIMIT_SIGNAL_SIGNATURE_BLOCK_SECONDS) :
+                failure_reasons.append(f"SIGNATURE_FAIL: Duplicate ICT Limit Signal signature found within blocking period.")
+    elif not any(r.startswith("SANITY_FAIL") or r.startswith("POS_SIZE_FAIL") or r.startswith("TP_CALC_FAIL") or r.startswith("SL_CALC_FAIL") for r in failure_reasons):
+        failure_reasons.append("SIGNATURE_SKIP: Cannot generate trade signature due to missing parameters.")
+
+    # --- Final Decision Point ---
+    if failure_reasons:
+        print(f"{log_prefix} FINAL_REJECT: ICT Setup for {symbol} REJECTED. Reasons: {failure_reasons}")
         return
 
-    passed_sanity, sanity_reason = pre_order_sanity_checks(
-        symbol, signal_side, entry_price, stop_loss_price, tp1_price, hypothetical_qty, # Use tp1_price for basic R:R check
-        symbol_info, acc_bal, configs['risk_percent'], configs, specific_leverage_for_trade=current_leverage_on_symbol
-    )
-    if not passed_sanity: 
-        print(f"{log_prefix} Pre-signal sanity checks FAILED for ICT signal: {sanity_reason}")
-        return
-    # print(f"{log_prefix} Sanity checks for ICT signal parameters PASSED.")
-
-    # Trade Signature for ICT Limit Signal to avoid spamming for the exact same setup
-    # Note: TP2/TP3 are not in this signature as they might be dynamic or vary. Focus on Entry/SL/TP1.
-    trade_sig_ict_limit = generate_trade_signature(symbol, f"ICT_LIMIT_{signal_side}", entry_price, stop_loss_price, tp1_price, hypothetical_qty, p_prec)
-    with recent_trade_signatures_lock:
-        if trade_sig_ict_limit in recent_trade_signatures and \
-           (dt.now() - recent_trade_signatures[trade_sig_ict_limit]).total_seconds() < configs.get("ict_limit_signal_signature_block_seconds", DEFAULT_ICT_LIMIT_SIGNAL_SIGNATURE_BLOCK_SECONDS) : # Longer block for same signal
-            # print(f"{log_prefix} Duplicate ICT Limit Signal signature found within blocking period. Skipping.")
-            return
-    
-    # --- Signal Mode or Live Mode with ICT Limit Order Placement ---
-    # This function is now primarily for IDENTIFYING the setup and parameters.
-    # The actual order placement or signal sending will be decided by the calling context (e.g. if mode == 'signal')
-    # or if a new config 'ict_place_limit_orders_live' is true.
-
-    # For now, if in 'signal' mode, send the Telegram signal.
-    # If in 'live' mode, this function will now also handle placing the actual LIMIT order
-    # and storing it in `ict_strategy_states` for `monitor_pending_ict_entries` to pick up.
-
-    signal_timestamp_final = klines_df.index[-1] # Timestamp of the last kline data used for signal generation
-
-    # Prepare ICT details for Telegram
+    # --- If all checks passed (failure_reasons is empty), proceed to action ---
+    print(f"{log_prefix} ALL_CHECKS_PASSED: Proceeding with ICT action for {symbol} ({signal_side}).")
+    signal_timestamp_final = klines_df.index[-1] 
     ict_details_for_telegram = {
-        'grab_type': grab_details.get('type'),
-        'price_swept': grab_details.get('price_swept'),
+        'grab_type': grab_details.get('type'), 'price_swept': grab_details.get('price_swept'),
         'grab_timestamp': grab_details.get('candle_timestamp'),
-        'fvg_range': {
-            'fvg_bottom': fvg.get('fvg_bottom'),
-            'fvg_top': fvg.get('fvg_top')
-        } if fvg else None,
-        'fvg_direction': fvg.get('direction') if fvg else None,
-        'fvg_timestamp_c3': fvg.get('timestamp_c3') if fvg else None,
-        'ob_range': {
-            'ob_bottom': order_block.get('ob_bottom'),
-            'ob_top': order_block.get('ob_top')
-        } if order_block else None,
-        'ob_direction': order_block.get('direction') if order_block else None,
-        'ob_timestamp': order_block.get('timestamp') if order_block else None,
-        'po3_confirmed': po3_confirmed,
-        'entry_logic_used': entry_type_used
+        'fvg_range': {'fvg_bottom': fvg.get('fvg_bottom'), 'fvg_top': fvg.get('fvg_top')} if fvg else None,
+        'fvg_direction': fvg.get('direction') if fvg else None, 'fvg_timestamp_c3': fvg.get('timestamp_c3') if fvg else None,
+        'ob_range': {'ob_bottom': order_block.get('ob_bottom'), 'ob_top': order_block.get('ob_top')} if order_block else None,
+        'ob_direction': order_block.get('direction') if order_block else None, 'ob_timestamp': order_block.get('timestamp') if order_block else None,
+        'po3_confirmed': po3_confirmed, 'entry_logic_used': entry_type_used
     }
 
     if configs['mode'] == 'signal':
@@ -6682,12 +7086,12 @@ def manage_ict_trade_entry(client, configs, symbol, klines_df, symbol_info, lock
             entry_price, tp1_price, tp2_price, tp3_price, stop_loss_price, 
             configs['risk_percent'], est_pnl_tp1, est_pnl_sl, symbol_info, 
             "ICT Limit Signal", signal_timestamp_final, "LIMIT",
-            ict_details=ict_details_for_telegram # Pass constructed ICT details
+            ict_details=ict_details_for_telegram
         )
         
-        with active_signals_lock: # Store in active_signals for virtual monitoring
+        with active_signals_lock:
             signal_id_virtual_ict = f"signal_ict_limit_{symbol}_{int(signal_timestamp_final.timestamp())}"
-            active_signals[symbol] = { # Overwrites if previous signal for symbol existed
+            active_signals[symbol] = {
                 "signal_id": signal_id_virtual_ict, "entry_price": entry_price, 
                 "current_sl_price": stop_loss_price, "initial_sl_price": stop_loss_price,
                 "current_tp1_price": tp1_price, "initial_tp1_price": tp1_price,
@@ -6698,35 +7102,32 @@ def manage_ict_trade_entry(client, configs, symbol, klines_df, symbol_info, lock
                 "strategy_type": "ICT_LIMIT_SIGNAL", "sl_management_stage": "initial",
                 "last_update_message_type": "NEW_SIGNAL",
                 "initial_risk_per_unit": risk_per_unit
-                # Add FVG, OB, Sweep details if needed for richer virtual monitoring later
             }
         
-        # Log this new signal event to CSV
         log_event_ict_signal = {
             "SignalID": signal_id_virtual_ict, "Symbol": symbol, "Strategy": "ICT_LIMIT_SIGNAL", "Side": signal_side,
             "Leverage": current_leverage_on_symbol, "SignalOpenPrice": entry_price, 
             "EventType": "NEW_ICT_LIMIT_SIGNAL", "EventPrice": entry_price,
-            "Notes": f"SL:{stop_loss_price:.{p_prec}f}, TP1:{tp1_price:.{p_prec}f}, TP2:{tp2_price:.{p_prec}f}, TP3:{tp3_price:.{p_prec}f}. EntryType:{entry_type_used}. Grab@{grab_details['candle_timestamp']}",
+            "Notes": f"SL:{stop_loss_price:.{p_prec}f}, TP1:{tp1_price:.{p_prec}f}, TP2:{tp2_price:.{p_prec}f}, TP3:{tp3_price:.{p_prec}f}. EntryType:{entry_type_used}. Grab@{grab_details.get('candle_timestamp','N/A')}",
             "EstimatedPNL_USD100": est_pnl_tp1 
         }
         log_signal_event_to_csv(log_event_ict_signal)
         
-        with last_signal_lock: last_signal_time[f"{symbol}_ict_limit"] = dt.now() # Update cooldown
-        with recent_trade_signatures_lock: recent_trade_signatures[trade_sig_ict_limit] = dt.now() # Record signature
-        print(f"{log_prefix} Signal Mode: ICT Limit Signal for {symbol} sent and recorded.")
+        with last_signal_lock: last_signal_time[f"{symbol}_ict_limit"] = dt.now()
+        with recent_trade_signatures_lock: recent_trade_signatures[trade_sig_ict_limit] = dt.now()
+        print(f"{log_prefix} SIGNAL_MODE_ACTION: ICT Limit Signal for {symbol} sent and recorded.")
         return
 
-    elif configs['mode'] == 'live': # Live mode: Place the actual LIMIT order
-        print(f"{log_prefix} Live Mode: Attempting to place ICT LIMIT order for {symbol} ({signal_side})")
+    elif configs['mode'] == 'live':
+        print(f"{log_prefix} LIVE_MODE_ACTION: Attempting to place ICT LIMIT order for {symbol} ({signal_side})")
         
-        # Ensure leverage and margin type are set on the symbol for live trading
         if not (set_leverage_on_symbol(client, symbol, current_leverage_on_symbol) and \
                 set_margin_type_on_symbol(client, symbol, configs['margin_type'], configs)):
-            print(f"{log_prefix} Failed to set leverage/margin for {symbol} before placing ICT limit order. Aborting."); return
+            failure_reasons.append("LIVE_ORDER_FAIL: Failed to set leverage/margin for ICT limit order.")
+            # Log all failures and return, even if this happens just before order placement
+            if failure_reasons: print(f"{log_prefix} FINAL_REJECT: ICT Setup for {symbol} REJECTED. Reasons: {failure_reasons}")
+            return
 
-        # Use the already calculated hypothetical_qty for the order
-        # This qty was already sanity checked.
-        
         limit_order_api_side = "BUY" if signal_side == "LONG" else "SELL"
         position_side_api = signal_side.upper()
 
@@ -6736,14 +7137,13 @@ def manage_ict_trade_entry(client, configs, symbol, klines_df, symbol_info, lock
         )
 
         if not ict_limit_order_obj:
-            reason_live_fail = f"Failed to place ICT LIMIT entry order. Error: {ict_limit_error_msg}"
-            print(f"{log_prefix} {reason_live_fail}")
-            send_trade_rejection_notification(symbol, f"ICT_LIMIT_{signal_side}", reason_live_fail, entry_price, stop_loss_price, tp1_price, hypothetical_qty, symbol_info, configs)
+            failure_reasons.append(f"LIVE_ORDER_FAIL: Failed to place ICT LIMIT entry order. Error: {ict_limit_error_msg}")
+            if failure_reasons: print(f"{log_prefix} FINAL_REJECT: ICT Setup for {symbol} REJECTED. Reasons: {failure_reasons}")
+            # No Telegram rejection here as it's a direct order placement failure, already logged by place_new_order
             return
 
-        print(f"{log_prefix} ICT LIMIT entry order PLACED: ID {ict_limit_order_obj['orderId']}. Status: {ict_limit_order_obj['status']}")
+        print(f"{log_prefix} LIVE_ORDER_SUCCESS: ICT LIMIT entry order PLACED: ID {ict_limit_order_obj['orderId']}. Status: {ict_limit_order_obj['status']}")
         
-        # Send Telegram notification for the placed limit order
         if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
             qty_disp_live = f"{hypothetical_qty:.{int(symbol_info.get('quantityPrecision',0))}f}"
             limit_order_msg_live = (
@@ -6756,31 +7156,32 @@ def manage_ict_trade_entry(client, configs, symbol, klines_df, symbol_info, lock
             )
             send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], limit_order_msg_live)
 
-        # Store pending order details in ict_strategy_states for monitoring
         with ict_strategy_states_lock:
             ict_strategy_states[symbol] = {
                 "state": "PENDING_ICT_ENTRY",
                 "pending_entry_order_id": ict_limit_order_obj['orderId'],
-                "order_placed_timestamp": dt.now(timezone.utc), # Record when bot placed it
+                "order_placed_timestamp": dt.now(timezone.utc),
                 "pending_entry_details": {
                     "limit_price": entry_price, "sl_price": stop_loss_price,
-                    "tp1_price": tp1_price, "tp2_price": tp2_price, "tp3_price": tp3_price, # Store all TPs
+                    "tp1_price": tp1_price, "tp2_price": tp2_price, "tp3_price": tp3_price,
                     "quantity": hypothetical_qty, "side": signal_side,
                     "symbol_info": symbol_info, "leverage": current_leverage_on_symbol,
                     "initial_risk_per_unit": risk_per_unit,
-                    "fvg_snapshot": fvg, # Store context
-                    "ob_snapshot": order_block,
-                    "grab_snapshot": grab_details
+                    "fvg_snapshot": fvg, "ob_snapshot": order_block, "grab_snapshot": grab_details
                 }
             }
-            print(f"{log_prefix} ICT Limit order {ict_limit_order_obj['orderId']} for {symbol} stored in ict_strategy_states for monitoring.")
+            print(f"{log_prefix} ICT Limit order {ict_limit_order_obj['orderId']} for {symbol} stored in ict_strategy_states.")
         
-        with last_signal_lock: last_signal_time[f"{symbol}_ict_limit"] = dt.now() # Cooldown
-        with recent_trade_signatures_lock: recent_trade_signatures[trade_sig_ict_limit] = dt.now() # Signature
-        return # Successfully placed live limit order or sent signal
+        with last_signal_lock: last_signal_time[f"{symbol}_ict_limit"] = dt.now()
+        with recent_trade_signatures_lock: recent_trade_signatures[trade_sig_ict_limit] = dt.now()
+        return
     
-    # If not 'signal' or 'live', or if other conditions prevent action (though should be caught earlier)
-    # print(f"{log_prefix} Mode is '{configs['mode']}'. No action taken for ICT setup (not placing live limit order or sending signal).")
+    # Default return if not signal or live mode, or if somehow logic fell through.
+    # This path should ideally not be hit if all other conditions/returns are handled.
+    if not failure_reasons: # Only print if no other failure was logged.
+        print(f"{log_prefix} No action taken for ICT setup (mode: {configs['mode']}, or other logic path).")
+    elif failure_reasons: # If there were reasons but somehow didn't return earlier.
+        print(f"{log_prefix} FINAL_REJECT (fallback): ICT Setup for {symbol} REJECTED. Reasons: {failure_reasons}")
 
 # --- End ICT Strategy Main Logic ---
 
@@ -9236,6 +9637,11 @@ trading_halted_manual = False     # Flag for manual trading halt from Telegram c
 telegram_load_choice: str = None
 telegram_make_changes_choice: str = None
 
+# --- Configuration Hot-Reload Globals ---
+configs_lock = threading.Lock() # To protect the global configs dictionary during updates
+last_config_modification_time = None
+DEFAULT_CONFIG_WATCHER_INTERVAL_SECONDS = 60 # How often to check for config file changes
+
 # --- Telegram Command Handlers ---
 
 async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9361,9 +9767,10 @@ async def close_all_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def set_risk_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global config_filepath # Removed configs
-    app_configs = context.bot_data.get('configs', {})
+    # Use app_configs_snapshot for chat ID check
+    app_configs_snapshot = context.bot_data.get('configs', {}) 
     effective_chat_id = str(update.effective_chat.id)
-    expected_chat_id = str(app_configs.get("telegram_chat_id"))
+    expected_chat_id = str(app_configs_snapshot.get("telegram_chat_id"))
     if effective_chat_id != expected_chat_id: return
 
     try:
@@ -9373,18 +9780,33 @@ async def set_risk_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         risk_str = context.args[0]
         new_risk_percent_val = float(risk_str)
 
-        if 0 < new_risk_percent_val <= 100: 
-            old_risk = app_configs.get('risk_percent', 0.01) * 100.0 
-            app_configs['risk_percent'] = new_risk_percent_val / 100.0 
+        if 0 < new_risk_percent_val <= 100:
+            old_risk_decimal_in_memory = 0.01 # Default
+            with configs_lock: # Get current value before attempting change
+                 old_risk_decimal_in_memory = configs.get('risk_percent', 0.01)
             
-            configs_to_save = app_configs.copy()
-            for k_sens in ["api_key", "api_secret", "telegram_bot_token", "telegram_chat_id", "last_startup_message", "cycle_start_time_ref"]:
-                configs_to_save.pop(k_sens, None)
+            # Attempt to update the CSV file first
+            # Create a temporary dict with the change to see if it saves correctly
+            temp_configs_for_save_attempt = {}
+            with configs_lock: # Read current global state to build the save dict
+                temp_configs_for_save_attempt = configs.copy()
             
-            if save_configuration_to_csv(config_filepath, configs_to_save):
-                msg = f"Risk per trade updated from {old_risk:.2f}% to {new_risk_percent_val:.2f}% and saved."
-            else:
-                msg = f"Risk per trade updated to {new_risk_percent_val:.2f}%, but FAILED to save to {config_filepath}."
+            temp_configs_for_save_attempt['risk_percent'] = new_risk_percent_val / 100.0 # Apply proposed change to this temp dict
+            
+            # Remove sensitive/runtime keys before attempting to save
+            for k_sens in ["api_key", "api_secret", "telegram_bot_token", "telegram_chat_id", 
+                           "last_startup_message", "cycle_start_time_ref", "strategy_id", "strategy_name",
+                           "monitored_symbols_count", "bot_start_time_str"]: 
+                temp_configs_for_save_attempt.pop(k_sens, None)
+            
+            if save_configuration_to_csv(config_filepath, temp_configs_for_save_attempt):
+                # If save is successful, then officially update the in-memory global configs
+                with configs_lock:
+                    configs['risk_percent'] = new_risk_percent_val / 100.0
+                msg = f"Risk per trade set to {new_risk_percent_val:.2f}% and saved to '{config_filepath}'. Hot-reload watcher will pick up the change from file."
+            else: 
+                msg = f"FAILED to save risk change to '{config_filepath}'. In-memory risk percent remains {old_risk_decimal_in_memory*100:.2f}%."
+            
             print(msg)
             await update.message.reply_text(msg, parse_mode="Markdown")
         else:
@@ -9398,9 +9820,9 @@ async def set_risk_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def set_leverage_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global config_filepath # Removed configs
-    app_configs = context.bot_data.get('configs', {})
+    app_configs_snapshot = context.bot_data.get('configs', {})
     effective_chat_id = str(update.effective_chat.id)
-    expected_chat_id = str(app_configs.get("telegram_chat_id"))
+    expected_chat_id = str(app_configs_snapshot.get("telegram_chat_id"))
     if effective_chat_id != expected_chat_id: return
 
     try:
@@ -9411,17 +9833,27 @@ async def set_leverage_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         new_leverage = int(leverage_str)
 
         if 1 <= new_leverage <= 125: 
-            old_leverage = app_configs.get('leverage', 20) 
-            app_configs['leverage'] = new_leverage
+            old_leverage_in_memory = 20 # Default
+            with configs_lock:
+                old_leverage_in_memory = configs.get('leverage', 20)
             
-            configs_to_save = app_configs.copy()
-            for k_sens in ["api_key", "api_secret", "telegram_bot_token", "telegram_chat_id", "last_startup_message", "cycle_start_time_ref"]:
-                configs_to_save.pop(k_sens, None)
+            temp_configs_for_save_attempt = {}
+            with configs_lock:
+                temp_configs_for_save_attempt = configs.copy()
+            
+            temp_configs_for_save_attempt['leverage'] = new_leverage
+                
+            for k_sens in ["api_key", "api_secret", "telegram_bot_token", "telegram_chat_id", 
+                           "last_startup_message", "cycle_start_time_ref", "strategy_id", "strategy_name",
+                           "monitored_symbols_count", "bot_start_time_str"]:
+                temp_configs_for_save_attempt.pop(k_sens, None)
 
-            if save_configuration_to_csv(config_filepath, configs_to_save):
-                msg = f"Default leverage updated from {old_leverage}x to {new_leverage}x and saved."
-            else:
-                msg = f"Default leverage updated to {new_leverage}x, but FAILED to save to {config_filepath}."
+            if save_configuration_to_csv(config_filepath, temp_configs_for_save_attempt):
+                with configs_lock: # Official update to global if save succeeded
+                    configs['leverage'] = new_leverage
+                msg = f"Default leverage set to {new_leverage}x and saved to '{config_filepath}'. Hot-reload watcher will pick up the change from file."
+            else: 
+                msg = f"FAILED to save leverage change to '{config_filepath}'. In-memory leverage remains {old_leverage_in_memory}x."
             print(msg)
             await update.message.reply_text(msg, parse_mode="Markdown")
             await update.message.reply_text(f"Note: This sets the default leverage. Dynamic leverage might override this for specific trades if enabled.", parse_mode="Markdown")
@@ -9435,39 +9867,51 @@ async def set_leverage_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def log_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # global configs # Removed configs
-    app_configs = context.bot_data.get('configs', {})
+    # Use app_configs_snapshot for chat ID check, but current global `configs` for data
+    app_configs_snapshot = context.bot_data.get('configs', {}) 
     effective_chat_id = str(update.effective_chat.id)
-    expected_chat_id = str(app_configs.get("telegram_chat_id"))
+    expected_chat_id = str(app_configs_snapshot.get("telegram_chat_id")) 
     if effective_chat_id != expected_chat_id: return
 
-    last_startup_msg = app_configs.get("last_startup_message", "No recent status summary available.")
+    with configs_lock: 
+        current_global_configs_copy = configs.copy()
+
+    last_startup_msg = current_global_configs_copy.get("last_startup_message", "No recent status summary available.")
     log_text = (
         f"📜 *Bot Log/Status Summary*\n\n"
-        f"Recent Status Snapshot:\n{last_startup_msg}\n\n"
+        f"Recent Status Snapshot (may not reflect hot-reloaded changes until next cycle summary):\n{last_startup_msg}\n\n"
         f"_Note: Detailed log file access via Telegram is currently basic. For full logs, please check the console/log file directly._"
     )
     await update.message.reply_text(log_text, parse_mode="Markdown")
 
 async def config_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # global configs # Removed configs
-    app_configs = context.bot_data.get('configs', {})
+    global configs, configs_lock 
+    
+    app_configs_snapshot = context.bot_data.get('configs', {})
     effective_chat_id = str(update.effective_chat.id)
-    expected_chat_id = str(app_configs.get("telegram_chat_id"))
+    expected_chat_id = str(app_configs_snapshot.get("telegram_chat_id")) 
     if effective_chat_id != expected_chat_id: return
 
-    config_texts = ["⚙️ *Current Bot Configuration:*"]
-    excluded_keys = ["api_key", "api_secret", "telegram_bot_token", "telegram_chat_id", "last_startup_message", "cycle_start_time_ref", "strategy_id", "strategy_name"] 
+    config_texts = ["⚙️ *Current Bot Configuration (Reflects Hot-Reloads):*"]
+    excluded_keys = ["api_key", "api_secret", "telegram_bot_token", "telegram_chat_id", 
+                     "last_startup_message", "cycle_start_time_ref", "strategy_id", "strategy_name",
+                     "monitored_symbols_count", "bot_start_time_str"] # Added more runtime keys
     
-    sorted_config_keys = sorted(app_configs.keys())
+    with configs_lock: 
+        current_display_configs = configs.copy() 
+
+    sorted_config_keys = sorted(current_display_configs.keys())
 
     for key in sorted_config_keys:
         if key not in excluded_keys:
-            value = app_configs[key]
-            if key == "risk_percent": value_str = f"{value * 100:.2f}%"
-            elif key == "portfolio_risk_cap": value_str = f"{value:.2f}%"
-            elif key == "max_drawdown_percent": value_str = f"{value:.2f}%"
-            elif key == "daily_stop_loss_percent": value_str = f"{value:.2f}%"
-            elif key == "target_annualized_volatility": value_str = f"{value * 100:.2f}% (decimal: {value:.4f})"
+            value = current_display_configs[key]
+            # Value formatting (ensure this is robust for all expected types)
+            if key == "risk_percent": value_str = f"{float(value) * 100:.2f}%" if isinstance(value, (float, int)) else str(value)
+            elif key == "portfolio_risk_cap": value_str = f"{float(value):.2f}%" if isinstance(value, (float, int)) else str(value)
+            elif key == "max_drawdown_percent": value_str = f"{float(value):.2f}%" if isinstance(value, (float, int)) else str(value)
+            elif key == "daily_stop_loss_percent": value_str = f"{float(value):.2f}%" if isinstance(value, (float, int)) else str(value)
+            elif key == "target_annualized_volatility": value_str = f"{float(value) * 100:.2f}% (decimal: {float(value):.4f})" if isinstance(value, (float, int)) else str(value)
+            elif key == "config_watcher_interval_seconds": value_str = f"{value}s" 
             elif isinstance(value, float): value_str = f"{value:.4f}"
             else: value_str = str(value)
             config_texts.append(f"`{key.replace('_', ' ').title()}`: `{value_str}`")
@@ -9691,6 +10135,123 @@ async def summary_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else: # Should not happen if get_summary_from_csv always returns a string
         await update.message.reply_text("Could not retrieve summary.", parse_mode="Markdown")
 
+# --- Configuration Hot-Reload Functions ---
+def check_and_reload_configurations(config_filepath: str, current_configs_ref: dict):
+    """
+    Checks if the configuration file has been modified and reloads it if necessary.
+    Updates the current_configs_ref (global configs dict) if reload is successful.
+    """
+    global last_config_modification_time, configs_lock # configs_lock protects current_configs_ref
+
+    try:
+        if not os.path.exists(config_filepath):
+            # print(f"HotReload: Config file '{config_filepath}' not found. Cannot check for updates.")
+            return False # Indicate no check was performed or failed critically
+
+        current_mod_time = os.path.getmtime(config_filepath)
+
+        if last_config_modification_time is None: # First run after (re)start
+            last_config_modification_time = current_mod_time
+            # print(f"HotReload: Initialized config modification time for '{config_filepath}'.")
+            return False # No reload on first check, just initialize time
+
+        if current_mod_time != last_config_modification_time:
+            print(f"HotReload: Detected change in '{config_filepath}'. Attempting to reload...")
+            
+            new_raw_configs = load_configuration_from_csv(config_filepath)
+            if new_raw_configs is None:
+                print(f"HotReload: FAILED to load new configurations from '{config_filepath}'. Using existing settings.")
+                # Do not update last_config_modification_time, so it retries on next check
+                return False
+
+            is_valid, validation_msg, validated_new_csv_configs = validate_configurations(new_raw_configs)
+            if not is_valid:
+                print(f"HotReload: FAILED validation for new configurations from '{config_filepath}': {validation_msg}. Using existing settings.")
+                # Do not update last_config_modification_time
+                return False
+
+            # Successfully loaded and validated new CSV configurations. Now merge them carefully.
+            with configs_lock:
+                # Preserve non-CSV items like API keys, bot_start_time, etc. from the current global configs
+                # These are typically set once at startup or are runtime state.
+                preserved_keys = ["api_key", "api_secret", "telegram_bot_token", "telegram_chat_id", 
+                                  "bot_start_time_str", "strategy_id", "strategy_name", 
+                                  "last_startup_message", "cycle_start_time_ref", "monitored_symbols_count"] # Add any other runtime keys
+                
+                temp_updated_configs = validated_new_csv_configs.copy() # Start with new CSV values
+
+                for p_key in preserved_keys:
+                    if p_key in current_configs_ref and p_key not in temp_updated_configs: # If key was runtime and not in new CSV
+                        temp_updated_configs[p_key] = current_configs_ref[p_key]
+                    # If p_key IS in validated_new_csv_configs, it means user explicitly set it in CSV, let it override (e.g. changing strategy choice)
+                    # However, for things like API keys, they should NEVER be in the CSV.
+                    # The `validate_configurations` doesn't expect them, so they wouldn't be in `validated_new_csv_configs`.
+
+                # Critical: Ensure API keys are always from the original startup load, not from CSV.
+                # This loop handles if they were somehow injected into current_configs_ref from a bad source before.
+                # Best practice: load_api_keys() is the source of truth for these.
+                # The current structure: main_bot_logic calls get_user_configurations (which loads CSV),
+                # then calls load_api_keys and adds them to `configs`.
+                # So, `current_configs_ref` (the global `configs`) should have them.
+                if "api_key" in current_configs_ref: temp_updated_configs["api_key"] = current_configs_ref["api_key"]
+                if "api_secret" in current_configs_ref: temp_updated_configs["api_secret"] = current_configs_ref["api_secret"]
+                if "telegram_bot_token" in current_configs_ref: temp_updated_configs["telegram_bot_token"] = current_configs_ref["telegram_bot_token"]
+                if "telegram_chat_id" in current_configs_ref: temp_updated_configs["telegram_chat_id"] = current_configs_ref["telegram_chat_id"]
+
+
+                # Update the global `configs` dictionary (passed as current_configs_ref)
+                current_configs_ref.clear() # Clear the old global configs
+                current_configs_ref.update(temp_updated_configs) # Update with new merged set
+
+                last_config_modification_time = current_mod_time
+                print(f"HotReload: Successfully reloaded and validated configurations from '{config_filepath}'.")
+                # Optionally, log which specific keys changed if needed (more complex diffing)
+                
+                # Send Telegram notification about successful hot-reload
+                if current_configs_ref.get("telegram_bot_token") and current_configs_ref.get("telegram_chat_id"):
+                    send_telegram_message(
+                        current_configs_ref["telegram_bot_token"], 
+                        current_configs_ref["telegram_chat_id"],
+                        f"⚙️ Bot configurations successfully hot-reloaded from '{config_filepath}'."
+                    )
+                return True # Reloaded
+            
+        # else: print(f"HotReload: No changes detected in '{config_filepath}'.")
+        return False # No change detected or no reload needed
+
+    except Exception as e:
+        print(f"HotReload: Error during configuration check/reload: {e}")
+        traceback.print_exc()
+        return False
+
+
+def config_watcher_thread_func(config_filepath_to_watch: str, global_configs_dict: dict, interval_seconds: int):
+    """
+    Thread function to periodically check and reload configurations.
+    Args:
+        config_filepath_to_watch (str): Path to the configuration file.
+        global_configs_dict (dict): Reference to the global configs dictionary to update.
+        interval_seconds (int): How often to check for changes.
+    """
+    global bot_shutdown_requested 
+    print(f"ConfigWatcherThread: Started. Watching '{config_filepath_to_watch}' every {interval_seconds}s.")
+    
+    # Initialize last_config_modification_time on first run of this thread
+    # This is also done by check_and_reload_configurations, but doing it here ensures it's set before first sleep.
+    global last_config_modification_time
+    if os.path.exists(config_filepath_to_watch) and last_config_modification_time is None:
+        last_config_modification_time = os.path.getmtime(config_filepath_to_watch)
+        print(f"ConfigWatcherThread: Initialized mod time for '{config_filepath_to_watch}'.")
+
+    while not bot_shutdown_requested:
+        time.sleep(interval_seconds) # Check periodically
+        if bot_shutdown_requested: break # Check again after sleep
+
+        # print("ConfigWatcherThread: Checking for configuration updates...") # Too verbose for every interval
+        check_and_reload_configurations(config_filepath_to_watch, global_configs_dict)
+        
+    print("ConfigWatcherThread: Shutdown signal received. Exiting.")
+
 
 if __name__ == "__main__":
     # These globals are directly managed by the main loop or its direct conditions
@@ -9698,44 +10259,68 @@ if __name__ == "__main__":
     # Other globals like daily_high_equity etc., are modified by functions called from main_bot_logic
     # or by the new reset_global_states_for_restart function.
 
-    returned_configs = None # Initialize to ensure it exists for the first Telegram message if restart happens early
+    # --- Global configs dictionary ---
+    # This will be populated by get_user_configurations and then potentially hot-reloaded.
+    # It needs to be accessible by the config_watcher_thread and Telegram handlers.
+    configs = {} # Initialize as an empty dict; main_bot_logic will populate it.
+
     first_run = True
+    config_watcher_thread = None # To hold the watcher thread object
 
     while True:
-        # Clear critical state at the beginning of each main loop iteration (especially for restarts)
-        # This ensures that stale states from a previous run (e.g. live mode then signal mode) are wiped.
-        with active_trades_lock:
-            active_trades.clear()
-        with active_signals_lock: # Assuming active_signals_lock is defined with active_signals
-            active_signals.clear()
-        with fib_strategy_states_lock:
-            fib_strategy_states.clear()
-        with ict_strategy_states_lock: # Also clear ICT states on main loop restart
-            ict_strategy_states.clear()
-        
-        if first_run:
-            print("First run: Cleared active_trades, active_signals, fib_strategy_states, and ict_strategy_states.")
-            first_run = False
-        else: # This is a restart
-            print("Bot Restart: Cleared active_trades, active_signals, fib_strategy_states, and ict_strategy_states before restarting main logic.")
-            
-        # If this isn't the first iteration (i.e., it's a restart), client might already exist.
-        # main_bot_logic is responsible for initializing/re-initializing it.
-        # If client becomes None due to an error in main_bot_logic, restart might be problematic
-        # for pre-restart order cancellation. This is a complex edge case.
-        # For now, assume main_bot_logic sets client correctly or exits.
+        if not first_run: # This is a restart
+            print("Bot Restart: Clearing active trade/signal/strategy states before restarting main logic.")
+            # Clear critical state at the beginning of each main loop iteration (especially for restarts)
+            with active_trades_lock: active_trades.clear()
+            with active_signals_lock: active_signals.clear()
+            with fib_strategy_states_lock: fib_strategy_states.clear()
+            with ict_strategy_states_lock: ict_strategy_states.clear()
+            reset_global_states_for_restart() # Resets daily states, cooldowns, etc.
+        else:
+            print("First run: Initializing states (they are already empty or at defaults).")
+            # On first run, states are already at their initial values.
+            # `last_config_modification_time` will be set by the watcher or first call to check_and_reload.
 
-        returned_configs = main_bot_logic() # Call the main operational logic
+        # `main_bot_logic` will populate the global `configs` dictionary.
+        # It also initializes the `client` global.
+        main_bot_logic() # This function now directly modifies the global `configs` and `client`.
+                         # It no longer returns configs, as `configs` is global.
+        
+        # After main_bot_logic runs (which includes initial config load and client setup),
+        # and if it's the first run, start the config watcher thread.
+        if first_run and configs.get("mode") != "backtest": # Don't run watcher for backtests
+            config_watch_interval = configs.get("config_watcher_interval_seconds", DEFAULT_CONFIG_WATCHER_INTERVAL_SECONDS)
+            if not isinstance(config_watch_interval, (int, float)) or config_watch_interval <=0: # Basic check
+                config_watch_interval = DEFAULT_CONFIG_WATCHER_INTERVAL_SECONDS # Fallback
+                print(f"Warning: Invalid config_watcher_interval_seconds from config. Using default: {config_watch_interval}s")
+                configs['config_watcher_interval_seconds'] = config_watch_interval # Correct in global configs too
+
+            config_watcher_thread = threading.Thread(
+                target=config_watcher_thread_func,
+                args=(config_filepath, configs, config_watch_interval), # Pass global `configs`
+                name="ConfigWatcherThread",
+                daemon=True
+            )
+            config_watcher_thread.start()
+            print(f"Config watcher thread started with interval: {config_watch_interval}s")
+        
+        first_run = False # Subsequent iterations are restarts
 
         if bot_restart_requested:
-            print("Bot restart sequence initiated...")
+            print("Bot restart sequence initiated by Telegram command...")
+            bot_shutdown_requested = True # Signal all loops (like trading_loop, watcher) to stop
+            
+            if config_watcher_thread and config_watcher_thread.is_alive():
+                print("Waiting for ConfigWatcherThread to exit...")
+                config_watcher_thread.join(timeout= (configs.get("config_watcher_interval_seconds", DEFAULT_CONFIG_WATCHER_INTERVAL_SECONDS) + 5) ) # Wait a bit longer than its loop
+                if config_watcher_thread.is_alive():
+                    print("ConfigWatcherThread did not exit gracefully.")
             
             # Attempt to cancel any outstanding orders from the previous run if client is available
+            # `client` is global and should have been set by `main_bot_logic`
             if client: # Check if client was successfully initialized in the previous run
                 print("Performing pre-restart order cancellation check (if any trades still marked active by bot)...")
                 with active_trades_lock: 
-                    # active_trades should ideally be empty here if trading_loop exited cleanly,
-                    # but this is a fallback.
                     for symbol, trade_details in list(active_trades.items()):
                         for oid_key in ['sl_order_id', 'tp_order_id']:
                             oid = trade_details.get(oid_key)
@@ -9747,21 +10332,27 @@ if __name__ == "__main__":
                                     print(f"Pre-restart: Failed to cancel {oid_key} {oid} for {symbol}: {e_c}")
             active_trades.clear() # Ensure it's cleared again after attempted cancellations
 
-            reset_global_states_for_restart() # Call the centralized reset function
+            # reset_global_states_for_restart() # This is already called at the top of the loop for restarts
 
             bot_restart_requested = False 
-            bot_shutdown_requested = False # Ensure restart overrides shutdown for the next loop
+            bot_shutdown_requested = False # Reset for the next run of main_bot_logic
 
             print("Global states have been reset. Restarting in 5 seconds...")
             
-            # Use returned_configs from the *just completed* run of main_bot_logic for the notification
-            if returned_configs and returned_configs.get("telegram_bot_token") and returned_configs.get("telegram_chat_id"):
-                 send_telegram_message(returned_configs["telegram_bot_token"], returned_configs["telegram_chat_id"], "✅ Bot has shut down current operations and is restarting now...")
+            # Use the global `configs` for the notification, as it was populated by the run of main_bot_logic
+            # that just completed before this restart sequence.
+            if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+                 send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], "✅ Bot has shut down current operations and is restarting now...")
             else:
-                print("Telegram details not available from the last run's configs for restart message.")
+                print("Telegram details not available from current configs for restart message.")
             
             time.sleep(5) 
             continue 
         else:
-            print("Bot shutdown sequence complete (not a restart request, or error during execution). Exiting script.")
+            # This means bot_shutdown_requested was true (and not a restart) OR main_bot_logic exited/failed
+            # If it was a graceful shutdown via Telegram, bot_shutdown_requested would be true here.
+            if bot_shutdown_requested:
+                 print("Bot shutdown sequence complete (Shutdown requested). Exiting script.")
+            else:
+                 print("Bot exited (main_bot_logic completed or error). Exiting script.")
             break
