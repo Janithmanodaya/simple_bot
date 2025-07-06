@@ -45,26 +45,6 @@ DEFAULT_REALIZED_VOLATILITY_PERIOD = 30   # Period in candles for calculating re
 DEFAULT_MIN_LEVERAGE = 1                  # Minimum leverage to use
 DEFAULT_MAX_LEVERAGE = 20                 # Maximum leverage to use (user preference, also check exchange limits)
 DEFAULT_STRATEGY = "ema_cross"   # Default strategy to run
-
-# ICT Strategy Defaults
-DEFAULT_ICT_TIMEFRAME_PRIMARY = "1h"
-DEFAULT_ICT_TIMEFRAME_ENTRY = "1m" # Should align with existing 1m buffer usage if possible
-DEFAULT_ICT_MIN_LIQUIDITY_SWEEP_SIZE_PIPS = 10 # Example in pips
-DEFAULT_ICT_MIN_LIQUIDITY_SWEEP_SIZE_ATR = 0.5 # Example in ATR multiples
-DEFAULT_ICT_FVG_MIN_WIDTH_PIPS = 5 # Example in pips
-DEFAULT_ICT_FVG_MIN_WIDTH_PERCENT_RANGE = 0.1 # Example in % of range
-DEFAULT_ICT_ORDERBLOCK_LOOKBACK = 10 # Number of candles
-DEFAULT_ICT_SESSION_FILTER = ["London", "NewYork"] # Default sessions
-DEFAULT_ICT_ENTRY_ORDER_TYPE = "LIMIT" # Changed to LIMIT as per user feedback
-DEFAULT_ICT_SL_BUFFER_ATR_MULT = 0.2 # ATR multiplier for SL buffer
-DEFAULT_ICT_TP1_QTY_PCT = 0.33 # Quantity for TP1
-DEFAULT_ICT_TP2_QTY_PCT = 0.33 # Quantity for TP2
-DEFAULT_ICT_TP3_QTY_PCT = 0.34 # Quantity for TP3 (remainder)
-DEFAULT_ICT_BREAKEVEN_BUFFER_R = 0.1 # Breakeven buffer in R multiples (0.1R)
-DEFAULT_ICT_SIGNAL_COOLDOWN_SECONDS = 3600 # 1 hour cooldown between ICT signals for same symbol
-DEFAULT_ICT_ORDER_TIMEOUT_MINUTES = 10 # Default timeout for ICT limit orders
-
-
 DEFAULT_FIB_ORDER_TIMEOUT_MINUTES = 5 # Default timeout for Fib retracement limit orders
 DEFAULT_FIB_ATR_PERIOD = 14          # Default ATR period for Fibonacci strategy SL
 DEFAULT_FIB_SL_ATR_MULTIPLIER = 1.0  # Default ATR multiplier for SL for Fibonacci strategy
@@ -114,13 +94,6 @@ last_signal_lock = threading.Lock()
 symbol_1m_candle_buffers = {}
 symbol_1m_candle_buffers_lock = threading.Lock()
 DEFAULT_1M_BUFFER_SIZE = 200 # Max 1-minute candles to keep per symbol for new strategy (e.g., for pivot lookbacks)
-
-# Globals for ICT Primary Timeframe Candle Buffers
-# Key: symbol, Value: deque of last N primary TF candles (e.g., 1h candles)
-symbol_primary_tf_candle_buffers = {}
-symbol_primary_tf_candle_buffers_lock = threading.Lock()
-DEFAULT_PRIMARY_TF_BUFFER_SIZE = 100 # Max primary TF candles for ICT zone detection (e.g., 100 1-hour candles)
-
 
 # Globals for Trade Signature Check
 recent_trade_signatures = {} # Stores trade_signature: timestamp
@@ -218,26 +191,7 @@ def validate_configurations(loaded_configs: dict) -> tuple[bool, str, dict]:
         "min_leverage": {"type": int, "condition": lambda x: 1 <= x <= 125},
         "max_leverage": {"type": int, "condition": lambda x: 1 <= x <= 125}, # Further check against min_leverage done in input logic
         "allow_exceed_risk_for_min_notional": {"type": bool},
-        "strategy_choice": {"type": str, "valid_values": ["ema_cross", "fib_retracement", "ict"]},
-        # ICT Strategy Params
-        "ict_timeframe_primary": {"type": str, "optional": True, "valid_values": ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d"]},
-        "ict_timeframe_entry": {"type": str, "optional": True, "valid_values": ["1m", "3m", "5m", "15m"]}, # Entry TF usually smaller or equal to primary
-        "ict_min_liquidity_sweep_size_pips": {"type": float, "optional": True, "condition": lambda x: x >= 0},
-        "ict_min_liquidity_sweep_size_atr": {"type": float, "optional": True, "condition": lambda x: x >= 0},
-        "ict_fvg_min_width_pips": {"type": float, "optional": True, "condition": lambda x: x >= 0},
-        "ict_fvg_min_width_percent_range": {"type": float, "optional": True, "condition": lambda x: 0 <= x <= 1}, # As a percentage
-        "ict_orderblock_lookback": {"type": int, "optional": True, "condition": lambda x: x > 0},
-        "ict_session_filter": {"type": list, "optional": True}, # Special handling for list below
-        "ict_primary_tf_buffer_size": {"type": int, "optional": True, "condition": lambda x: 50 <= x <= 500}, # For ICT primary TF
-        "ict_entry_order_type": {"type": str, "optional": True, "valid_values": ["MARKET", "LIMIT"]},
-        "ict_sl_buffer_atr_mult": {"type": float, "optional": True, "condition": lambda x: x >= 0},
-        "ict_tp1_qty_pct": {"type": float, "optional": True, "condition": lambda x: 0 < x <= 1},
-        "ict_tp2_qty_pct": {"type": float, "optional": True, "condition": lambda x: 0 < x <= 1},
-        "ict_tp3_qty_pct": {"type": float, "optional": True, "condition": lambda x: 0 < x <= 1}, # Validation for sum of pct could be added later
-        "ict_breakeven_buffer_r": {"type": float, "optional": True, "condition": lambda x: 0 <= x < 1},
-        "ict_signal_cooldown_seconds": {"type": int, "optional": True, "condition": lambda x: x >= 0},
-        "ict_order_timeout_minutes": {"type": int, "optional": True, "condition": lambda x: 1 <= x <= 1440}, # 1 min to 1 day
-        
+        "strategy_choice": {"type": str, "valid_values": ["ema_cross", "fib_retracement"]},
         "fib_1m_buffer_size": {"type": int, "optional": True, "condition": lambda x: 20 <= x <= 1000}, # For Fibonacci strategy
         "fib_order_timeout_minutes": {"type": int, "optional": True, "condition": lambda x: 1 <= x <= 60}, # For Fibonacci strategy
         "fib_atr_period": {"type": int, "optional": True, "condition": lambda x: x > 0}, # For Fibonacci SL
@@ -299,27 +253,6 @@ def validate_configurations(loaded_configs: dict) -> tuple[bool, str, dict]:
                 converted_val = float(val_str)
             elif rules["type"] == str:
                 converted_val = val_str # Already string, or explicitly convert
-            elif rules["type"] == list: # Handling for list type (e.g. ict_session_filter)
-                # Assuming the list is stored as a comma-separated string in CSV, or Python list literal string
-                if isinstance(val_orig, list): # Already a list
-                    converted_val = val_orig
-                elif isinstance(val_orig, str):
-                    if val_orig.startswith('[') and val_orig.endswith(']'):
-                        try:
-                            # Attempt to parse it as a Python list literal
-                            import ast
-                            parsed_list = ast.literal_eval(val_orig)
-                            if isinstance(parsed_list, list):
-                                converted_val = parsed_list
-                            else:
-                                return False, f"Value for '{key}' ('{val_orig}') is not a valid list format.", {}
-                        except (ValueError, SyntaxError):
-                             # Fallback to comma-separated if literal_eval fails
-                            converted_val = [item.strip() for item in val_orig.strip("[]").split(',') if item.strip()]
-                    else: # Assume comma-separated string if not starting/ending with brackets
-                        converted_val = [item.strip() for item in val_orig.split(',') if item.strip()]
-                else:
-                     return False, f"Invalid type for list key '{key}'. Expected list or string, got {type(val_orig)}.", {}
             else: # Should not happen with defined rules
                 return False, f"Unknown expected type for '{key}'.", {}
             
@@ -352,22 +285,6 @@ def validate_configurations(loaded_configs: dict) -> tuple[bool, str, dict]:
         if validated_configs["backtest_start_balance_type"] == "custom" and "backtest_custom_start_balance" not in validated_configs:
             return False, "Missing 'backtest_custom_start_balance' when type is custom.", {}
 
-    # ICT Specific Validations
-    if validated_configs.get("strategy_choice") == "ict":
-        # Validate ict_session_filter if present
-        if "ict_session_filter" in validated_configs:
-            sessions = validated_configs["ict_session_filter"]
-            if not isinstance(sessions, list):
-                return False, f"'ict_session_filter' must be a list, got {type(sessions)}.", {}
-            
-            # Further validation for session names if needed, e.g. check against allowed values
-            allowed_sessions_ict = ["london", "newyork", "tokyo", "sydney"] # example, case-insensitive
-            valid_sessions_found = []
-            for session_item in sessions:
-                if not isinstance(session_item, str) or session_item.strip().lower() not in allowed_sessions_ict:
-                    return False, f"Invalid session '{session_item}' in 'ict_session_filter'. Allowed (case-insensitive): {allowed_sessions_ict}.", {}
-                valid_sessions_found.append(session_item.strip().lower()) # Store as lowercase
-            validated_configs["ict_session_filter"] = valid_sessions_found # Update with cleaned list
 
     return True, "Validation successful.", validated_configs
 
@@ -470,31 +387,6 @@ def manage_daily_state(client, configs: dict, active_trades_dict_ref: dict, acti
             trading_halted_drawdown = False
             trading_halted_daily_loss = False
             last_trading_day = today
-
-            # --- Daily Reset for ICT Strategy State and Buffers ---
-            global ict_strategy_states, ict_strategy_states_lock
-            global symbol_primary_tf_candle_buffers, symbol_primary_tf_candle_buffers_lock
-            
-            print(f"New Day Reset: Clearing ICT strategy states and primary TF buffers...")
-            with ict_strategy_states_lock:
-                for symbol_state in ict_strategy_states.keys():
-                    ict_strategy_states[symbol_state] = { # Reset to initial structure
-                        "last_sweep": None, "active_fvgs": [], 
-                        "active_order_blocks": [], "active_ict_trade_zones": [],
-                        "pending_ict_entries": []
-                    }
-                # Or simply: ict_strategy_states.clear() if all symbol states are to be wiped
-                # For now, resetting structure per symbol to keep the symbol keys if desired.
-                # If new symbols might appear, .clear() might be cleaner. Let's use .clear().
-                ict_strategy_states.clear() 
-                print(f"ICT strategy states cleared for all symbols.")
-
-            with symbol_primary_tf_candle_buffers_lock:
-                symbol_primary_tf_candle_buffers.clear()
-                print(f"ICT Primary TF candle buffers cleared.")
-            # Note: 1-minute buffer (symbol_1m_candle_buffers) is general and not cleared here
-            # unless specifically required by all strategies using it.
-            # --- End ICT Daily Reset ---
             
             if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
                 send_telegram_message(
@@ -930,30 +822,6 @@ def update_1m_candle_buffer(symbol: str, new_candle_df_row: pd.Series, buffer_si
         symbol_1m_candle_buffers[symbol].append(new_candle_df_row)
         # print(f"Appended new 1m candle for {symbol} at {new_candle_df_row.name}. Buffer size: {len(symbol_1m_candle_buffers[symbol])}")
 
-def update_primary_tf_candle_buffer(symbol: str, new_candle_df_row: pd.Series, buffer_size: int):
-    """
-    Updates the primary timeframe (e.g., 1h) candle buffer for a given symbol (for ICT strategy).
-    `new_candle_df_row` should be a Pandas Series representing the latest primary TF candle,
-    with a DateTimeIndex.
-    """
-    global symbol_primary_tf_candle_buffers, symbol_primary_tf_candle_buffers_lock
-    with symbol_primary_tf_candle_buffers_lock:
-        if symbol not in symbol_primary_tf_candle_buffers:
-            symbol_primary_tf_candle_buffers[symbol] = deque(maxlen=buffer_size)
-        
-        if symbol_primary_tf_candle_buffers[symbol]:
-            last_buffered_candle_time = symbol_primary_tf_candle_buffers[symbol][-1].name
-            if new_candle_df_row.name == last_buffered_candle_time:
-                symbol_primary_tf_candle_buffers[symbol][-1] = new_candle_df_row
-                # print(f"Updated last primary TF candle for {symbol} at {new_candle_df_row.name}")
-                return
-            elif new_candle_df_row.name < last_buffered_candle_time:
-                # print(f"Skipping older primary TF candle for {symbol}. New: {new_candle_df_row.name}, Last: {last_buffered_candle_time}")
-                return
-
-        symbol_primary_tf_candle_buffers[symbol].append(new_candle_df_row)
-        # print(f"Appended new primary TF candle for {symbol} at {new_candle_df_row.name}. Buffer size: {len(symbol_primary_tf_candle_buffers[symbol])}")
-
 def get_historical_klines_1m(client, symbol: str, limit: int = 200): # Default limit for initial fill or checks
     """
     Fetches historical 1-minute klines for the Fibonacci strategy.
@@ -997,937 +865,6 @@ def get_historical_klines_1m(client, symbol: str, limit: int = 200): # Default l
         processing_error = e
         return pd.DataFrame(), processing_error
 
-def get_historical_klines_primary_tf(client, symbol: str, interval_str: str, limit: int = 200):
-    """
-    Fetches historical klines for the ICT strategy's primary timeframe.
-    `interval_str` should be like "1h", "15m", etc.
-    Returns a DataFrame and an error object.
-    """
-    start_time = time.time()
-    klines_primary = []
-    api_error = None
-    
-    # Convert interval_str to Client.KLINE_INTERVAL_* constant
-    # This mapping is crucial and needs to be robust.
-    interval_mapping = {
-        "1m": Client.KLINE_INTERVAL_1MINUTE, "3m": Client.KLINE_INTERVAL_3MINUTE,
-        "5m": Client.KLINE_INTERVAL_5MINUTE, "15m": Client.KLINE_INTERVAL_15MINUTE,
-        "30m": Client.KLINE_INTERVAL_30MINUTE, "1h": Client.KLINE_INTERVAL_1HOUR,
-        "2h": Client.KLINE_INTERVAL_2HOUR, "4h": Client.KLINE_INTERVAL_4HOUR,
-        "6h": Client.KLINE_INTERVAL_6HOUR, "8h": Client.KLINE_INTERVAL_8HOUR,
-        "12h": Client.KLINE_INTERVAL_12HOUR, "1d": Client.KLINE_INTERVAL_1DAY,
-        # Add more if needed: "1w": Client.KLINE_INTERVAL_1WEEK, "1M": Client.KLINE_INTERVAL_1MONTH
-    }
-    api_interval = interval_mapping.get(interval_str.lower())
-    if not api_interval:
-        print(f"Error: Invalid primary timeframe interval string '{interval_str}'.")
-        return pd.DataFrame(), ValueError(f"Invalid interval string: {interval_str}")
-
-    print(f"Fetching Primary TF ('{interval_str}') klines for {symbol}, limit {limit}...")
-    try:
-        klines_primary = client.get_klines(symbol=symbol, interval=api_interval, limit=limit)
-    except BinanceAPIException as e:
-        print(f"API Error fetching Primary TF klines for {symbol}: {e}")
-        api_error = e
-        return pd.DataFrame(), api_error
-    except Exception as e:
-        print(f"General error fetching Primary TF klines for {symbol}: {e}")
-        api_error = e
-        return pd.DataFrame(), api_error
-    
-    duration = time.time() - start_time
-    processing_error = None
-    try:
-        if not klines_primary:
-            print(f"No Primary TF kline data for {symbol} (fetch duration: {duration:.2f}s).")
-            return pd.DataFrame(), api_error
-
-        df = pd.DataFrame(klines_primary, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
-        for col in ['open', 'high', 'low', 'close', 'volume']: df[col] = pd.to_numeric(df[col], errors='coerce')
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df.set_index('timestamp', inplace=True)
-        df.dropna(subset=['open', 'high', 'low', 'close'], inplace=True)
-        
-        if df.empty and not api_error:
-            print(f"Primary TF kline data for {symbol} resulted in empty DataFrame after processing (fetch duration: {duration:.2f}s).")
-        else:
-             print(f"Fetched {len(df)} Primary TF klines for {symbol} (runtime: {duration:.2f}s).")
-        return df, None
-    except Exception as e:
-        print(f"Error processing Primary TF kline data for {symbol}: {e}")
-        processing_error = e
-        return pd.DataFrame(), processing_error
-
-# --- ICT Zone Detection Modules ---
-
-def detect_liquidity_sweep(symbol: str, primary_tf_df: pd.DataFrame, configs: dict, symbol_info: dict) -> dict | None:
-    """
-    Detects liquidity sweeps on the primary timeframe data.
-
-    Args:
-        symbol (str): The trading symbol.
-        primary_tf_df (pd.DataFrame): DataFrame of primary timeframe candles.
-                                      Index must be timestamp, columns must include 'high', 'low', 'close'.
-        configs (dict): Bot configuration containing ICT parameters.
-        symbol_info (dict): Symbol information for precision.
-
-
-    Returns:
-        dict | None: Sweep event details if detected, else None.
-                     Example: {"type": "bullish_sweep", "timestamp": pd.Timestamp, 
-                               "price_swept": float, "sweep_wick": float, "closing_price": float}
-    """
-    global ict_strategy_states, ict_strategy_states_lock # Access global ICT state
-
-    log_prefix = f"[{symbol} ICT_Sweep]"
-    if primary_tf_df.empty or len(primary_tf_df) < PIVOT_N_LEFT + PIVOT_N_RIGHT + 2: # Need enough for pivot + current candle
-        # print(f"{log_prefix} Insufficient primary TF data for sweep detection ({len(primary_tf_df)} candles).")
-        return None
-
-    current_candle = primary_tf_df.iloc[-1]
-    historical_data_for_pivots = primary_tf_df.iloc[:-1] # Exclude current candle for pivot calculation
-
-    if len(historical_data_for_pivots) < PIVOT_N_LEFT + PIVOT_N_RIGHT + 1:
-        # print(f"{log_prefix} Insufficient historical data for pivot calculation in sweep detection.")
-        return None
-
-    # Get the most recent confirmed swing high and low *before* the current candle
-    prev_high_time, prev_swing_high, prev_low_time, prev_swing_low = get_latest_pivots_from_buffer(
-        historical_data_for_pivots, PIVOT_N_LEFT, PIVOT_N_RIGHT
-    )
-
-    sweep_event = None
-    min_sweep_pips = configs.get("ict_min_liquidity_sweep_size_pips", DEFAULT_ICT_MIN_LIQUIDITY_SWEEP_SIZE_PIPS)
-    min_sweep_atr_mult = configs.get("ict_min_liquidity_sweep_size_atr", DEFAULT_ICT_MIN_LIQUIDITY_SWEEP_SIZE_ATR)
-    price_precision = int(symbol_info.get('pricePrecision', 2))
-    
-    current_atr_primary_tf = 0
-    if min_sweep_atr_mult > 0:
-        atr_period_for_sweep = configs.get("atr_period", DEFAULT_ATR_PERIOD) 
-        if len(primary_tf_df) >= atr_period_for_sweep:
-            # Ensure primary_tf_df has high, low, close if calculate_atr needs them
-            if all(col in primary_tf_df.columns for col in ['high', 'low', 'close']):
-                atr_series_primary = calculate_atr(primary_tf_df.copy(), period=atr_period_for_sweep)
-                if not atr_series_primary.empty and pd.notna(atr_series_primary.iloc[-1]):
-                    current_atr_primary_tf = atr_series_primary.iloc[-1]
-            else:
-                print(f"{log_prefix} Primary TF DataFrame missing HLC columns for ATR calculation.")
-
-        if current_atr_primary_tf == 0:
-            print(f"{log_prefix} Could not calculate valid ATR on primary TF for sweep size. ATR-based sweep check skipped.")
-            if min_sweep_pips == 0: return None # Cannot check sweep if both pips and ATR are disabled/failed
-
-    # Check for Bullish Sweep (sweeping a previous high)
-    if prev_swing_high is not None:
-        if current_candle['high'] > prev_swing_high:
-            sweep_size_actual = current_candle['high'] - prev_swing_high
-            
-            pip_value = 1 / (10**price_precision)
-            min_sweep_val_pips = min_sweep_pips * pip_value
-            
-            min_sweep_val_atr = 0
-            if current_atr_primary_tf > 0 and min_sweep_atr_mult > 0:
-                 min_sweep_val_atr = current_atr_primary_tf * min_sweep_atr_mult
-            
-            sweep_size_ok = False
-            if min_sweep_pips > 0 and sweep_size_actual >= min_sweep_val_pips:
-                sweep_size_ok = True
-                print(f"{log_prefix} Bullish sweep candidate by pips: Wick {current_candle['high']:.{price_precision}f} > SwingHigh {prev_swing_high:.{price_precision}f}. Sweep size {sweep_size_actual:.{price_precision}f} >= MinPipsVal {min_sweep_val_pips:.{price_precision}f}")
-            
-            if not sweep_size_ok and min_sweep_atr_mult > 0 and current_atr_primary_tf > 0 and sweep_size_actual >= min_sweep_val_atr:
-                sweep_size_ok = True
-                print(f"{log_prefix} Bullish sweep candidate by ATR: Wick {current_candle['high']:.{price_precision}f} > SwingHigh {prev_swing_high:.{price_precision}f}. Sweep size {sweep_size_actual:.{price_precision}f} >= MinAtrVal {min_sweep_val_atr:.{price_precision}f} (ATR: {current_atr_primary_tf:.{price_precision}f})")
-
-            if sweep_size_ok:
-                if current_candle['close'] < prev_swing_high:
-                    sweep_event = {
-                        "type": "bullish_sweep", "timestamp": current_candle.name,
-                        "price_swept": prev_swing_high, "sweep_wick": current_candle['high'],
-                        "closing_price": current_candle['close']
-                    }
-                    print(f"{log_prefix} CONFIRMED Bullish Sweep of High {prev_swing_high:.{price_precision}f}")
-                else:
-                    print(f"{log_prefix} Bullish sweep REJECTED: Close {current_candle['close']:.{price_precision}f} not < swept high {prev_swing_high:.{price_precision}f}.")
-
-    # Check for Bearish Sweep (sweeping a previous low)
-    if not sweep_event and prev_swing_low is not None: # Only if no bullish sweep found
-        if current_candle['low'] < prev_swing_low:
-            sweep_size_actual = prev_swing_low - current_candle['low']
-
-            pip_value = 1 / (10**price_precision)
-            min_sweep_val_pips = min_sweep_pips * pip_value
-            
-            min_sweep_val_atr = 0
-            if current_atr_primary_tf > 0 and min_sweep_atr_mult > 0:
-                min_sweep_val_atr = current_atr_primary_tf * min_sweep_atr_mult
-
-            sweep_size_ok = False
-            if min_sweep_pips > 0 and sweep_size_actual >= min_sweep_val_pips:
-                sweep_size_ok = True
-                print(f"{log_prefix} Bearish sweep candidate by pips: Wick {current_candle['low']:.{price_precision}f} < SwingLow {prev_swing_low:.{price_precision}f}. Sweep size {sweep_size_actual:.{price_precision}f} >= MinPipsVal {min_sweep_val_pips:.{price_precision}f}")
-
-            if not sweep_size_ok and min_sweep_atr_mult > 0 and current_atr_primary_tf > 0 and sweep_size_actual >= min_sweep_val_atr:
-                sweep_size_ok = True
-                print(f"{log_prefix} Bearish sweep candidate by ATR: Wick {current_candle['low']:.{price_precision}f} < SwingLow {prev_swing_low:.{price_precision}f}. Sweep size {sweep_size_actual:.{price_precision}f} >= MinAtrVal {min_sweep_val_atr:.{price_precision}f} (ATR: {current_atr_primary_tf:.{price_precision}f})")
-
-            if sweep_size_ok:
-                if current_candle['close'] > prev_swing_low:
-                    sweep_event = {
-                        "type": "bearish_sweep", "timestamp": current_candle.name,
-                        "price_swept": prev_swing_low, "sweep_wick": current_candle['low'],
-                        "closing_price": current_candle['close']
-                    }
-                    print(f"{log_prefix} CONFIRMED Bearish Sweep of Low {prev_swing_low:.{price_precision}f}")
-                else:
-                    print(f"{log_prefix} Bearish sweep REJECTED: Close {current_candle['close']:.{price_precision}f} not > swept low {prev_swing_low:.{price_precision}f}.")
-
-    if sweep_event:
-        with ict_strategy_states_lock:
-            if symbol not in ict_strategy_states: ict_strategy_states[symbol] = {}
-            ict_strategy_states[symbol]['last_sweep'] = sweep_event
-            ict_strategy_states[symbol]['active_fvgs'] = [] # Clear dependent states
-            ict_strategy_states[symbol]['active_order_blocks'] = []
-            ict_strategy_states[symbol]['active_ict_trade_zones'] = []
-            print(f"{log_prefix} Stored {sweep_event['type']} in ict_strategy_states.")
-        
-        # Log and Notify Sweep
-        log_ict_event_to_csv({
-            "Symbol": symbol, "EventType": "SWEEP_DETECTED", "Direction": sweep_event['type'],
-            "PriceSwept": sweep_event['price_swept'], "SweepWick": sweep_event['sweep_wick'],
-            "Price": sweep_event['closing_price'], # Price here is the closing price of sweep candle
-            "Notes": f"Sweep of {sweep_event['price_swept']}"
-        })
-        send_ict_telegram_alert(configs, "SWEEP", symbol, sweep_event, symbol_info)
-
-    return sweep_event
-
-def calculate_ict_sl_tp(entry_price: float, side: str, ict_zone: dict, atr_1m_value: float | None, configs: dict, symbol_info: dict) -> tuple[float | None, list[dict]]:
-    """
-    Calculates Stop Loss (SL) and multiple Take Profit (TP) levels for an ICT strategy trade.
-
-    Args:
-        entry_price (float): The entry price of the trade.
-        side (str): "LONG" or "SHORT".
-        ict_zone (dict): The validated ICT trade zone details 
-                         (e.g., {"zone_upper", "zone_lower", "ob_high", "ob_low", ...}).
-        atr_1m_value (float | None): Current 1-minute ATR value for SL buffer. Can be None if ATR calc fails.
-        configs (dict): Bot configuration containing ICT SL/TP parameters.
-        symbol_info (dict): Symbol information for price precision.
-
-    Returns:
-        tuple: (sl_price, tp_levels_details_list)
-               sl_price (float | None): Calculated SL price, or None if calculation fails.
-               tp_levels_details_list (list[dict]): List of TP details 
-                                                    e.g., [{"price": float, "quantity_pct": float, "name": "TP1"}, ...]
-                                                    Returns empty list if TPs cannot be calculated.
-    """
-    p_prec = int(symbol_info.get('pricePrecision', 2))
-    sl_buffer_atr_mult = configs.get("ict_sl_buffer_atr_mult", DEFAULT_ICT_SL_BUFFER_ATR_MULT)
-    
-    sl_price = None
-    
-    # SL Logic: Opposite edge of FVG/OB ± small ATR buffer
-    # For a LONG trade (expecting price to go up from the zone):
-    # Zone is typically FVG (e.g., fvg_lower_band to fvg_upper_band) confirmed by a Bullish OB below/overlapping it.
-    # SL should be below the lowest point of the FVG or OB.
-    if side == "LONG":
-        # Consider the lower of FVG's lower band and OB's low as the protective structure.
-        protective_low = min(ict_zone.get("zone_lower", float('inf')), ict_zone.get("ob_low", float('inf')))
-        if protective_low == float('inf'): # Should not happen if zone is valid
-            print(f"[{symbol_info['symbol']} ICT_SLTP] Error: Could not determine protective low for LONG SL from zone: {ict_zone}")
-            return None, []
-        
-        sl_price_candidate = protective_low
-        if atr_1m_value is not None and atr_1m_value > 0 and sl_buffer_atr_mult > 0:
-            sl_price_candidate -= (atr_1m_value * sl_buffer_atr_mult)
-        sl_price = round(sl_price_candidate, p_prec)
-        if sl_price >= entry_price : # SL must be below entry for LONG
-            print(f"[{symbol_info['symbol']} ICT_SLTP] Warning: Calculated SL {sl_price} for LONG is not below entry {entry_price}. SL invalid.")
-            return None, []
-
-    # For a SHORT trade (expecting price to go down from the zone):
-    # Zone is typically FVG (e.g., fvg_lower_band to fvg_upper_band) confirmed by a Bearish OB above/overlapping it.
-    # SL should be above the highest point of the FVG or OB.
-    elif side == "SHORT":
-        protective_high = max(ict_zone.get("zone_upper", float('-inf')), ict_zone.get("ob_high", float('-inf')))
-        if protective_high == float('-inf'):
-            print(f"[{symbol_info['symbol']} ICT_SLTP] Error: Could not determine protective high for SHORT SL from zone: {ict_zone}")
-            return None, []
-
-        sl_price_candidate = protective_high
-        if atr_1m_value is not None and atr_1m_value > 0 and sl_buffer_atr_mult > 0:
-            sl_price_candidate += (atr_1m_value * sl_buffer_atr_mult)
-        sl_price = round(sl_price_candidate, p_prec)
-        if sl_price <= entry_price : # SL must be above entry for SHORT
-            print(f"[{symbol_info['symbol']} ICT_SLTP] Warning: Calculated SL {sl_price} for SHORT is not above entry {entry_price}. SL invalid.")
-            return None, []
-    else:
-        print(f"[{symbol_info['symbol']} ICT_SLTP] Invalid side '{side}' for SL/TP calculation.")
-        return None, []
-
-    # TP Logic: Layered at 1R, 2R, 3R
-    tp_levels_details_list = []
-    if sl_price is None: return None, [] # Cannot calculate TPs if SL is invalid
-
-    risk_per_unit_price = abs(entry_price - sl_price)
-    if risk_per_unit_price == 0: # Should be caught by SL validation against entry, but as a safeguard
-        print(f"[{symbol_info['symbol']} ICT_SLTP] Risk per unit is zero (entry={entry_price}, SL={sl_price}). Cannot calculate R-based TPs.")
-        return sl_price, [] # Return valid SL but no TPs
-
-    r_multiples = [1.0, 2.0, 3.0] # For TP1, TP2, TP3
-    tp_qty_pcts = [
-        configs.get("ict_tp1_qty_pct", DEFAULT_ICT_TP1_QTY_PCT),
-        configs.get("ict_tp2_qty_pct", DEFAULT_ICT_TP2_QTY_PCT),
-        configs.get("ict_tp3_qty_pct", DEFAULT_ICT_TP3_QTY_PCT)
-    ]
-    
-    # Ensure sum of qty_pcts is close to 1.0, adjust last TP if needed.
-    # This is a simplified adjustment. A more robust one would distribute remainder or handle <1 sums.
-    sum_pcts = sum(tp_qty_pcts)
-    if abs(sum_pcts - 1.0) > 1e-5 : # If not summing to 1.0 (within tolerance)
-        print(f"[{symbol_info['symbol']} ICT_SLTP] Warning: TP quantity percentages ({tp_qty_pcts}) do not sum to 1.0 (sum: {sum_pcts}). Adjusting last TP.")
-        # Simple adjustment: give remainder to TP3, or if TP3 is 0, to TP2, then TP1.
-        # This assumes TP3 is intended as the remainder portion.
-        if tp_qty_pcts[2] > 0 or (tp_qty_pcts[1] == 0 and tp_qty_pcts[0] == 0) : # If TP3 is used or it's the only one
-            tp_qty_pcts[2] = max(0, 1.0 - tp_qty_pcts[0] - tp_qty_pcts[1])
-        elif tp_qty_pcts[1] > 0: # If TP2 is used and TP3 is not
-            tp_qty_pcts[1] = max(0, 1.0 - tp_qty_pcts[0])
-        # TP1 would be 1.0 if it's the only one used, handled by initial config.
-
-    for i, r_mult in enumerate(r_multiples):
-        tp_price_candidate = 0
-        if side == "LONG":
-            tp_price_candidate = entry_price + (risk_per_unit_price * r_mult)
-        else: # SHORT
-            tp_price_candidate = entry_price - (risk_per_unit_price * r_mult)
-        
-        tp_price_final = round(tp_price_candidate, p_prec)
-
-        # Ensure TP is logical (e.g., for LONG, TP > entry; for SHORT, TP < entry)
-        if (side == "LONG" and tp_price_final <= entry_price) or \
-           (side == "SHORT" and tp_price_final >= entry_price):
-            print(f"[{symbol_info['symbol']} ICT_SLTP] Calculated TP{i+1} ({tp_price_final}) is not profitable against entry {entry_price}. Skipping this TP level.")
-            continue # Skip this TP level
-            
-        if tp_qty_pcts[i] > 0: # Only add TP if quantity percentage is assigned
-            tp_levels_details_list.append({
-                "price": tp_price_final,
-                "quantity_pct": tp_qty_pcts[i],
-                "name": f"TP{i+1}"
-            })
-            
-    if not tp_levels_details_list:
-        print(f"[{symbol_info['symbol']} ICT_SLTP] No valid TP levels calculated.")
-        # Still return the SL if it was valid, even if TPs could not be set.
-        # Caller needs to handle case of valid SL but no TPs.
-        
-    print(f"[{symbol_info['symbol']} ICT_SLTP] Calculated SL: {sl_price:.{p_prec}f}. TP Levels: {tp_levels_details_list}")
-    return sl_price, tp_levels_details_list
-
-def manage_ict_entry_logic(client, configs: dict, symbol: str, symbol_info: dict, current_entry_tf_candle_row: pd.Series, ict_zones: list[dict]):
-    """
-    Manages the entry logic for the ICT strategy based on active zones and ENTRY TIMEFRAME candle data.
-    Places LIMIT orders, and if filled (monitored by a separate function), SL/TP orders with multiple TPs.
-    """
-    global active_trades, active_trades_lock, ict_strategy_states, ict_strategy_states_lock
-    global last_signal_time, last_signal_lock, recent_trade_signatures, recent_trade_signatures_lock
-    global trading_halted_drawdown, trading_halted_daily_loss, trading_halted_manual, daily_state_lock
-    
-    log_prefix = f"[{threading.current_thread().name}] {symbol} ICT_Entry:"
-    entry_order_type = configs.get("ict_entry_order_type", DEFAULT_ICT_ENTRY_ORDER_TYPE) # Should be LIMIT
-
-    # --- Halt Checks ---
-    with daily_state_lock:
-        if trading_halted_drawdown or trading_halted_daily_loss:
-            return
-    if trading_halted_manual:
-        return
-
-    if not ict_zones:
-        return
-
-    if current_entry_tf_candle_row is None or current_entry_tf_candle_row.empty:
-        print(f"{log_prefix} No current entry timeframe candle data available for {symbol}. Skipping ICT entry check.")
-        return
-
-    current_entry_tf_close = current_entry_tf_candle_row['close']
-    current_utc_time = pd.Timestamp.now(tz='UTC') 
-    entry_tf_str = configs.get("ict_timeframe_entry", DEFAULT_ICT_TIMEFRAME_ENTRY) # For logging
-
-    # --- Session Filter ---
-    session_filter_list = configs.get("ict_session_filter", DEFAULT_ICT_SESSION_FILTER)
-    # Add current session to notes if active within a session
-    active_session_for_log = "Any"
-    for sess_name_cfg in session_filter_list:
-        if is_time_in_ict_session(current_utc_time, [sess_name_cfg.lower()]): # Check one by one
-            active_session_for_log = sess_name_cfg.title()
-            break # Found an active session
-            
-    if not is_time_in_ict_session(current_utc_time, [s.lower() for s in session_filter_list]):
-        return
-    
-    # --- Iterate through active ICT zones ---
-    for zone in ict_zones:
-        zone_upper = zone['zone_upper'] # This is FVG upper
-        zone_lower = zone['zone_lower'] # This is FVG lower
-        zone_type = zone['type'] # "long_zone" or "short_zone" (derived from OB type)
-        
-        trade_side = None
-        # For LIMIT orders, price doesn't need to be *in* the zone on the entry TF candle's close.
-        # The zone itself defines where we want to place the limit order.
-        # We just need a valid zone to consider placing a limit order.
-        if zone_type == "long_zone": # Bullish OB, Bearish FVG -> Long setup
-            trade_side = "LONG"
-        elif zone_type == "short_zone": # Bearish OB, Bullish FVG -> Short setup
-            trade_side = "SHORT"
-        
-        if not trade_side:
-            # This should not happen if zone has a valid type
-            print(f"{log_prefix} Invalid zone type '{zone_type}' for {symbol}. Skipping zone.")
-            continue 
-
-        # Determine proposed entry price for LIMIT order
-        # Default to FVG midpoint. Could be made more configurable (e.g. proximal/distal edge of FVG or OB).
-        p_prec = int(symbol_info['pricePrecision'])
-        proposed_limit_entry_price = round((zone_upper + zone_lower) / 2.0, p_prec)
-
-        print(f"{log_prefix} Potential {trade_side} limit entry for {symbol} in {zone_type} ({zone_lower}-{zone_upper}). Proposed Limit: {proposed_limit_entry_price} (Entry TF: {entry_tf_str} @ {current_entry_tf_close})")
-
-        # --- Cooldown Check ---
-        cooldown_seconds_ict = configs.get("ict_signal_cooldown_seconds", DEFAULT_ICT_SIGNAL_COOLDOWN_SECONDS)
-        with last_signal_lock:
-            if symbol in last_signal_time and \
-               (dt.now() - last_signal_time.get(f"{symbol}_ict", dt.min)).total_seconds() < cooldown_seconds_ict:
-                # print(f"{log_prefix} ICT Cooldown active for {symbol}. Skipping.")
-                continue # Try next zone or return
-        
-        # --- Active Trade / Position / Open Orders Checks (similar to other strategies) ---
-        with active_trades_lock:
-            if symbol in active_trades:
-                # print(f"{log_prefix} Symbol {symbol} already has an active trade. Skipping ICT entry.")
-                continue
-            if len(active_trades) >= configs["max_concurrent_positions"]:
-                print(f"{log_prefix} Max concurrent positions reached. Cannot open ICT trade for {symbol}.")
-                return # No more capacity for any trades
-
-        # (Skipping live position/order checks on exchange for brevity here, assume they'd be similar to manage_trade_entry)
-
-        # --- Calculate SL/TP ---
-        # ATR for SL buffer. For ICT, this should ideally use ATR from the entry timeframe (e.g., 1m or 15m).
-        # Assuming current_entry_tf_candle_row is the latest from that timeframe's buffer.
-        atr_entry_tf_value = None
-        entry_tf_buffer_for_atr = None
-        
-        # Determine which buffer to use for ATR calculation based on entry_tf_str
-        # For now, we only have a dedicated 1m buffer. If entry_tf is not 1m, ATR might not be available or needs specific handling.
-        # The plan mentioned using 1m ATR for SL buffer, so we will try to get it from symbol_1m_candle_buffers
-        if entry_tf_str == "1m" or True: # Always try to get 1m ATR for SL buffer for now as per plan
-            with symbol_1m_candle_buffers_lock:
-                if symbol in symbol_1m_candle_buffers and len(symbol_1m_candle_buffers[symbol]) >= configs.get("atr_period", DEFAULT_ATR_PERIOD):
-                    buffer_list = list(symbol_1m_candle_buffers[symbol])
-                    temp_df_1m = pd.DataFrame([s.to_dict() for s in buffer_list])
-                    if not temp_df_1m.empty and all(c in temp_df_1m for c in ['high','low','close']):
-                        # Ensure correct index for ATR calculation
-                        index_timestamps = [s.name for s in buffer_list if hasattr(s, 'name')]
-                        if len(index_timestamps) == len(temp_df_1m):
-                             temp_df_1m.index = pd.DatetimeIndex(index_timestamps)
-                             atr_1m_series = calculate_atr(temp_df_1m, period=configs.get("atr_period", DEFAULT_ATR_PERIOD))
-                             if not atr_1m_series.empty and pd.notna(atr_1m_series.iloc[-1]):
-                                 atr_entry_tf_value = atr_1m_series.iloc[-1]
-                        else: print(f"{log_prefix} Timestamp index mismatch for 1m ATR calc for {symbol}.")
-        
-        if atr_entry_tf_value is None:
-            print(f"{log_prefix} Could not calculate 1m ATR for SL buffer for {symbol}. Using zero buffer.")
-            atr_entry_tf_value = 0.0
-        
-        sl_price, tp_levels_details = calculate_ict_sl_tp(
-            proposed_limit_entry_price, trade_side, zone, atr_entry_tf_value, configs, symbol_info
-        )
-
-        if sl_price is None or not tp_levels_details:
-            print(f"{log_prefix} Failed to calculate valid SL/TP for {symbol} in zone. SL: {sl_price}, TPs: {tp_levels_details}")
-            continue 
-
-        # --- Position Sizing & Risk Checks ---
-        acc_bal = get_account_balance(client, configs)
-        if acc_bal is None or acc_bal <= 0:
-            print(f"{log_prefix} Invalid account balance ({acc_bal}). Aborting ICT entry."); return
-
-        current_leverage_on_symbol = configs.get('leverage') 
-        try:
-            pos_info_lev = client.futures_position_information(symbol=symbol)
-            if pos_info_lev and isinstance(pos_info_lev, list) and pos_info_lev[0]:
-                current_leverage_on_symbol = int(pos_info_lev[0].get('leverage', configs.get('leverage')))
-        except Exception as e_lev:
-            print(f"{log_prefix} Could not fetch current leverage for {symbol}: {e_lev}. Using default {current_leverage_on_symbol}x.")
-
-        qty_to_order_total = calculate_position_size(acc_bal, configs['risk_percent'], proposed_limit_entry_price, sl_price, symbol_info, configs)
-        if qty_to_order_total is None or qty_to_order_total <= 0:
-            print(f"{log_prefix} Invalid total position size calculated ({qty_to_order_total}). Aborting."); continue
-        
-        passed_sanity, sanity_reason = pre_order_sanity_checks(
-            symbol, trade_side, proposed_limit_entry_price, sl_price, tp_levels_details[0]['price'], qty_to_order_total, 
-            symbol_info, acc_bal, configs['risk_percent'], configs, current_leverage_on_symbol
-        )
-        if not passed_sanity:
-            print(f"{log_prefix} Pre-order sanity checks FAILED for ICT entry: {sanity_reason}"); continue
-        
-        trade_sig_ict = generate_trade_signature(symbol, f"ICT_{trade_side}", proposed_limit_entry_price, sl_price, tp_levels_details[0]['price'], qty_to_order_total, int(symbol_info['pricePrecision']))
-        with recent_trade_signatures_lock:
-            if trade_sig_ict in recent_trade_signatures and \
-               (dt.now() - recent_trade_signatures[trade_sig_ict]).total_seconds() < 60: # Check within 60s for exact duplicate
-                print(f"{log_prefix} Duplicate ICT trade signature found (pending or recent). Skipping."); continue
-        
-        with last_signal_lock:
-            last_signal_time[f"{symbol}_ict"] = dt.now()
-
-        # --- Place LIMIT Order or Send Signal ---
-        if configs['mode'] == 'signal':
-            est_pnl_tp1_ict = calculate_pnl_for_fixed_capital(proposed_limit_entry_price, tp_levels_details[0]['price'], trade_side, current_leverage_on_symbol, 100.0, symbol_info)
-            est_pnl_sl_ict = calculate_pnl_for_fixed_capital(proposed_limit_entry_price, sl_price, trade_side, current_leverage_on_symbol, 100.0, symbol_info)
-            
-            signal_alert_details = {
-                "side": trade_side, "entry_price": proposed_limit_entry_price, "sl_price": sl_price,
-                "tp1_price": tp_levels_details[0]['price'] if tp_levels_details else None,
-                "tp1_qty_pct": tp_levels_details[0]['quantity_pct'] if tp_levels_details else 0,
-                "tp2_price": tp_levels_details[1]['price'] if len(tp_levels_details) > 1 else None,
-                "tp2_qty_pct": tp_levels_details[1]['quantity_pct'] if len(tp_levels_details) > 1 else 0,
-                "tp3_price": tp_levels_details[2]['price'] if len(tp_levels_details) > 2 else None,
-                "tp3_qty_pct": tp_levels_details[2]['quantity_pct'] if len(tp_levels_details) > 2 else 0,
-            }
-            send_ict_telegram_alert(configs, "ENTRY", symbol, signal_alert_details, symbol_info) # Will show as LIMIT type
-            
-            log_ict_event_to_csv({
-                "Symbol": symbol, "EventType": "LIMIT_ENTRY_SIGNAL", "Direction": trade_side,
-                "EntryPrice": proposed_limit_entry_price, "SL_Price": sl_price,
-                "TP1_Price": signal_alert_details["tp1_price"], "TP1_Qty_Pct": signal_alert_details["tp1_qty_pct"],
-                "TP2_Price": signal_alert_details["tp2_price"], "TP2_Qty_Pct": signal_alert_details["tp2_qty_pct"],
-                "TP3_Price": signal_alert_details["tp3_price"], "TP3_Qty_Pct": signal_alert_details["tp3_qty_pct"],
-                "Zone_Upper": zone.get("zone_upper"), "Zone_Lower": zone.get("zone_lower"),
-                "OB_High": zone.get("ob_high"), "OB_Low": zone.get("ob_low"),
-                "Notes": f"Signal for limit entry in zone from {entry_tf_str}. Session: {active_session_for_log}"
-            })
-            with recent_trade_signatures_lock: recent_trade_signatures[trade_sig_ict] = dt.now() # Record signature for signal
-            print(f"{log_prefix} Signal Mode: ICT LIMIT signal for {symbol} sent and logged.")
-            return # Exit after processing one valid zone and sending signal
-
-        # --- Live/Backtest Mode: Place LIMIT Order ---
-        if entry_order_type != "LIMIT": # Should always be LIMIT now for ICT
-            print(f"{log_prefix} ICT entry_order_type is not LIMIT ({entry_order_type}). Aborting as per new requirement.")
-            return
-
-        print(f"{log_prefix} Attempting {trade_side} {qty_to_order_total} {symbol} via LIMIT @ {proposed_limit_entry_price}")
-        limit_entry_order, entry_err_msg = place_new_order(client, symbol_info, 
-                                       "BUY" if trade_side=="LONG" else "SELL", 
-                                       "LIMIT", qty_to_order_total, price=proposed_limit_entry_price,
-                                       position_side=trade_side)
-
-        if not limit_entry_order:
-            print(f"{log_prefix} ICT LIMIT entry order placement FAILED. Error: {entry_err_msg}")
-            # Log failed attempt
-            log_ict_event_to_csv({
-                "Symbol": symbol, "EventType": "LIMIT_ENTRY_FAIL", "Direction": trade_side,
-                "EntryPrice": proposed_limit_entry_price, "SL_Price": sl_price, "Notes": f"Failed: {entry_err_msg}"
-            })
-            return 
-
-        print(f"{log_prefix} ICT LIMIT entry order PLACED: ID {limit_entry_order['orderId']}, Status: {limit_entry_order['status']}")
-        
-        # Store pending order details
-        pending_order_info = {
-            "order_id": limit_entry_order['orderId'],
-            "limit_price": proposed_limit_entry_price,
-            "sl_price": sl_price,
-            "tp_levels_details": tp_levels_details, # List of dicts: {"price", "quantity_pct", "name"}
-            "quantity": qty_to_order_total,
-            "side": trade_side,
-            "zone_snapshot": zone, # Store the zone that triggered this
-            "atr_1m_at_placement": atr_entry_tf_value, # Store ATR used for SL calc for consistency
-            "order_placed_timestamp": current_utc_time,
-            "symbol_info": symbol_info # Store for monitor
-        }
-        with ict_strategy_states_lock:
-            if symbol not in ict_strategy_states: ict_strategy_states[symbol] = {"pending_ict_entries": []}
-            if 'pending_ict_entries' not in ict_strategy_states[symbol]: ict_strategy_states[symbol]['pending_ict_entries'] = []
-            ict_strategy_states[symbol]['pending_ict_entries'].append(pending_order_info)
-            print(f"{log_prefix} ICT Limit order {limit_entry_order['orderId']} added to pending_ict_entries for {symbol}.")
-        
-        with recent_trade_signatures_lock: recent_trade_signatures[trade_sig_ict] = dt.now()
-        
-        # Log successful placement of LIMIT order
-        log_ict_event_to_csv({
-            "Symbol": symbol, "EventType": "LIMIT_ENTRY_PLACED", "Direction": trade_side,
-            "EntryPrice": proposed_limit_entry_price, "SL_Price": sl_price, "OrderID": limit_entry_order['orderId'],
-            "Notes": f"Limit order placed for zone from {entry_tf_str}. Session: {active_session_for_log}"
-        })
-        # Send Telegram alert for LIMIT order placed (not yet filled)
-        alert_details_limit_placed = {
-            "side": trade_side, "entry_price": proposed_limit_entry_price, "sl_price": sl_price, 
-            "order_id": limit_entry_order.get('orderId'),
-            "tp1_price": tp_levels_details[0]['price'] if tp_levels_details else None, # For info
-            "tp1_qty_pct": tp_levels_details[0]['quantity_pct'] if tp_levels_details else 0,
-             # Can add more TPs if needed in this informational alert
-        }
-        # Using existing "ENTRY" type but context implies it's a pending limit
-        send_ict_telegram_alert(configs, "ENTRY", symbol, alert_details_limit_placed, symbol_info) 
-
-        return # Successfully placed a limit order for this zone
-
-    # If loop completes, no entry was made for any zone for this symbol in this cycle
-    # print(f"{log_prefix} No ICT entry conditions met for any active zone for {symbol} this cycle.")
-
-
-def find_fair_value_gap(symbol: str, primary_tf_df: pd.DataFrame, sweep_event: dict, configs: dict, symbol_info: dict) -> dict | None:
-    """
-    Identifies Fair Value Gaps (FVGs) on the primary timeframe data, typically after a liquidity sweep.
-    # print(f"{log_prefix} No ICT entry conditions met for any active zone for {symbol} this cycle.")
-
-
-def find_fair_value_gap(symbol: str, primary_tf_df: pd.DataFrame, sweep_event: dict, configs: dict, symbol_info: dict) -> dict | None:
-    """
-    Identifies Fair Value Gaps (FVGs) on the primary timeframe data, typically after a liquidity sweep.
-
-    Args:
-        symbol (str): The trading symbol.
-        primary_tf_df (pd.DataFrame): DataFrame of primary timeframe candles. Must contain 'high', 'low', 'close'.
-        sweep_event (dict): Details of the liquidity sweep that triggered this FVG search.
-        configs (dict): Bot configuration with ICT parameters.
-        symbol_info (dict): Symbol information for precision.
-
-    Returns:
-        dict | None: FVG details if found, else None.
-                     Example: {"type": "bullish_fvg" (meaning price expected to go up from here), 
-                               "upper_band": float, "lower_band": float, 
-                               "timestamp_created": pd.Timestamp, "triggering_sweep_timestamp": pd.Timestamp}
-    """
-    global ict_strategy_states, ict_strategy_states_lock
-    log_prefix = f"[{symbol} ICT_FVG]"
-
-    if primary_tf_df.empty or len(primary_tf_df) < 3: # Need at least 3 candles for FVG pattern
-        # print(f"{log_prefix} Insufficient primary TF data for FVG detection ({len(primary_tf_df)} candles).")
-        return None
-
-    # FVGs are typically sought on the retracement leg *after* a sweep.
-    # We need to find the index of the sweep candle to look at candles after it.
-    sweep_timestamp = sweep_event['timestamp']
-    
-    try:
-        sweep_candle_index = primary_tf_df.index.get_loc(sweep_timestamp)
-    except KeyError:
-        print(f"{log_prefix} Sweep candle timestamp {sweep_timestamp} not found in primary_tf_df. Cannot find FVG.")
-        return None
-
-    # We search for FVGs in the candles *after* the sweep candle.
-    # A common FVG pattern involves 3 candles. We need to ensure we have enough candles after the sweep.
-    # If sweep_candle_index is the last index, no candles after. If second to last, only 1 candle after.
-    # We need at least 2 candles *after* the sweep candle to form a 3-candle FVG pattern where the
-    # FVG is typically considered "created" by the third candle of that pattern.
-    # So, we need index up to sweep_candle_index + 2 to exist.
-    
-    fvg_event = None
-    
-    # Iterate from the candle after the sweep candle up to the third to last candle in the df
-    # to allow a 3-candle pattern to form.
-    # Candle 1 (index k), Candle 2 (index k+1), Candle 3 (index k+2)
-    # The FVG is between C1 and C3, created by C2's impulse.
-    for k in range(sweep_candle_index + 1, len(primary_tf_df) - 2):
-        candle1 = primary_tf_df.iloc[k]
-        candle2 = primary_tf_df.iloc[k+1] # The "impulse" candle creating the gap
-        candle3 = primary_tf_df.iloc[k+2] # The candle confirming the gap relative to candle1
-
-        fvg_upper = None
-        fvg_lower = None
-        fvg_type = None
-
-        # Bullish FVG (price moved down fast, expect retrace up to fill it, then continue down - so this is a potential short entry area)
-        # Candle 1 Low > Candle 3 High. FVG is C3.high to C1.low.
-        if candle1['low'] > candle3['high']:
-            fvg_type = "bullish_fvg" # Indicates a void to the upside (bullish price action created it)
-            fvg_lower = candle3['high']
-            fvg_upper = candle1['low']
-            
-        # Bearish FVG (price moved up fast, expect retrace down to fill it, then continue up - so this is a potential long entry area)
-        # Candle 1 High < Candle 3 Low. FVG is C1.high to C3.low.
-        elif candle1['high'] < candle3['low']:
-            fvg_type = "bearish_fvg" # Indicates a void to the downside (bearish price action created it)
-            fvg_lower = candle1['high']
-            fvg_upper = candle3['low']
-
-        if fvg_type:
-            fvg_width = abs(fvg_upper - fvg_lower)
-            min_fvg_pips = configs.get("ict_fvg_min_width_pips", DEFAULT_ICT_FVG_MIN_WIDTH_PIPS)
-            min_fvg_pct_range = configs.get("ict_fvg_min_width_percent_range", DEFAULT_ICT_FVG_MIN_WIDTH_PERCENT_RANGE)
-            price_precision = int(symbol_info.get('pricePrecision', 2))
-            pip_value = 1 / (10**price_precision)
-            
-            min_fvg_val_pips = min_fvg_pips * pip_value
-            
-            three_candle_range = max(candle1['high'], candle2['high'], candle3['high']) - \
-                                 min(candle1['low'], candle2['low'], candle3['low'])
-            min_fvg_val_pct = 0
-            if three_candle_range > 0 : # Avoid division by zero
-                min_fvg_val_pct = three_candle_range * min_fvg_pct_range
-
-            fvg_width_ok = False
-            if min_fvg_pips > 0 and fvg_width >= min_fvg_val_pips:
-                fvg_width_ok = True
-                print(f"{log_prefix} {fvg_type} candidate by pips: Width {fvg_width:.{price_precision}f} >= MinPipsVal {min_fvg_val_pips:.{price_precision}f}")
-            
-            if not fvg_width_ok and min_fvg_pct_range > 0 and three_candle_range > 0 and fvg_width >= min_fvg_val_pct:
-                fvg_width_ok = True
-                print(f"{log_prefix} {fvg_type} candidate by % range: Width {fvg_width:.{price_precision}f} >= MinPctVal {min_fvg_val_pct:.{price_precision}f} (3-candle range: {three_candle_range:.{price_precision}f})")
-
-            if fvg_width_ok:
-                fvg_event = {
-                    "type": fvg_type, "upper_band": fvg_upper, "lower_band": fvg_lower,
-                    "timestamp_created": candle3.name, # FVG confirmed by C3's close
-                    "triggering_sweep_timestamp": sweep_timestamp
-                }
-                print(f"{log_prefix} CONFIRMED {fvg_type} at {candle3.name}. Range: {fvg_lower:.{price_precision}f}-{fvg_upper:.{price_precision}f}")
-                
-                with ict_strategy_states_lock:
-                    if symbol not in ict_strategy_states: ict_strategy_states[symbol] = {}
-                    if 'active_fvgs' not in ict_strategy_states[symbol]: ict_strategy_states[symbol]['active_fvgs'] = []
-                    # Add FVG, maybe limit number of active FVGs or manage overlaps later
-                    ict_strategy_states[symbol]['active_fvgs'].append(fvg_event)
-                
-                # Log and Notify FVG
-                log_ict_event_to_csv({
-                    "Symbol": symbol, "EventType": "FVG_CREATED", "Direction": fvg_event['type'],
-                    "FVG_Upper": fvg_event['upper_band'], "FVG_Lower": fvg_event['lower_band'],
-                    "FVG_Created_TS": fvg_event['timestamp_created'],
-                    "Notes": f"FVG identified after sweep at {fvg_event['triggering_sweep_timestamp']}"
-                })
-                send_ict_telegram_alert(configs, "FVG_CREATED", symbol, fvg_event, symbol_info)
-                
-                return fvg_event # Return the first valid FVG found after the sweep
-            else:
-                # print(f"{log_prefix} {fvg_type} REJECTED at {candle3.name}: Width {fvg_width:.{price_precision}f} too small.") # Already printed by width check
-                fvg_type = None # Reset for next iteration
-
-    if not fvg_event:
-        print(f"{log_prefix} No valid FVG found after sweep at {sweep_timestamp}.")
-    
-    return None # No FVG found in the post-sweep leg that meets criteria
-
-def validate_order_block(symbol: str, primary_tf_df: pd.DataFrame, fvg_event: dict, configs: dict, symbol_info: dict) -> dict | None:
-    """
-    Identifies and validates an Order Block (OB) associated with a given Fair Value Gap (FVG).
-
-    Args:
-        symbol (str): The trading symbol.
-        primary_tf_df (pd.DataFrame): DataFrame of primary timeframe candles.
-        fvg_event (dict): Details of the FVG for which to find an OB.
-        configs (dict): Bot configuration with ICT parameters.
-        symbol_info (dict): Symbol information.
-
-    Returns:
-        dict | None: OB details if a valid one is found and aligns with the FVG, else None.
-                     Example: {"type": "bullish_ob", "high": float, "low": float, 
-                               "timestamp": pd.Timestamp, "fvg_timestamp": pd.Timestamp}
-    """
-    global ict_strategy_states, ict_strategy_states_lock
-    log_prefix = f"[{symbol} ICT_OB_Validation]"
-
-    fvg_type = fvg_event["type"] # "bullish_fvg" or "bearish_fvg"
-    fvg_created_timestamp = fvg_event["timestamp_created"]
-    lookback_period = configs.get("ict_orderblock_lookback", DEFAULT_ICT_ORDERBLOCK_LOOKBACK)
-    price_precision = int(symbol_info.get('pricePrecision', 2))
-    
-    # Determine the index of the candle that confirmed the FVG (candle3 in find_fair_value_gap)
-    try:
-        fvg_confirm_candle_idx = primary_tf_df.index.get_loc(fvg_created_timestamp)
-    except KeyError:
-        print(f"{log_prefix} FVG confirmation candle timestamp {fvg_created_timestamp} not found. Cannot validate OB.")
-        return None
-
-    # Order blocks are typically the candle *before* the impulsive move that created the FVG.
-    # The FVG pattern (C1, C2, C3) means C2 is the impulse. So, C1 might be the OB.
-    # Or, it could be further back within the lookback_period relative to C1.
-    # Search window for OB: `lookback_period` candles ending at or before the FVG's C1.
-    # FVG is formed by C1, C2, C3. C1 is at index `fvg_confirm_candle_idx - 2`.
-    
-    # Start search from the candle immediately preceding the 3-candle FVG pattern.
-    # If FVG is C1,C2,C3, C1 is at fvg_confirm_candle_idx - 2.
-    # We look for OB candidate in candles *before* C1 of the FVG.
-    # The search window ends at index: fvg_confirm_candle_idx - 3 (candle before C1 of FVG)
-    # The search window starts at index: max(0, fvg_confirm_candle_idx - 3 - lookback_period + 1)
-    
-    # Corrected logic: FVG is C1, C2, C3. C1 is index k, C2 is k+1, C3 is k+2.
-    # fvg_created_timestamp is C3.name. So C3 index is fvg_confirm_candle_idx.
-    # C1 index is fvg_confirm_candle_idx - 2.
-    # We need to look for OBs in `lookback_period` candles *before* C1.
-    # So, the end of our OB search window is `fvg_confirm_candle_idx - 3`.
-    
-    ob_search_end_idx = fvg_confirm_candle_idx - 2 # This is index of C1 of FVG
-    if ob_search_end_idx < 0:
-        print(f"{log_prefix} Not enough candles before FVG to search for OB.")
-        return None
-        
-    ob_search_start_idx = max(0, ob_search_end_idx - lookback_period)
-    
-    candidate_ob_candle = None
-    ob_type_expected = None # "bullish_ob" or "bearish_ob"
-
-    # If FVG is bearish (meaning a void to the downside, price went up fast), we look for a BULLISH OB (last down candle before up move).
-    # If FVG is bullish (meaning a void to the upside, price went down fast), we look for a BEARISH OB (last up candle before down move).
-    
-    # For a "bearish_fvg" (long setup): look for a bullish OB (last down candle before the up-move that created the FVG).
-    # The up-move is C2 of the FVG. So, C1 of the FVG would be the OB if it's a down candle.
-    if fvg_type == "bearish_fvg": # FVG is below current price, expecting price to rally from it (long setup)
-        ob_type_expected = "bullish_ob" 
-        # Find the last down-candle (close < open) in the lookback window preceding or including C1 of FVG.
-        # The "impulse" is the move from C1 through C2 into C3. C1 is `primary_tf_df.iloc[ob_search_end_idx]`
-        for i in range(ob_search_end_idx, ob_search_start_idx -1, -1): # Iterate backwards from C1
-            if i < 0: break # Should be caught by max(0,...) but good practice
-            candle = primary_tf_df.iloc[i]
-            if candle['close'] < candle['open']: # It's a down candle
-                # This is a potential bullish OB. Take the last one found.
-                candidate_ob_candle = candle
-                print(f"{log_prefix} Potential Bullish OB (last down-candle) found at {candidate_ob_candle.name} for Bearish FVG.")
-                break 
-    
-    # For a "bullish_fvg" (short setup): look for a bearish OB (last up candle before the down-move that created the FVG).
-    # The down-move is C2 of the FVG. So, C1 of the FVG would be the OB if it's an up candle.
-    elif fvg_type == "bullish_fvg": # FVG is above current price, expecting price to drop from it (short setup)
-        ob_type_expected = "bearish_ob"
-        for i in range(ob_search_end_idx, ob_search_start_idx -1, -1): # Iterate backwards from C1
-            if i < 0: break
-            candle = primary_tf_df.iloc[i]
-            if candle['close'] > candle['open']: # It's an up candle
-                candidate_ob_candle = candle
-                print(f"{log_prefix} Potential Bearish OB (last up-candle) found at {candidate_ob_candle.name} for Bullish FVG.")
-                break
-
-    if candidate_ob_candle is None:
-        print(f"{log_prefix} No suitable OB candle found for {fvg_type} in lookback window ending {primary_tf_df.index[ob_search_end_idx]}.")
-        return None
-
-    ob_high = candidate_ob_candle['high']
-    ob_low = candidate_ob_candle['low']
-    
-    # Validate Confluence: OB must have some overlap with the FVG or be very close.
-    # A simple check: FVG's range must overlap with OB's range.
-    # FVG range: fvg_event['lower_band'] to fvg_event['upper_band']
-    # OB range: ob_low to ob_high
-    
-    fvg_lower_band = fvg_event['lower_band']
-    fvg_upper_band = fvg_event['upper_band']
-
-    # Check for overlap: (max of starts < min of ends)
-    overlap_exists = max(ob_low, fvg_lower_band) < min(ob_high, fvg_upper_band)
-    
-    # More specific check: For a bullish OB (long setup), FVG should be above or overlapping the OB.
-    # For a bearish OB (short setup), FVG should be below or overlapping the OB.
-    # And the FVG should typically be "created" by price moving away from the OB.
-    
-    # Let's use a simple overlap for now as per plan "Check overlap between OB and FVG (≥ X% overlap)"
-    # For simplicity, just check any overlap first. Percentage overlap can be added.
-    if not overlap_exists:
-        print(f"{log_prefix} OB at {candidate_ob_candle.name} ({ob_low:.{price_precision}f}-{ob_high:.{price_precision}f}) does not overlap with FVG ({fvg_lower_band:.{price_precision}f}-{fvg_upper_band:.{price_precision}f}). OB Rejected.")
-        return None
-
-    print(f"{log_prefix} CONFIRMED {ob_type_expected} at {candidate_ob_candle.name} (Range: {ob_low:.{price_precision}f}-{ob_high:.{price_precision}f}) overlaps with FVG.")
-
-    ob_event = {
-        "type": ob_type_expected, "high": ob_high, "low": ob_low,
-        "timestamp": candidate_ob_candle.name, 
-        "fvg_timestamp": fvg_created_timestamp # Link to the FVG it validates
-    }
-
-    # If OB validates an FVG, this forms an "ICT Trade Zone"
-    # The zone itself is often the FVG, with the OB as confirmation or a more refined entry area.
-    # For now, let's store the OB and link it. The concept of "ICT Trade Zone" will combine these.
-    with ict_strategy_states_lock:
-        if symbol not in ict_strategy_states: ict_strategy_states[symbol] = {} # Should exist if FVG was processed
-        if 'active_order_blocks' not in ict_strategy_states[symbol]: ict_strategy_states[symbol]['active_order_blocks'] = []
-        
-        # Add OB, maybe limit number or manage overlaps later
-        ict_strategy_states[symbol]['active_order_blocks'].append(ob_event)
-        
-        # Create the "ICT Trade Zone"
-        if 'active_ict_trade_zones' not in ict_strategy_states[symbol]: ict_strategy_states[symbol]['active_ict_trade_zones'] = []
-        
-        trade_zone_type = "long_zone" if ob_type_expected == "bullish_ob" else "short_zone"
-        
-        # Define zone boundaries - often the FVG itself, or a combination
-        # For now, let's assume the FVG is the primary zone of interest if confirmed by OB
-        trade_zone = {
-            "type": trade_zone_type,
-            "zone_upper": fvg_upper_band, "zone_lower": fvg_lower_band, # FVG as the zone
-            "ob_high": ob_high, "ob_low": ob_low, # Associated OB
-            "fvg_upper_orig": fvg_upper_band, "fvg_lower_orig": fvg_lower_band, # Original FVG for reference
-            "timestamp_created": candidate_ob_candle.name # Zone confirmed by OB
-        }
-        ict_strategy_states[symbol]['active_ict_trade_zones'].append(trade_zone)
-        print(f"{log_prefix} ICT Trade Zone ({trade_zone_type}) created based on FVG and OB.")
-
-        # Log and Notify Zone Validation
-        log_ict_event_to_csv({
-            "Symbol": symbol, "EventType": "ZONE_VALIDATED", "Direction": trade_zone_type,
-            "FVG_Upper": fvg_event['upper_band'], "FVG_Lower": fvg_event['lower_band'],
-            "OB_High": ob_event['high'], "OB_Low": ob_event['low'],
-            "Zone_Upper": trade_zone['zone_upper'], "Zone_Lower": trade_zone['zone_lower'],
-            "Notes": f"Zone validated by OB at {ob_event['timestamp']}"
-        })
-        send_ict_telegram_alert(configs, "ZONE_VALIDATED", symbol, trade_zone, symbol_info) # Pass symbol_info
-
-    return ob_event # Return the OB event itself
-
-# --- ICT Session Time Handling ---
-# Define session times in UTC. User specified: London 08:00-16:00 UTC; NewYork 13:30-20:00 UTC
-# For robustness, allow these to be configurable if needed later, but start with constants.
-ICT_SESSION_TIMES_UTC = {
-    "london": ("08:00", "16:00"),
-    "newyork": ("13:30", "20:00"), # As per user prompt
-    "tokyo": ("00:00", "08:00"),   # Example, common definition
-    "sydney": ("22:00", "06:00")   # Example, spans across midnight UTC
-}
-
-def is_time_in_ict_session(current_time_utc: dt, ict_session_filter: list[str] | None) -> bool:
-    """
-    Checks if the current UTC time falls within any of the specified ICT trading sessions.
-
-    Args:
-        current_time_utc (datetime.datetime): The current time in UTC.
-        ict_session_filter (list[str] | None): List of lowercase session names (e.g., ["london", "newyork"]).
-                                               If None or empty, all times are considered "in session".
-
-    Returns:
-        bool: True if the current time is within an active filtered session, False otherwise.
-    """
-    if not ict_session_filter: # If filter is None or empty, consider it always in session (or no filter applied)
-        return True
-
-    current_time_obj = current_time_utc.time()
-
-    for session_name_lower in ict_session_filter:
-        session_name_lower = session_name_lower.lower() # Ensure lowercase for lookup
-        if session_name_lower in ICT_SESSION_TIMES_UTC:
-            open_str, close_str = ICT_SESSION_TIMES_UTC[session_name_lower]
-            
-            try:
-                session_open_time = dt.strptime(open_str, "%H:%M").time()
-                session_close_time = dt.strptime(close_str, "%H:%M").time()
-            except ValueError:
-                print(f"Error: Invalid time format for session '{session_name_lower}' in ICT_SESSION_TIMES_UTC.")
-                continue # Skip this session if times are invalid
-
-            # Handle sessions that span across midnight (e.g., Sydney)
-            if session_open_time > session_close_time: # Spans midnight
-                if current_time_obj >= session_open_time or current_time_obj < session_close_time:
-                    # print(f"DEBUG: Time {current_time_obj} IS IN {session_name_lower} session (spans midnight).")
-                    return True
-            else: # Normal same-day session
-                if session_open_time <= current_time_obj < session_close_time:
-                    # print(f"DEBUG: Time {current_time_obj} IS IN {session_name_lower} session.")
-                    return True
-        else:
-            print(f"Warning: Session name '{session_name_lower}' from filter not defined in ICT_SESSION_TIMES_UTC.")
-            
-    # print(f"DEBUG: Time {current_time_obj} IS NOT in any of the filtered sessions: {ict_session_filter}")
-    return False
-
 # --- Market Structure Detector (Fib Strategy) ---
 # Global state for Fibonacci strategy (per symbol)
 # Stores: 'trend' (None, 'uptrend', 'downtrend'),
@@ -1939,16 +876,6 @@ def is_time_in_ict_session(current_time_utc: dt, ict_session_filter: list[str] |
 #         'flip_bias_direction' (None, 'long', 'short') - for prioritizing next BoS after SL.
 fib_strategy_states = {}
 fib_strategy_states_lock = threading.Lock()
-
-# Global state for ICT strategy (per symbol)
-# Stores: 'last_sweep': {type, timestamp, price_swept, sweep_wick}
-#         'active_fvgs': [{type, upper_band, lower_band, timestamp_created, triggering_sweep_details}]
-#         'active_order_blocks': [{type, high, low, fvg_associated_details}]
-#         'active_ict_trade_zones': [{type, zone_upper, zone_lower, ob_high, ob_low, fvg_upper, fvg_lower, timestamp}]
-#         'pending_ict_entries': []
-ict_strategy_states = {}
-ict_strategy_states_lock = threading.Lock()
-
 
 # Constants for pivot detection
 PIVOT_N_LEFT = 5  # Number of candles to the left for pivot detection (general use)
@@ -2989,172 +1916,6 @@ def monitor_pending_fib_entries(client, configs: dict):
                 else: # Should not happen if pending_entries_copy was derived correctly
                     print(f"{log_prefix_monitor} Warning: Tried to reset state for {sym_to_reset}, but it was not in fib_strategy_states.")
 
-def monitor_pending_ict_entries(client, configs: dict):
-    """
-    Monitors pending ICT limit entry orders.
-    If filled, places SL/TP. If timed out or invalid, cancels the order and resets state.
-    """
-    global ict_strategy_states, ict_strategy_states_lock, active_trades, active_trades_lock
-    
-    log_prefix_ict_monitor = "[ICT_PendingMonitor]"
-    entries_to_remove_from_state = [] # List of (symbol, order_id_to_remove) tuples
-
-    pending_entries_snapshot = {}
-    with ict_strategy_states_lock:
-        for symbol, state_data in list(ict_strategy_states.items()):
-            if state_data.get('pending_ict_entries'):
-                pending_entries_snapshot[symbol] = list(state_data['pending_ict_entries'])
-
-    if not pending_entries_snapshot:
-        return
-
-    print(f"\n{log_prefix_ict_monitor} Checking {sum(len(v) for v in pending_entries_snapshot.values())} pending ICT entry order(s)...")
-
-    for symbol, pending_list_for_symbol in pending_entries_snapshot.items():
-        for pending_entry_details in pending_list_for_symbol:
-            order_id = pending_entry_details.get('order_id')
-            limit_price = pending_entry_details.get('limit_price')
-            order_placed_ts = pending_entry_details.get('order_placed_timestamp')
-            s_info = pending_entry_details.get('symbol_info') # Crucial: ensure this is stored
-
-            if not all([order_id, limit_price, order_placed_ts, s_info]):
-                print(f"{log_prefix_ict_monitor} Incomplete pending ICT entry data for {symbol} (Order ID: {order_id}). Removing.")
-                entries_to_remove_from_state.append((symbol, order_id))
-                continue
-            
-            try:
-                order_status = client.futures_get_order(symbol=symbol, orderId=order_id)
-                
-                if order_status['status'] == 'FILLED':
-                    print(f"{log_prefix_ict_monitor} ✅ ICT Limit entry order {order_id} for {symbol} FILLED!")
-                    actual_entry_price = float(order_status['avgPrice'])
-                    total_filled_qty = float(order_status['executedQty'])
-                    
-                    sl_price_orig = pending_entry_details['sl_price']
-                    tp_levels_details_orig = pending_entry_details['tp_levels_details']
-                    trade_side = pending_entry_details['side']
-                    
-                    sl_price_final = sl_price_orig
-                    tp_levels_details_final = tp_levels_details_orig
-
-                    if abs(actual_entry_price - limit_price) > (0.001 * limit_price): # If >0.1% deviation
-                        print(f"{log_prefix_ict_monitor} Fill price {actual_entry_price} differs from limit {limit_price}. Re-evaluating SL/TP.")
-                        zone_snap = pending_entry_details.get('zone_snapshot')
-                        atr_at_place = pending_entry_details.get('atr_1m_at_placement') # This was 1m ATR for SL buffer
-                        if zone_snap:
-                            sl_price_final, tp_levels_details_final = calculate_ict_sl_tp(
-                                actual_entry_price, trade_side, zone_snap, atr_at_place, configs, s_info
-                            )
-                            if sl_price_final is None or not tp_levels_details_final:
-                                print(f"{log_prefix_ict_monitor} CRITICAL: Failed to re-calculate SL/TP for {symbol}. Using original. Order ID: {order_id}")
-                                sl_price_final, tp_levels_details_final = sl_price_orig, tp_levels_details_orig
-                        else:
-                             print(f"{log_prefix_ict_monitor} Zone snapshot missing. Using original SL/TP for {symbol} Order ID: {order_id}")
-                             sl_price_final, tp_levels_details_final = sl_price_orig, tp_levels_details_orig
-                    
-                    sl_ord_obj, sl_err_msg = place_new_order(client, s_info,
-                                        "SELL" if trade_side == "LONG" else "BUY", "STOP_MARKET", total_filled_qty, 
-                                        stop_price=sl_price_final, position_side=trade_side, is_closing_order=True)
-                    if not sl_ord_obj: print(f"{log_prefix_ict_monitor} CRITICAL: FAILED TO PLACE SL for ICT trade {symbol}! Error: {sl_err_msg}")
-
-                    tp_orders_placed_details_ict = []
-                    qty_remaining_for_tps_ict = total_filled_qty
-                    q_prec_ict = int(s_info['quantityPrecision'])
-
-                    for i, tp_info_level in enumerate(tp_levels_details_final):
-                        current_tp_price_level = tp_info_level["price"]
-                        qty_pct_for_level = tp_info_level["quantity_pct"]
-                        
-                        current_tp_qty_level = 0
-                        if i == len(tp_levels_details_final) - 1: 
-                            current_tp_qty_level = round(qty_remaining_for_tps_ict, q_prec_ict)
-                        else:
-                            current_tp_qty_level = round(total_filled_qty * qty_pct_for_level, q_prec_ict)
-                        
-                        if current_tp_qty_level <= 0: continue
-                        
-                        tp_ord_obj_level, tp_err_msg_level = place_new_order(client, s_info,
-                                             "SELL" if trade_side == "LONG" else "BUY", "TAKE_PROFIT_MARKET", current_tp_qty_level,
-                                             stop_price=current_tp_price_level, position_side=trade_side, is_closing_order=True)
-                        if tp_ord_obj_level:
-                            tp_orders_placed_details_ict.append({"id": tp_ord_obj_level.get('orderId'), "price": current_tp_price_level, "quantity": current_tp_qty_level, "status": "OPEN", "name": tp_info_level["name"]})
-                        else:
-                            print(f"{log_prefix_ict_monitor} WARNING: Failed to place {tp_info_level['name']} for {symbol}. Error: {tp_err_msg_level}")
-                            tp_orders_placed_details_ict.append({"id": None, "price": current_tp_price_level, "quantity": current_tp_qty_level, "status": "FAILED", "name": tp_info_level["name"]})
-                        
-                        qty_remaining_for_tps_ict = round(qty_remaining_for_tps_ict - current_tp_qty_level, q_prec_ict)
-                        if qty_remaining_for_tps_ict < 0 : qty_remaining_for_tps_ict = 0
-                    
-                    with active_trades_lock:
-                        if symbol not in active_trades:
-                            active_trades[symbol] = {
-                                "entry_order_id": order_id, "sl_order_id": sl_ord_obj.get('orderId') if sl_ord_obj else None,
-                                "tp_orders": tp_orders_placed_details_ict, "entry_price": actual_entry_price,
-                                "current_sl_price": sl_price_final, "initial_sl_price": sl_price_final,
-                                "initial_risk_per_unit": abs(actual_entry_price - sl_price_final),
-                                "quantity": total_filled_qty, "side": trade_side, "symbol_info": s_info,
-                                "open_timestamp": pd.Timestamp(order_status['updateTime'], unit='ms', tz='UTC'),
-                                "strategy_type": "ICT_MULTI_TP", "sl_management_stage": "initial",
-                                "ict_trade_zone_snapshot": pending_entry_details.get('zone_snapshot')
-                            }
-                            print(f"{log_prefix_ict_monitor} ICT trade for {symbol} moved to active_trades.")
-                            # Logging and alerting for fill completion
-                            log_ict_event_to_csv({
-                                "Symbol": symbol, "EventType": "LIMIT_ENTRY_FILLED", "Direction": trade_side,
-                                "EntryPrice": actual_entry_price, "SL_Price": sl_price_final, "OrderID": order_id,
-                                # Include TP details in notes or separate fields if desired
-                                "Notes": f"ICT Limit Order Filled. SL/TPs placed."
-                            })
-                            # Use the main "ENTRY" alert type, it will show all TPs
-                            alert_details_fill = {"side": trade_side, "entry_price": actual_entry_price, 
-                                                "sl_price": sl_price_final, "order_id": order_id}
-                            for idx, tp_det in enumerate(tp_orders_placed_details_ict):
-                                alert_details_fill[f"tp{idx+1}_price"] = tp_det.get("price")
-                                alert_details_fill[f"tp{idx+1}_qty_pct"] = pending_entry_details['tp_levels_details'][idx].get('quantity_pct',0) if idx < len(pending_entry_details['tp_levels_details']) else 0
-                            send_ict_telegram_alert(configs, "ENTRY", symbol, alert_details_fill, s_info)
-
-                        else:
-                             print(f"{log_prefix_ict_monitor} {symbol} already in active_trades. Limit fill for ICT {order_id} might be duplicate.")
-                    
-                    entries_to_remove_from_state.append((symbol, order_id))
-                
-                elif order_status['status'] in ['CANCELED', 'EXPIRED', 'REJECTED', 'PENDING_CANCEL']:
-                    print(f"{log_prefix_ict_monitor} ICT Limit order {order_id} for {symbol} is {order_status['status']}. Removing.")
-                    entries_to_remove_from_state.append((symbol, order_id))
-                    log_ict_event_to_csv({"Symbol": symbol, "EventType": f"LIMIT_ORDER_{order_status['status']}", "OrderID": order_id, "Notes": "Order did not fill."})
-
-                elif order_status['status'] == 'NEW' or order_status['status'] == 'PARTIALLY_FILLED':
-                    timeout_minutes = configs.get("ict_order_timeout_minutes", DEFAULT_ICT_ORDER_TIMEOUT_MINUTES)
-                    if (pd.Timestamp.now(tz='UTC') - order_placed_ts).total_seconds() > timeout_minutes * 60:
-                        print(f"{log_prefix_ict_monitor} ICT Limit order {order_id} for {symbol} timed out ({timeout_minutes}m). Cancelling.")
-                        try:
-                            client.futures_cancel_order(symbol=symbol, orderId=order_id)
-                            log_ict_event_to_csv({"Symbol": symbol, "EventType": "LIMIT_ORDER_TIMEOUT_CANCELLED", "OrderID": order_id})
-                            # TODO: Send Telegram notification for timeout cancellation
-                        except Exception as e_cancel:
-                            print(f"{log_prefix_ict_monitor} Failed to cancel timed-out ICT order {order_id}: {e_cancel}")
-                        entries_to_remove_from_state.append((symbol, order_id))
-            
-            except BinanceAPIException as e:
-                if e.code == -2013: 
-                    print(f"{log_prefix_ict_monitor} ICT Limit order {order_id} for {symbol} NOT FOUND. Removing.")
-                    entries_to_remove_from_state.append((symbol, order_id))
-                else: print(f"{log_prefix_ict_monitor} API Error checking ICT order {order_id}: {e}")
-            except Exception as e:
-                print(f"{log_prefix_ict_monitor} Unexpected error checking ICT order {order_id}: {e}")
-                traceback.print_exc(); entries_to_remove_from_state.append((symbol, order_id))
-
-    if entries_to_remove_from_state:
-        with ict_strategy_states_lock:
-            for sym_clear, oid_clear in entries_to_remove_from_state:
-                if sym_clear in ict_strategy_states and 'pending_ict_entries' in ict_strategy_states[sym_clear]:
-                    # Filter out the specific pending entry by order_id
-                    ict_strategy_states[sym_clear]['pending_ict_entries'] = [
-                        p_entry for p_entry in ict_strategy_states[sym_clear]['pending_ict_entries']
-                        if p_entry.get('order_id') != oid_clear
-                    ]
-                    print(f"{log_prefix_ict_monitor} Removed pending ICT order {oid_clear} for {sym_clear} from state.")
-
 
 def start_telegram_polling(bot_token: str, app_configs: dict):
     # Create and set a new event loop for this thread
@@ -3297,27 +2058,6 @@ def get_user_configurations(load_choice_override: str = None, make_changes_overr
                                     configs["fib_atr_period"] = DEFAULT_FIB_ATR_PERIOD
                                 if "fib_sl_atr_multiplier" not in configs:
                                     configs["fib_sl_atr_multiplier"] = DEFAULT_FIB_SL_ATR_MULTIPLIER
-                            elif strategy_choice == "ict":
-                                configs["strategy_id"] = 10 # New ID for ICT strategy
-                                configs["strategy_name"] = "ICT Liquidity Strategy"
-                                # Ensure ICT specific params have defaults if not in CSV
-                                if "ict_timeframe_primary" not in configs: configs["ict_timeframe_primary"] = DEFAULT_ICT_TIMEFRAME_PRIMARY
-                                if "ict_timeframe_entry" not in configs: configs["ict_timeframe_entry"] = DEFAULT_ICT_TIMEFRAME_ENTRY
-                                if "ict_min_liquidity_sweep_size_pips" not in configs: configs["ict_min_liquidity_sweep_size_pips"] = DEFAULT_ICT_MIN_LIQUIDITY_SWEEP_SIZE_PIPS
-                                if "ict_min_liquidity_sweep_size_atr" not in configs: configs["ict_min_liquidity_sweep_size_atr"] = DEFAULT_ICT_MIN_LIQUIDITY_SWEEP_SIZE_ATR
-                                if "ict_fvg_min_width_pips" not in configs: configs["ict_fvg_min_width_pips"] = DEFAULT_ICT_FVG_MIN_WIDTH_PIPS
-                                if "ict_fvg_min_width_percent_range" not in configs: configs["ict_fvg_min_width_percent_range"] = DEFAULT_ICT_FVG_MIN_WIDTH_PERCENT_RANGE
-                                if "ict_orderblock_lookback" not in configs: configs["ict_orderblock_lookback"] = DEFAULT_ICT_ORDERBLOCK_LOOKBACK
-                                if "ict_session_filter" not in configs: configs["ict_session_filter"] = DEFAULT_ICT_SESSION_FILTER
-                                if "ict_primary_tf_buffer_size" not in configs: configs["ict_primary_tf_buffer_size"] = DEFAULT_PRIMARY_TF_BUFFER_SIZE
-                                if "ict_entry_order_type" not in configs: configs["ict_entry_order_type"] = DEFAULT_ICT_ENTRY_ORDER_TYPE
-                                if "ict_sl_buffer_atr_mult" not in configs: configs["ict_sl_buffer_atr_mult"] = DEFAULT_ICT_SL_BUFFER_ATR_MULT
-                                if "ict_tp1_qty_pct" not in configs: configs["ict_tp1_qty_pct"] = DEFAULT_ICT_TP1_QTY_PCT
-                                if "ict_tp2_qty_pct" not in configs: configs["ict_tp2_qty_pct"] = DEFAULT_ICT_TP2_QTY_PCT
-                                if "ict_tp3_qty_pct" not in configs: configs["ict_tp3_qty_pct"] = DEFAULT_ICT_TP3_QTY_PCT
-                                if "ict_breakeven_buffer_r" not in configs: configs["ict_breakeven_buffer_r"] = DEFAULT_ICT_BREAKEVEN_BUFFER_R
-                                if "ict_signal_cooldown_seconds" not in configs: configs["ict_signal_cooldown_seconds"] = DEFAULT_ICT_SIGNAL_COOLDOWN_SECONDS
-                                if "ict_order_timeout_minutes" not in configs: configs["ict_order_timeout_minutes"] = DEFAULT_ICT_ORDER_TIMEOUT_MINUTES
                             else: # Should not happen if validation is correct
                                 print(f"Warning: Unknown strategy_choice '{strategy_choice}' from CSV. Defaulting to EMA Cross.")
                                 configs["strategy_choice"] = "ema_cross"
@@ -3390,27 +2130,23 @@ def get_user_configurations(load_choice_override: str = None, make_changes_overr
     # Strategy Choice
     while True:
         strategy_default_display = configs.get("strategy_choice", DEFAULT_STRATEGY)
-        strategy_input = input(f"Select strategy (1:EMA Cross / 2:Fib Retracement / 3:ICT Strategy) (current: {strategy_default_display}): ").strip()
+        strategy_input = input(f"Select strategy (1:EMA Cross / 2:Fib Retracement) (current: {strategy_default_display}): ").strip()
         
         chosen_strategy = None
         if not strategy_input and "strategy_choice" in configs: chosen_strategy = configs["strategy_choice"]
         elif strategy_input == "1": chosen_strategy = "ema_cross"
         elif strategy_input == "2": chosen_strategy = "fib_retracement"
-        elif strategy_input == "3": chosen_strategy = "ict"
 
-        if chosen_strategy in ["ema_cross", "fib_retracement", "ict"]:
+        if chosen_strategy in ["ema_cross", "fib_retracement"]:
             configs["strategy_choice"] = chosen_strategy
             if chosen_strategy == "ema_cross":
                 configs["strategy_id"] = 8
                 configs["strategy_name"] = "Advance EMA Cross"
-            elif chosen_strategy == "fib_retracement":
+            else: # fib_retracement
                 configs["strategy_id"] = 9
                 configs["strategy_name"] = "Fibonacci Retracement"
-            elif chosen_strategy == "ict":
-                configs["strategy_id"] = 10 # New ID for ICT strategy
-                configs["strategy_name"] = "ICT Liquidity Strategy"
             break
-        print("Invalid strategy choice. Please enter '1', '2', or '3'.")
+        print("Invalid strategy choice. Please enter '1' or '2'.")
 
     # Environment
     while True:
@@ -3846,162 +2582,6 @@ def get_user_configurations(load_choice_override: str = None, make_changes_overr
         # ATR-Smart TP for Fib
         configs.pop("use_atr_for_tp", None)
         configs.pop("tp_atr_multiplier", None)
-
-    # ICT Strategy Specific Configurations
-    if configs.get("strategy_choice") == "ict":
-        print("\n--- ICT Strategy Specific Configurations ---")
-        # Primary Timeframe
-        while True:
-            tf_primary_val = get_input_with_default(
-                "Enter ICT Primary Timeframe (e.g., 1h, 4h, 15m)",
-                "ict_timeframe_primary", DEFAULT_ICT_TIMEFRAME_PRIMARY, str
-            ).lower()
-            if tf_primary_val in expected_params["ict_timeframe_primary"]["valid_values"]: # Reuse validation list
-                configs["ict_timeframe_primary"] = tf_primary_val
-                break
-            print(f"Invalid timeframe. Allowed: {expected_params['ict_timeframe_primary']['valid_values']}")
-        # Entry Timeframe
-        while True:
-            tf_entry_val = get_input_with_default(
-                "Enter ICT Entry Timeframe (e.g., 1m, 5m)",
-                "ict_timeframe_entry", DEFAULT_ICT_TIMEFRAME_ENTRY, str
-            ).lower()
-            if tf_entry_val in expected_params["ict_timeframe_entry"]["valid_values"]:
-                configs["ict_timeframe_entry"] = tf_entry_val
-                break
-            print(f"Invalid timeframe. Allowed: {expected_params['ict_timeframe_entry']['valid_values']}")
-        # Min Liquidity Sweep Size (Pips)
-        while True:
-            try:
-                val = get_input_with_default("Enter Min Liquidity Sweep Size (Pips, 0 to disable pips-based)", "ict_min_liquidity_sweep_size_pips", DEFAULT_ICT_MIN_LIQUIDITY_SWEEP_SIZE_PIPS, float)
-                if val >= 0: configs["ict_min_liquidity_sweep_size_pips"] = val; break
-                print("Min Liquidity Sweep Size (Pips) must be >= 0.")
-            except ValueError: print("Invalid input. Please enter a number.")
-        # Min Liquidity Sweep Size (ATR Multiples)
-        while True:
-            try:
-                val = get_input_with_default("Enter Min Liquidity Sweep Size (ATR multiples, 0 to disable ATR-based)", "ict_min_liquidity_sweep_size_atr", DEFAULT_ICT_MIN_LIQUIDITY_SWEEP_SIZE_ATR, float)
-                if val >= 0: configs["ict_min_liquidity_sweep_size_atr"] = val; break
-                print("Min Liquidity Sweep Size (ATR multiples) must be >= 0.")
-            except ValueError: print("Invalid input. Please enter a number.")
-        # FVG Min Width (Pips)
-        while True:
-            try:
-                val = get_input_with_default("Enter FVG Min Width (Pips, 0 to disable pips-based)", "ict_fvg_min_width_pips", DEFAULT_ICT_FVG_MIN_WIDTH_PIPS, float)
-                if val >= 0: configs["ict_fvg_min_width_pips"] = val; break
-                print("FVG Min Width (Pips) must be >= 0.")
-            except ValueError: print("Invalid input. Please enter a number.")
-        # FVG Min Width (Percent Range)
-        while True:
-            try:
-                val = get_input_with_default("Enter FVG Min Width (% of range, 0-1, e.g. 0.1 for 10%)", "ict_fvg_min_width_percent_range", DEFAULT_ICT_FVG_MIN_WIDTH_PERCENT_RANGE, float)
-                if 0 <= val <= 1: configs["ict_fvg_min_width_percent_range"] = val; break
-                print("FVG Min Width (% of range) must be between 0 and 1.")
-            except ValueError: print("Invalid input. Please enter a number.")
-        # Order Block Lookback
-        while True:
-            try:
-                val = get_input_with_default("Enter Order Block Lookback (candles)", "ict_orderblock_lookback", DEFAULT_ICT_ORDERBLOCK_LOOKBACK, int)
-                if val > 0: configs["ict_orderblock_lookback"] = val; break
-                print("Order Block Lookback must be a positive integer.")
-            except ValueError: print("Invalid input. Please enter an integer.")
-        # Session Filter
-        while True:
-            sessions_str = get_input_with_default(
-                "Enter ICT Session Filter (comma-separated, e.g., London,NewYork)",
-                "ict_session_filter", ",".join(DEFAULT_ICT_SESSION_FILTER), str
-            )
-            sessions_list = [s.strip().lower() for s in sessions_str.split(',') if s.strip()]
-            valid_sessions = True
-            allowed_s = ["london", "newyork", "tokyo", "sydney"]
-            for s in sessions_list:
-                if s not in allowed_s:
-                    print(f"Invalid session '{s}'. Allowed: {allowed_s}")
-                    valid_sessions = False; break
-            if valid_sessions:
-                configs["ict_session_filter"] = [s.capitalize() for s in sessions_list] # Store capitalized
-                break
-        # ICT Primary TF Buffer Size
-        while True:
-            try:
-                val = get_input_with_default("Enter ICT Primary TF Candle Buffer Size (e.g., 50-500)", "ict_primary_tf_buffer_size", DEFAULT_PRIMARY_TF_BUFFER_SIZE, int)
-                if 50 <= val <= 500: configs["ict_primary_tf_buffer_size"] = val; break
-                print("ICT Primary TF Buffer Size must be between 50 and 500.")
-            except ValueError: print("Invalid input. Please enter an integer.")
-        # ICT Entry Order Type - Defaulting to LIMIT as per user feedback. Keep configurable for now.
-        while True:
-            val = get_input_with_default("Enter ICT Entry Order Type (recommended: LIMIT)", "ict_entry_order_type", DEFAULT_ICT_ENTRY_ORDER_TYPE, str).upper()
-            if val in ["MARKET", "LIMIT"]: 
-                configs["ict_entry_order_type"] = val
-                if val == "MARKET":
-                    print("Warning: MARKET entry for ICT is selected. LIMIT is generally recommended for ICT strategies.")
-                break
-            print("Invalid order type. Choose MARKET or LIMIT.")
-        # ICT SL Buffer ATR Multiplier
-        while True:
-            try:
-                val = get_input_with_default("Enter ICT SL Buffer ATR Multiplier (e.g., 0.2)", "ict_sl_buffer_atr_mult", DEFAULT_ICT_SL_BUFFER_ATR_MULT, float)
-                if val >= 0: configs["ict_sl_buffer_atr_mult"] = val; break
-                print("SL Buffer ATR Multiplier must be >= 0.")
-            except ValueError: print("Invalid input. Please enter a number.")
-        # ICT TP Quantity Percentages (TP1, TP2, TP3)
-        for i, qty_key, default_qty_pct in [
-            (1, "ict_tp1_qty_pct", DEFAULT_ICT_TP1_QTY_PCT),
-            (2, "ict_tp2_qty_pct", DEFAULT_ICT_TP2_QTY_PCT),
-            (3, "ict_tp3_qty_pct", DEFAULT_ICT_TP3_QTY_PCT)
-        ]:
-            while True:
-                try:
-                    val_pct_display = configs.get(qty_key, default_qty_pct) * 100.0
-                    user_input_pct = input(f"Enter ICT TP{i} Quantity % (e.g., 33 for 33%) (default: {val_pct_display:.0f}%): ")
-                    final_val_decimal = 0
-                    if not user_input_pct: final_val_decimal = configs.get(qty_key, default_qty_pct)
-                    else:
-                        val_input_float = float(user_input_pct)
-                        if 0 < val_input_float <= 100: final_val_decimal = val_input_float / 100.0
-                        else: print(f"TP{i} Quantity % must be > 0 and <= 100."); continue
-                    configs[qty_key] = final_val_decimal; break
-                except ValueError: print("Invalid input. Please enter a number for percentage.")
-        # ICT Breakeven Buffer R
-        while True:
-            try:
-                val = get_input_with_default("Enter ICT Breakeven Buffer (in R, e.g., 0.1 for 0.1R)", "ict_breakeven_buffer_r", DEFAULT_ICT_BREAKEVEN_BUFFER_R, float)
-                if 0 <= val < 1: configs["ict_breakeven_buffer_r"] = val; break
-                print("Breakeven Buffer (R) must be between 0 and 1.")
-            except ValueError: print("Invalid input. Please enter a number.")
-        # ICT Signal Cooldown Seconds
-        while True:
-            try:
-                val = get_input_with_default("Enter ICT Signal Cooldown (seconds, e.g. 3600 for 1hr)", "ict_signal_cooldown_seconds", DEFAULT_ICT_SIGNAL_COOLDOWN_SECONDS, int)
-                if val >= 0: configs["ict_signal_cooldown_seconds"] = val; break
-                print("Signal Cooldown must be >= 0 seconds.")
-            except ValueError: print("Invalid input. Please enter an integer.")
-
-    else: # Not ICT strategy, remove its specific params if they were in loaded CSV
-        configs.pop("ict_timeframe_primary", None)
-        configs.pop("ict_timeframe_entry", None)
-        configs.pop("ict_min_liquidity_sweep_size_pips", None)
-        configs.pop("ict_min_liquidity_sweep_size_atr", None)
-        configs.pop("ict_fvg_min_width_pips", None)
-        configs.pop("ict_fvg_min_width_percent_range", None)
-        configs.pop("ict_orderblock_lookback", None)
-        configs.pop("ict_session_filter", None)
-        configs.pop("ict_primary_tf_buffer_size", None)
-        configs.pop("ict_entry_order_type", None)
-        configs.pop("ict_sl_buffer_atr_mult", None)
-        configs.pop("ict_tp1_qty_pct", None)
-        configs.pop("ict_tp2_qty_pct", None)
-        configs.pop("ict_tp3_qty_pct", None)
-        configs.pop("ict_breakeven_buffer_r", None)
-        configs.pop("ict_signal_cooldown_seconds", None)
-        configs.pop("ict_entry_order_type", None)
-        configs.pop("ict_sl_buffer_atr_mult", None)
-        configs.pop("ict_tp1_qty_pct", None)
-        # configs.pop("ict_tp2_qty_pct", None) # Already popped above
-        # configs.pop("ict_tp3_qty_pct", None) # Already popped above
-        # configs.pop("ict_breakeven_buffer_r", None) # Already popped above
-        # configs.pop("ict_signal_cooldown_seconds", None) # Already popped above
-        configs.pop("ict_order_timeout_minutes", None)
 
 
     # Fibonacci Strategy Specific: TP Scaling and SL Management (only if Fib strategy is chosen)
@@ -5160,31 +3740,6 @@ def load_symbol_blacklist(filepath: str) -> list[str]:
         print(f"Error loading symbol blacklist from '{filepath}': {e}")
         return []
 
-def load_ict_symbols_from_csv(filepath: str) -> list[str]:
-    """Loads symbols specifically for the ICT strategy from a CSV file."""
-    if not os.path.exists(filepath):
-        print(f"Info: ICT symbols file '{filepath}' not found. No symbols will be loaded for ICT strategy.")
-        return []
-    try:
-        df = pd.read_csv(filepath)
-        if 'symbol' not in df.columns:
-            print(f"Error: ICT symbols CSV file '{filepath}' must contain a 'symbol' column.")
-            return []
-        
-        ict_symbols = sorted(list(set(df['symbol'].dropna().astype(str).str.upper().tolist())))
-        
-        if not ict_symbols:
-            print(f"Info: ICT symbols file '{filepath}' is empty or contains no valid symbols.")
-            return []
-        print(f"Loaded {len(ict_symbols)} unique symbol(s) for ICT strategy from '{filepath}'.")
-        return ict_symbols
-    except pd.errors.EmptyDataError:
-        print(f"Info: ICT symbols file '{filepath}' is empty. No symbols loaded for ICT strategy.")
-        return []
-    except Exception as e:
-        print(f"Error loading ICT symbols from '{filepath}': {e}")
-        return []
-
 def add_symbol_to_blacklist(filepath: str, symbol_to_add: str) -> bool:
     """
     Adds a symbol to the blacklist CSV file.
@@ -5360,131 +3915,6 @@ def process_symbol_fib_task(symbol, client, configs, lock): # lock here is activ
         print(f"{log_prefix_task} ERROR processing: {error_detail} {format_elapsed_time(cycle_start_ref)}")
         traceback.print_exc()
         return f"{symbol}: Fib Error - {error_detail}"
-
-def process_symbol_ict_task(symbol, client, configs, lock): # lock here is active_trades_lock
-    thread_name = threading.current_thread().name
-    cycle_start_ref = configs.get('cycle_start_time_ref', time.time())
-    log_prefix_task = f"[{thread_name}] {symbol} ICT_Task:"
-    print(f"{log_prefix_task} Processing {format_elapsed_time(cycle_start_ref)}")
-
-    try:
-        s_info = get_symbol_info(client, symbol)
-        if not s_info:
-            print(f"{log_prefix_task} Failed to get symbol_info. Skipping.")
-            return f"{symbol}: ICT Error - No symbol_info"
-
-        # 1. Fetch and Update Primary Timeframe Data
-        primary_tf_str = configs.get("ict_timeframe_primary", DEFAULT_ICT_TIMEFRAME_PRIMARY)
-        primary_buffer_size = configs.get("ict_primary_tf_buffer_size", DEFAULT_PRIMARY_TF_BUFFER_SIZE)
-        # Fetch enough for buffer + lookbacks for pivots etc.
-        primary_klines_df, primary_klines_error = get_historical_klines_primary_tf(client, symbol, primary_tf_str, limit=primary_buffer_size + PIVOT_N_LEFT + PIVOT_N_RIGHT + 5)
-
-        if primary_klines_error:
-            msg = f"Skipped: Error fetching Primary TF '{primary_tf_str}' klines ({str(primary_klines_error)})."
-            print(f"{log_prefix_task} {msg} {format_elapsed_time(cycle_start_ref)}")
-            return f"{symbol}: {msg}"
-        if primary_klines_df.empty or len(primary_klines_df) < PIVOT_N_LEFT + PIVOT_N_RIGHT + 2:
-            msg = f"Skipped: Insufficient Primary TF klines for ICT strategy ({len(primary_klines_df)})."
-            print(f"{log_prefix_task} {msg} {format_elapsed_time(cycle_start_ref)}")
-            return f"{symbol}: {msg}"
-        
-        # Update primary TF buffer (populate if new, else update last)
-        with symbol_primary_tf_candle_buffers_lock:
-            is_new_primary_buffer = symbol not in symbol_primary_tf_candle_buffers
-        if is_new_primary_buffer:
-            for idx_p in range(len(primary_klines_df)):
-                update_primary_tf_candle_buffer(symbol, primary_klines_df.iloc[idx_p], primary_buffer_size)
-        else:
-            update_primary_tf_candle_buffer(symbol, primary_klines_df.iloc[-1], primary_buffer_size)
-        
-        # Retrieve current primary TF buffer for zone detection
-        current_primary_buffer_df = None
-        with symbol_primary_tf_candle_buffers_lock:
-            if symbol in symbol_primary_tf_candle_buffers and len(symbol_primary_tf_candle_buffers[symbol]) > 0:
-                records = [s.to_dict() for s in symbol_primary_tf_candle_buffers[symbol] if isinstance(s, pd.Series)]
-                if records:
-                    temp_df = pd.DataFrame(records)
-                    if 'timestamp' not in temp_df.columns and symbol_primary_tf_candle_buffers[symbol][0].name is not None:
-                         temp_df.index = [s.name for s in symbol_primary_tf_candle_buffers[symbol]]
-                    elif 'timestamp' in temp_df.columns: temp_df.set_index('timestamp', inplace=True)
-                    if all(c in temp_df for c in ['open','high','low','close']): current_primary_buffer_df = temp_df
-        
-        if current_primary_buffer_df is None or current_primary_buffer_df.empty:
-            msg = f"Skipped: Primary TF buffer for {symbol} empty/invalid after update."
-            print(f"{log_prefix_task} {msg} {format_elapsed_time(cycle_start_ref)}"); return f"{symbol}: {msg}"
-
-        # 2. Fetch and Update Entry Timeframe Data (e.g., 15m as per user, or configured via ict_timeframe_entry)
-        entry_tf_str = configs.get("ict_timeframe_entry", DEFAULT_ICT_TIMEFRAME_ENTRY)
-        # Determine buffer and update function based on entry_tf_str
-        # For simplicity, if entry_tf_str is "1m", use existing 1m buffer logic.
-        # If it's another common TF like "15m", we might need a dedicated buffer or adapt primary_tf logic if interval matches.
-        # For now, let's assume if entry_tf is not 1m, we fetch it directly without a separate persistent buffer in this task,
-        # or rely on the primary_tf_buffer if intervals match.
-        # This part needs careful thought if entry_tf can be arbitrary and different from primary_tf.
-        # Per user: "use 15min for market analize and place order"
-        
-        current_entry_tf_candle_for_entry = None
-        klines_entry_tf_df, klines_entry_tf_error = None, None
-
-        if entry_tf_str == primary_tf_str: # Entry TF is same as Primary TF
-            klines_entry_tf_df = current_primary_buffer_df # Use the already fetched and buffered primary data
-            if not klines_entry_tf_df.empty:
-                current_entry_tf_candle_for_entry = klines_entry_tf_df.iloc[-1]
-        elif entry_tf_str == "1m": # Entry TF is 1m (different from primary, unless primary is also 1m)
-            entry_buffer_size = configs.get("fib_1m_buffer_size", DEFAULT_1M_BUFFER_SIZE)
-            klines_entry_tf_df, klines_entry_tf_error = get_historical_klines_1m(client, symbol, limit=configs.get("atr_period", DEFAULT_ATR_PERIOD) + 5)
-            if not klines_entry_tf_error and not klines_entry_tf_df.empty:
-                update_1m_candle_buffer(symbol, klines_entry_tf_df.iloc[-1], entry_buffer_size)
-                current_entry_tf_candle_for_entry = klines_entry_tf_df.iloc[-1]
-        else: # Entry TF is specific and different from 1m and primary (e.g., 15m for entry, 1h for primary)
-            # Fetch directly for now. A dedicated buffer like symbol_entry_tf_candle_buffers could be added.
-            klines_entry_tf_df, klines_entry_tf_error = get_historical_klines_primary_tf(client, symbol, entry_tf_str, limit=configs.get("atr_period", DEFAULT_ATR_PERIOD) + 5)
-            if not klines_entry_tf_error and not klines_entry_tf_df.empty:
-                current_entry_tf_candle_for_entry = klines_entry_tf_df.iloc[-1]
-
-        if klines_entry_tf_error:
-            msg = f"Skipped: Error fetching Entry TF '{entry_tf_str}' klines ({str(klines_entry_tf_error)})."
-            print(f"{log_prefix_task} {msg} {format_elapsed_time(cycle_start_ref)}"); return f"{symbol}: {msg}"
-        if current_entry_tf_candle_for_entry is None or current_entry_tf_candle_for_entry.empty:
-            msg = f"Skipped: No/empty klines for ICT Entry TF '{entry_tf_str}'."
-            print(f"{log_prefix_task} {msg} {format_elapsed_time(cycle_start_ref)}"); return f"{symbol}: {msg}"
-
-        # 3. ICT Zone Detection Logic (uses primary TF data)
-        print(f"{log_prefix_task} Detecting ICT Zones for {symbol} on Primary TF '{primary_tf_str}' ({len(current_primary_buffer_df)} candles)...")
-        sweep = detect_liquidity_sweep(symbol, current_primary_buffer_df.copy(), configs, s_info)
-        
-        active_zones_for_entry = []
-        if sweep:
-            print(f"{log_prefix_task} Sweep detected: {sweep['type']} at {sweep['timestamp']}. Searching for FVG...")
-            fvg = find_fair_value_gap(symbol, current_primary_buffer_df.copy(), sweep, configs, s_info)
-            if fvg:
-                print(f"{log_prefix_task} FVG found: {fvg['type']} at {fvg['timestamp_created']}. Validating OB...")
-                ob = validate_order_block(symbol, current_primary_buffer_df.copy(), fvg, configs, s_info)
-                if ob:
-                    print(f"{log_prefix_task} OB validated for FVG. ICT Trade Zone active.")
-                    # Retrieve the zones that were just created by validate_order_block
-                    with ict_strategy_states_lock:
-                        active_zones_for_entry = list(ict_strategy_states.get(symbol, {}).get('active_ict_trade_zones', []))
-                else:
-                    print(f"{log_prefix_task} No valid OB found for the FVG.")
-            else:
-                print(f"{log_prefix_task} No FVG found after sweep.")
-        # else: print(f"{log_prefix_task} No liquidity sweep detected.") # Can be verbose
-
-        # 4. Manage Entry Logic if Zones are Active
-        if active_zones_for_entry:
-            print(f"{log_prefix_task} {len(active_zones_for_entry)} ICT trade zone(s) active. Checking for entry on 1m TF...")
-            manage_ict_entry_logic(client, configs, symbol, s_info, current_1m_candle_for_entry, active_zones_for_entry)
-        else:
-            # print(f"{log_prefix_task} No active ICT trade zones to check for entry.")
-            pass
-            
-        return f"{symbol}: ICT Processed"
-    except Exception as e:
-        error_detail = f"Unhandled error in process_symbol_ict_task: {e}"
-        print(f"{log_prefix_task} ERROR processing: {error_detail} {format_elapsed_time(cycle_start_ref)}")
-        traceback.print_exc()
-        return f"{symbol}: ICT Error - {error_detail}"
 
 
 def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is active_trades_lock
@@ -6218,21 +4648,6 @@ def monitor_active_trades(client, configs): # Needs lock for active_trades acces
                 closure_data_for_removal["pnl"] = pnl
                 closure_data_for_removal["reason"] = f"Stop-Loss Hit @ {exit_price_assumed}"
                 print(f"Position {symbol} closed by SL. PNL: {pnl:.2f}")
-                
-                # Log and Notify ICT SL Hit
-                if trade_details.get('strategy_type') == "ICT_MULTI_TP":
-                    log_ict_event_to_csv({
-                        "Symbol": symbol, "EventType": "SL_HIT", "Direction": trade_details.get('side'),
-                        "Price": exit_price_assumed, "PNL": pnl, "OrderID": sl_order_id_to_cancel, # SL order ID
-                        "Notes": f"SL hit for trade entered at {trade_details.get('entry_price')}"
-                    })
-                    alert_details_sl = {
-                        "side": trade_details.get('side'), "reason": closure_data_for_removal["reason"],
-                        "exit_price": exit_price_assumed, "pnl": pnl, 
-                        "quantity": original_total_qty, "order_id": sl_order_id_to_cancel
-                    }
-                    send_ict_telegram_alert(configs, "EXIT", symbol, alert_details_sl, trade_details.get('symbol_info'))
-
             else:
                 # If not SL, it might be manual, liquidation, or the last TP filled leading to full closure.
                 # P&L for TP hits is ideally accounted for when TP order status is checked.
@@ -6240,41 +4655,11 @@ def monitor_active_trades(client, configs): # Needs lock for active_trades acces
                 # We'll assume PNL from TPs was already handled if applicable.
                 print(f"Position {symbol} closed. Not by bot's SL order. PNL for this full closure not calculated here (should be from TPs or manual).")
                 closure_data_for_removal["reason"] = "Position Closed (Not SL, likely TPs or Manual/Liq)"
-                # Log and Notify general closure for ICT if not by SL (TPs should log their own hits)
-                if trade_details.get('strategy_type') == "ICT_MULTI_TP" and not sl_order_status: # only if not SL hit
-                    log_ict_event_to_csv({
-                        "Symbol": symbol, "EventType": "MANUAL_OR_OTHER_EXIT", "Direction": trade_details.get('side'),
-                        "Price": trade_details.get('entry_price'), # No clear exit price here
-                        "Notes": "Position closed, not by bot's SL. TPs should have logged if they hit."
-                    })
-                    # No specific Telegram alert here, as individual TPs would have alerted.
-
+            
             with daily_state_lock:
                 global daily_realized_pnl
                 daily_realized_pnl += closure_data_for_removal["pnl"] # Add PNL from SL or final closure
                 print(f"Updated daily realized PNL: {daily_realized_pnl:.2f}")
-            
-            # --- ICT Zone Cleanup on Trade Closure ---
-            if trade_details.get('strategy_type') == "ICT_MULTI_TP":
-                closed_trade_zone_snapshot = trade_details.get("ict_trade_zone_snapshot")
-                if closed_trade_zone_snapshot and closed_trade_zone_snapshot.get("timestamp_created"):
-                    with ict_strategy_states_lock:
-                        if symbol in ict_strategy_states and 'active_ict_trade_zones' in ict_strategy_states[symbol]:
-                            initial_zone_count = len(ict_strategy_states[symbol]['active_ict_trade_zones'])
-                            ict_strategy_states[symbol]['active_ict_trade_zones'] = [
-                                z for z in ict_strategy_states[symbol]['active_ict_trade_zones']
-                                if z.get("timestamp_created") != closed_trade_zone_snapshot["timestamp_created"]
-                            ]
-                            zones_removed_count = initial_zone_count - len(ict_strategy_states[symbol]['active_ict_trade_zones'])
-                            if zones_removed_count > 0:
-                                print(f"{log_prefix} Removed {zones_removed_count} used ICT trade zone(s) for {symbol} from state after trade closure.")
-                            else:
-                                print(f"{log_prefix} Could not find matching ICT trade zone (ts: {closed_trade_zone_snapshot['timestamp_created']}) to remove for {symbol} after trade closure. Current zones: {ict_strategy_states[symbol]['active_ict_trade_zones']}")
-                        else:
-                             print(f"{log_prefix} No ICT state or active zones found for {symbol} to clean up after trade closure.")
-                else:
-                    print(f"{log_prefix} No ICT trade zone snapshot found in closed trade details for {symbol}. Cannot perform specific zone cleanup.")
-            # --- End ICT Zone Cleanup ---
 
             symbols_to_remove.append(closure_data_for_removal) # Add dict with details
             continue
@@ -6302,25 +4687,10 @@ def monitor_active_trades(client, configs): # Needs lock for active_trades acces
                             
                             print(f"Partial TP Hit: {tp_order_info.get('name')} for {symbol} filled {filled_qty_tp} @ {fill_price_tp}. PNL: {pnl_partial_tp:.2f}")
                             
-                            with daily_state_lock: # Ensure lock for daily_realized_pnl
+                            with daily_state_lock:
                                 daily_realized_pnl += pnl_partial_tp
-                                print(f"Updated daily realized PNL after partial TP ({tp_order_info.get('name')}): {daily_realized_pnl:.2f}")
+                                print(f"Updated daily realized PNL after partial TP: {daily_realized_pnl:.2f}")
 
-                            # Log and Notify ICT Partial TP Hit
-                            if trade_details.get('strategy_type') == "ICT_MULTI_TP":
-                                log_ict_event_to_csv({
-                                    "Symbol": symbol, "EventType": f"{tp_order_info.get('name', 'TPX')}_HIT", 
-                                    "Direction": trade_details.get('side'), "Price": fill_price_tp, 
-                                    "PNL": pnl_partial_tp, "OrderID": tp_order_info.get('id'),
-                                    "Notes": f"{tp_order_info.get('name')} hit for {filled_qty_tp} units."
-                                })
-                                alert_details_tp = {
-                                    "side": trade_details.get('side'), "reason": f"{tp_order_info.get('name', 'TPX')} Hit",
-                                    "exit_price": fill_price_tp, "pnl": pnl_partial_tp,
-                                    "quantity": filled_qty_tp, "order_id": tp_order_info.get('id')
-                                }
-                                send_ict_telegram_alert(configs, "EXIT", symbol, alert_details_tp, trade_details.get('symbol_info'))
-                            
                             # Reduce total quantity tracked by the bot for this trade
                             # This is complex: active_trades['quantity'] should reflect remaining open quantity.
                             # SL order also needs to be modified to new remaining quantity.
@@ -6355,17 +4725,7 @@ def monitor_active_trades(client, configs): # Needs lock for active_trades acces
             # This is part of the adaptive SL logic. For now, just noting the TP hit.
             
             # --- Staged SL Management for Fibonacci Multi-TP after a TP is hit ---
-            # This logic will now also apply to ICT_MULTI_TP if is_multi_tp_strategy is true for it.
-            is_fib_or_ict_multi_tp = is_multi_tp_strategy # General flag for multi-TP strategies like Fib or ICT
-            
-            if is_fib_or_ict_multi_tp and any_tp_hit_this_cycle: # Check if it's Fib or ICT and any TP hit
-                # Determine strategy-specific config prefixes
-                strat_prefix = ""
-                if trade_details.get('strategy_type') == "FIBONACCI_MULTI_TP":
-                    strat_prefix = "fib_"
-                elif trade_details.get('strategy_type') == "ICT_MULTI_TP":
-                    strat_prefix = "ict_"
-                
+            if is_multi_tp_strategy and any_tp_hit_this_cycle:
                 # Recalculate remaining quantity accurately based on all filled TPs
                 current_total_filled_tp_qty = sum(
                     tp.get('quantity', 0) for tp in trade_details['tp_orders'] 
@@ -6385,24 +4745,13 @@ def monitor_active_trades(client, configs): # Needs lock for active_trades acces
                     new_sl_price_staged = None
                     sl_adjustment_reason_staged = None
 
-                    # Use strategy-specific config keys
-                    move_sl_after_tp1_key = f"{strat_prefix}move_sl_after_tp1"
-                    breakeven_buffer_r_key = f"{strat_prefix}breakeven_buffer_r"
-                    sl_adjustment_after_tp2_key = f"{strat_prefix}sl_adjustment_after_tp2"
-                    
-                    # Get default values correctly based on prefix
-                    default_move_sl_after_tp1 = DEFAULT_FIB_MOVE_SL_AFTER_TP1 if strat_prefix == "fib_" else "breakeven" # Example for ICT default
-                    default_breakeven_buffer_r = DEFAULT_FIB_BREAKEVEN_BUFFER_R if strat_prefix == "fib_" else DEFAULT_ICT_BREAKEVEN_BUFFER_R
-                    default_sl_adj_after_tp2 = DEFAULT_FIB_SL_ADJUSTMENT_AFTER_TP2 if strat_prefix == "fib_" else "micro_pivot" # Example for ICT default
-
-
                     if tp1_hit and trade_details.get('sl_management_stage') == "initial":
-                        sl_action_tp1 = configs.get(move_sl_after_tp1_key, default_move_sl_after_tp1)
-                        print(f"[{symbol}] TP1 hit ({strat_prefix}). SL management stage moving to 'after_tp1'. Action: {sl_action_tp1}")
+                        sl_action_tp1 = configs.get("fib_move_sl_after_tp1", DEFAULT_FIB_MOVE_SL_AFTER_TP1)
+                        print(f"[{symbol}] TP1 hit. SL management stage moving to 'after_tp1'. Action: {sl_action_tp1}")
                         trade_details['sl_management_stage'] = "after_tp1" # Update state
                         
                         if sl_action_tp1 == "breakeven":
-                            buffer_r = configs.get(breakeven_buffer_r_key, default_breakeven_buffer_r)
+                            buffer_r = configs.get("fib_breakeven_buffer_r", DEFAULT_FIB_BREAKEVEN_BUFFER_R)
                             initial_risk_pu = trade_details.get('initial_risk_per_unit', 0)
                             if initial_risk_pu > 0:
                                 if trade_details['side'] == "LONG":
@@ -6410,28 +4759,36 @@ def monitor_active_trades(client, configs): # Needs lock for active_trades acces
                                 else: # SHORT
                                     new_sl_price_staged = trade_details['entry_price'] - (initial_risk_pu * buffer_r)
                                 sl_adjustment_reason_staged = f"TP1_HIT_SL_TO_BREAKEVEN_PLUS_{buffer_r}R"
-                            else: print(f"[{symbol}] Cannot calculate breakeven SL after TP1 ({strat_prefix}): initial_risk_per_unit is zero.")
+                            else: print(f"[{symbol}] Cannot calculate breakeven SL after TP1: initial_risk_per_unit is zero.")
                         elif sl_action_tp1 == "trailing":
+                            # Micro-pivot logic will be evaluated below, this flag indicates it *can* run.
                             sl_adjustment_reason_staged = "TP1_HIT_ACTIVATE_TRAILING" 
+                            # No immediate SL price change here; trailing logic will determine it.
                         elif sl_action_tp1 == "original":
                             sl_adjustment_reason_staged = "TP1_HIT_SL_ORIGINAL"
-                            new_sl_price_staged = trade_details['initial_sl_price'] 
+                            new_sl_price_staged = trade_details['initial_sl_price'] # Keep original SL price
                         
+                        # Update current_sl_for_dynamic_check if SL is moved to BE/Original explicitly here
                         if new_sl_price_staged is not None: current_sl_for_dynamic_check = new_sl_price_staged
 
-                    if tp2_hit and trade_details.get('sl_management_stage') in ["initial", "after_tp1"]: 
-                        sl_action_tp2 = configs.get(sl_adjustment_after_tp2_key, default_sl_adj_after_tp2)
-                        print(f"[{symbol}] TP2 hit ({strat_prefix}). SL management stage moving to 'after_tp2'. Action: {sl_action_tp2}")
-                        trade_details['sl_management_stage'] = "after_tp2" 
+
+                    if tp2_hit and trade_details.get('sl_management_stage') in ["initial", "after_tp1"]: # Can jump to after_tp2 if TP1&2 hit same time
+                        sl_action_tp2 = configs.get("fib_sl_adjustment_after_tp2", DEFAULT_FIB_SL_ADJUSTMENT_AFTER_TP2)
+                        print(f"[{symbol}] TP2 hit. SL management stage moving to 'after_tp2'. Action: {sl_action_tp2}")
+                        trade_details['sl_management_stage'] = "after_tp2" # Update state
 
                         if sl_action_tp2 == "micro_pivot":
                             sl_adjustment_reason_staged = "TP2_HIT_ACTIVATE_MICRO_PIVOT"
+                            # Micro-pivot logic will be evaluated below.
                         elif sl_action_tp2 == "atr_trailing":
                             sl_adjustment_reason_staged = "TP2_HIT_ACTIVATE_ATR_TRAILING (Not Implemented, fallback to MicroPivot/Original)"
+                             # TODO: Implement standard ATR trailing or fallback
                         elif sl_action_tp2 == "original":
                             sl_adjustment_reason_staged = "TP2_HIT_SL_AS_PER_AFTER_TP1_STAGE"
-                            new_sl_price_staged = current_sl_for_dynamic_check 
+                            # SL remains as it was after TP1 adjustment (or initial if TP1 was skipped)
+                            new_sl_price_staged = current_sl_for_dynamic_check # Keep SL from previous stage
                         
+                        # Update current_sl_for_dynamic_check if SL is modified explicitly here
                         if new_sl_price_staged is not None: current_sl_for_dynamic_check = new_sl_price_staged
 
 
@@ -6968,9 +5325,6 @@ def trading_loop(client, configs, monitored_symbols):
                     elif configs["strategy_choice"] == "ema_cross":
                         task_function_to_submit = process_symbol_task # This is the original EMA task
                         print(f"Using EMA Cross task function: {task_function_to_submit.__name__}")
-                    elif configs["strategy_choice"] == "ict":
-                        task_function_to_submit = process_symbol_ict_task 
-                        print(f"Using ICT Strategy task function: {task_function_to_submit.__name__}")
                     else:
                         print(f"ERROR: Unknown strategy_choice '{configs['strategy_choice']}' in trading_loop. Cannot submit tasks.")
                         # Potentially halt or skip this cycle's new trade processing
@@ -7015,10 +5369,7 @@ def trading_loop(client, configs, monitored_symbols):
                 elif configs['mode'] == 'live':
                     if not halt_dd_flag: # If not in max drawdown hard stop (where positions are closed)
                         monitor_active_trades(client, configs)
-                        # Monitor pending ICT Limit Orders (if ICT strategy is active or has pending orders)
-                        if configs.get("strategy_choice") == "ict" or any(s_data.get('pending_ict_entries') for s_data in ict_strategy_states.values()):
-                            monitor_pending_ict_entries(client, configs)
-                        print(f"Live Mode: Active trades & pending ICT entries monitoring complete. {format_elapsed_time(cycle_start_time)}")
+                        print(f"Live Mode: Active trades monitoring complete. {format_elapsed_time(cycle_start_time)}")
                     else: # Max drawdown halt is active in live mode
                         print(f"Live Mode: Skipping active trade monitoring as Max Drawdown halt is active and positions should be closed. {format_elapsed_time(cycle_start_time)}")
                 # Backtest mode has its own monitor_active_trades_backtest within its loop.
@@ -7338,135 +5689,6 @@ CSV_SUMMARY_HEADERS = [
     "Timestamp", "Date", "SignalID", "Symbol", "Strategy", "Side", 
     "Leverage", "SignalOpenPrice", "EventType", "EventPrice", "Notes", "EstimatedPNL_USD100"
 ]
-
-# --- ICT CSV Journaling ---
-ICT_JOURNAL_FILENAME = "ict_trade_journal.csv"
-ICT_JOURNAL_HEADERS = [
-    "Timestamp", "Date", "Symbol", "EventType", "Direction", 
-    "Price", "PriceSwept", "SweepWick",
-    "FVG_Upper", "FVG_Lower", "FVG_Created_TS",
-    "OB_High", "OB_Low", "OB_Timestamp",
-    "Zone_Upper", "Zone_Lower",
-    "EntryPrice", "SL_Price", 
-    "TP1_Price", "TP1_Qty_Pct", 
-    "TP2_Price", "TP2_Qty_Pct",
-    "TP3_Price", "TP3_Qty_Pct",
-    "OrderID", "ExitReason", "PNL", "Notes"
-]
-
-def log_ict_event_to_csv(event_details_dict: dict):
-    """Logs an ICT event to the ICT_JOURNAL_FILENAME."""
-    try:
-        file_exists = os.path.exists(ICT_JOURNAL_FILENAME)
-        row_data = {header: event_details_dict.get(header) for header in ICT_JOURNAL_HEADERS} # Allow None for missing
-        
-        row_data["Timestamp"] = pd.Timestamp.now(tz='UTC').strftime('%Y-%m-%d %H:%M:%S %Z')
-        row_data["Date"] = pd.Timestamp.now(tz='UTC').strftime('%Y-%m-%d')
-
-        # Ensure float formatting for relevant fields if they are not None
-        float_fields_to_format = [
-            "Price", "PriceSwept", "SweepWick", "FVG_Upper", "FVG_Lower", 
-            "OB_High", "OB_Low", "Zone_Upper", "Zone_Lower", 
-            "EntryPrice", "SL_Price", "TP1_Price", "TP2_Price", "TP3_Price", "PNL"
-        ]
-        for field in float_fields_to_format:
-            if isinstance(row_data.get(field), (float, int)):
-                row_data[field] = f"{row_data[field]:.8g}" # General purpose float formatting
-        
-        pct_fields = ["TP1_Qty_Pct", "TP2_Qty_Pct", "TP3_Qty_Pct"]
-        for field in pct_fields:
-            if isinstance(row_data.get(field), (float, int)):
-                 row_data[field] = f"{row_data[field]:.3f}"
-
-
-        df_to_append = pd.DataFrame([row_data])
-        
-        if not file_exists:
-            df_to_append.to_csv(ICT_JOURNAL_FILENAME, mode='a', header=True, index=False, columns=ICT_JOURNAL_HEADERS)
-        else:
-            df_to_append.to_csv(ICT_JOURNAL_FILENAME, mode='a', header=False, index=False, columns=ICT_JOURNAL_HEADERS)
-        
-        # print(f"Logged ICT event to {ICT_JOURNAL_FILENAME}: {row_data.get('Symbol')} - {row_data.get('EventType')}")
-    except Exception as e:
-        print(f"Error logging ICT event to CSV: {e}")
-        traceback.print_exc()
-
-# --- ICT Telegram Alerting ---
-def send_ict_telegram_alert(configs: dict, message_type: str, symbol: str, details: dict = None, symbol_info: dict = None):
-    """
-    Formats and sends a concise Telegram message for ICT strategy events.
-    """
-    if not configs.get("telegram_bot_token") or not configs.get("telegram_chat_id"):
-        # print(f"Telegram not configured. Cannot send ICT alert for {symbol}.") # Already handled by send_telegram_message
-        return
-
-    if details is None: details = {}
-    p_prec = 2 # Default
-    if symbol_info and isinstance(symbol_info.get('pricePrecision'), (str, int)): # Check if it's str or int
-        try: p_prec = int(symbol_info['pricePrecision'])
-        except ValueError: pass # Keep default if conversion fails
-
-    message = f"🔔 *[ICT] {symbol.upper()}*"
-    notes = ""
-
-    if message_type == "SWEEP":
-        sweep_type_display = details.get('type', 'Unknown Sweep').replace('_', ' ').title()
-        price_swept_str = f"{details.get('price_swept', 0):.{p_prec}f}"
-        wick_str = f"{details.get('sweep_wick', 0):.{p_prec}f}"
-        close_str = f"{details.get('closing_price', 0):.{p_prec}f}"
-        message += f": {sweep_type_display} @ {price_swept_str} (Wick: {wick_str}, Close: {close_str})"
-    
-    elif message_type == "FVG_CREATED":
-        fvg_type_display = details.get('type', 'Unknown FVG').replace('_', ' ').title()
-        lower_band_str = f"{details.get('lower_band', 0):.{p_prec}f}"
-        upper_band_str = f"{details.get('upper_band', 0):.{p_prec}f}"
-        message += f": {fvg_type_display} {lower_band_str} - {upper_band_str}"
-        if details.get("timestamp_created"):
-             message += f" (created @ {details['timestamp_created'].strftime('%H:%M:%S')})"
-
-    elif message_type == "ZONE_VALIDATED":
-        zone_type_display = details.get('type', 'Zone').replace('_zone', '').title() + " Zone"
-        fvg_l = f"{details.get('fvg_lower_orig', 0):.{p_prec}f}"
-        fvg_u = f"{details.get('fvg_upper_orig', 0):.{p_prec}f}"
-        ob_l = f"{details.get('ob_low', 0):.{p_prec}f}"
-        ob_h = f"{details.get('ob_high', 0):.{p_prec}f}"
-        message += f": {zone_type_display} Validated!\n  FVG: `{fvg_l} - {fvg_u}`\n  OB: `{ob_l} - {ob_h}`"
-
-    elif message_type == "ENTRY":
-        side = details.get('side', 'N/A').upper()
-        entry_p_str = f"{details.get('entry_price', 0):.{p_prec}f}"
-        sl_p_str = f"{details.get('sl_price', 0):.{p_prec}f}"
-        message += f": {side} Entry @ {entry_p_str}\n  SL: `{sl_p_str}`"
-        
-        tp_lines = []
-        for i in range(1, 4):
-            tp_price = details.get(f'tp{i}_price')
-            tp_qty_pct = details.get(f'tp{i}_qty_pct', 0) * 100
-            if tp_price is not None and tp_qty_pct > 0:
-                tp_lines.append(f"  TP{i}: `{tp_price:.{p_prec}f}` ({tp_qty_pct:.0f}%)")
-        if tp_lines: message += "\n" + "\n".join(tp_lines)
-        else: message += "\n  TPs: Not Set or All Zero Qty"
-        if details.get("order_id"): message += f"\n  Entry Order ID: `{details['order_id']}`"
-        
-    elif message_type == "EXIT": # For SL or TP hits
-        exit_reason = details.get('reason', 'Unknown Exit')
-        exit_p_str = f"{details.get('exit_price', 0):.{p_prec}f}"
-        pnl_str = f"{details.get('pnl', 0):.2f} USDT"
-        qty_str = f"{details.get('quantity', 0):.{symbol_info.get('quantityPrecision', 2) if symbol_info else 2}f}"
-        
-        emoji = "✅" if "TP" in exit_reason.upper() else "❌" if "SL" in exit_reason.upper() else "ℹ️"
-        message = f"{emoji} *[ICT] {symbol.upper()}*: Position Closed ({details.get('side', 'N/A')})\n" \
-                  f"  Reason: `{exit_reason}` @ `{exit_p_str}`\n" \
-                  f"  Qty: `{qty_str}` | PNL: `{pnl_str}`"
-        if details.get("order_id"): message += f"\n  Order ID: `{details['order_id']}`"
-
-    else:
-        message += f": Unknown Event Type '{message_type}'"
-        if details: message += f"\n  Details: `{str(details)[:200]}`" # Log some details for unknown
-
-    # print(f"Sending ICT Telegram Alert: {message}") # For debugging
-    send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], message)
-
 
 def log_signal_event_to_csv(event_details_dict: dict):
     """
@@ -7813,24 +6035,17 @@ def main_bot_logic(): # Renamed main to main_bot_logic
     if blacklisted_symbols:
         print(f"Loaded {len(blacklisted_symbols)} symbol(s) from blacklist: {', '.join(blacklisted_symbols)}")
 
-    monitored_symbols = []
-    if configs.get("strategy_choice") == "ict":
-        ict_symbols_filepath = "ict_symbols.csv"
-        monitored_symbols = load_ict_symbols_from_csv(ict_symbols_filepath)
-        if not monitored_symbols:
-            print(f"Warning: No symbols loaded from '{ict_symbols_filepath}' for ICT strategy. Bot may not trade.")
-            # Decide if bot should exit or continue without symbols for ICT. For now, let it continue but it won't find signals.
-    else:
-        monitored_symbols_all = get_all_usdt_perpetual_symbols(client) # Use global client
-        # Filter out blacklisted symbols
-        monitored_symbols = [s for s in monitored_symbols_all if s not in blacklisted_symbols]
-        excluded_by_blacklist_count = len(monitored_symbols_all) - len(monitored_symbols)
-        if excluded_by_blacklist_count > 0:
-            print(f"Excluded {excluded_by_blacklist_count} symbol(s) due to blacklist: {', '.join(sorted(list(set(monitored_symbols_all) - set(monitored_symbols))))}")
-
+    monitored_symbols_all = get_all_usdt_perpetual_symbols(client) # Use global client
+    
+    # Filter out blacklisted symbols
+    monitored_symbols = [s for s in monitored_symbols_all if s not in blacklisted_symbols]
+    
+    excluded_by_blacklist_count = len(monitored_symbols_all) - len(monitored_symbols)
+    if excluded_by_blacklist_count > 0:
+        print(f"Excluded {excluded_by_blacklist_count} symbol(s) due to blacklist: {', '.join(sorted(list(set(monitored_symbols_all) - set(monitored_symbols))))}")
+    
     if not monitored_symbols: 
-        strategy_name_for_msg = configs.get('strategy_name', 'the selected strategy')
-        print(f"Exiting: No symbols to monitor for {strategy_name_for_msg} (check CSV file or blacklist).")
+        print("Exiting: No symbols to monitor after applying blacklist (or no symbols found initially).")
         sys.exit(1)
     
     # --- Initial Telegram Notification ---
