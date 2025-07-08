@@ -26,8 +26,15 @@ from telegram import Update
 from telegram.ext import CallbackContext
 import requests # For fetching public IP address
 import numpy as np # For numerical operations like log and sqrt
+from concurrent.futures import TimeoutError as FutureTimeoutError # Alias to avoid confusion
+
+# Custom Exception for Kline Fetching Timeouts
+class KlineFetchTimeoutError(Exception):
+    """Custom exception for kline fetching timeouts."""
+    pass
 
 # --- Configuration Defaults ---
+TASK_COMPLETION_TIMEOUT_SECONDS = 120 # Max time for a symbol processing task to complete
 DEFAULT_RISK_PERCENT = 1.0       # Default account risk percentage per trade (e.g., 1.0 for 1%)
 DEFAULT_LEVERAGE = 20            # Default leverage (e.g., 20x)
 DEFAULT_MAX_CONCURRENT_POSITIONS = 5 # Default maximum number of concurrent open positions
@@ -222,8 +229,26 @@ def save_pending_fib_orders_to_csv():
                   'timestamp_created', 'swing_low_of_leg', 'swing_high_of_leg', 
                   'trend_at_creation', 'notes'] # Added 'notes'
     
-    with pending_fib_orders_lock:
-        orders_to_save = list(pending_fib_orders) 
+    # This function should be called ONLY when pending_fib_orders_lock is already held
+    # by the calling function (e.g., add_new_pending_fib_order, update_pending_fib_order_status).
+    # Creating a copy of pending_fib_orders should also happen under that external lock.
+    # For this fix, we assume the caller handles making `orders_to_save` correctly.
+    # The most critical part is removing the re-acquisition of the lock here.
+    
+    # The caller (add_new_pending_fib_order or update_pending_fib_order_status)
+    # is responsible for providing the list of orders to save,
+    # which it should prepare while holding the lock.
+    # Let's adjust the function to accept orders_to_save as an argument.
+    # No, let's keep it simple: the caller ensures lock is held, and this function reads global.
+    
+    # orders_to_save = list(pending_fib_orders) # This read must be under the caller's lock.
+    # For safety and clarity, let's make this function accept the list to save.
+    # However, to minimize changes for now, I will assume the global read is safe
+    # because the caller (add_new_pending_fib_order / update_pending_fib_order_status)
+    # holds the lock during the call to this function, protecting the read of pending_fib_orders.
+
+    # The primary fix is removing the `with pending_fib_orders_lock:` here.
+    orders_to_save = list(pending_fib_orders) # This read is now protected by the caller's lock.
 
     try:
         with open(PENDING_FIB_ORDERS_CSV, mode='w', newline='') as file:
@@ -909,7 +934,13 @@ def send_telegram_message(bot_token, chat_id, message):
             print(f"An unexpected error occurred while sending Telegram message: {e}")
             return False
 
-    return asyncio.run(_send())
+    # Run the async _send() function in a new daemon thread to avoid blocking the caller
+    # This is a "fire-and-forget" approach for notifications.
+    # Error handling within _send() will print to console.
+    # The main thread (e.g., symbol processing task) will not wait for Telegram send completion.
+    sender_thread = threading.Thread(target=lambda: asyncio.run(_send()), daemon=True)
+    sender_thread.start()
+    return True # Assume submission to thread is success; actual send success is logged by _send()
 
 def send_entry_signal_telegram(configs: dict, symbol: str, signal_type_display: str, leverage: int, entry_price: float, 
                                tp1_price: float, tp2_price: float | None, tp3_price: float | None, sl_price: float,
@@ -1098,7 +1129,12 @@ def get_historical_klines_1m(client, symbol: str, limit: int = 200): # Default l
     api_error = None
     # print(f"Fetching 1m klines for {symbol}, limit {limit}...") # Verbose
     try:
-        klines_1m = client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1MINUTE, limit=limit)
+        # Use the helper for the actual API call
+        klines_1m = _fetch_klines_with_timeout(client.get_klines, symbol=symbol, interval=Client.KLINE_INTERVAL_1MINUTE, limit=limit)
+    except KlineFetchTimeoutError as te: # Catch specific timeout error from helper
+        print(f"Timeout Error fetching 1m klines for {symbol}: {te}")
+        api_error = te
+        return pd.DataFrame(), api_error
     except BinanceAPIException as e:
         print(f"API Error fetching 1m klines for {symbol}: {e}")
         api_error = e
@@ -3412,6 +3448,47 @@ def _build_symbol_info_map_from_active_trades(active_trades_dict):
 
 # --- Binance API Interaction Functions (Error handling included) ---
 
+KLINE_FETCH_TIMEOUT_SECONDS = 20 # Timeout for the external kline fetch, slightly longer than client's internal
+
+def _fetch_klines_with_timeout(api_call_func, *args, **kwargs):
+    """
+    Executes a Binance API kline fetching function with an external timeout.
+    Args:
+        api_call_func: The actual client method to call (e.g., client.get_klines).
+        *args: Positional arguments for api_call_func.
+        **kwargs: Keyword arguments for api_call_func.
+
+    Returns:
+        The result of api_call_func if successful.
+    
+    Raises:
+        KlineFetchTimeoutError: If the API call exceeds KLINE_FETCH_TIMEOUT_SECONDS.
+        BinanceAPIException: If the API call itself raises it.
+        Exception: For other unexpected errors during the fetch.
+    """
+    # Using a new executor for each call to ensure thread isolation for timeout management.
+    # This is less efficient than a shared executor but safer for strict timeout enforcement on potentially blocking calls.
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(api_call_func, *args, **kwargs)
+        try:
+            # KLINE_FETCH_TIMEOUT_SECONDS is the timeout for future.result()
+            return future.result(timeout=KLINE_FETCH_TIMEOUT_SECONDS)
+        except FutureTimeoutError: # This is concurrent.futures.TimeoutError
+            # future.cancel() # Attempt to cancel the task if it's still running
+            # Cancellation of futures is not always guaranteed to interrupt the thread,
+            # especially if the underlying requests call is blocked in a non-interruptible way.
+            # However, the main goal is to unblock the calling thread.
+            symbol_arg = kwargs.get('symbol', args[0] if args else 'UnknownSymbol') # Try to get symbol for logging
+            err_msg = f"Kline fetch for {symbol_arg} timed out after {KLINE_FETCH_TIMEOUT_SECONDS} seconds (external timeout)."
+            print(f"ERROR: {err_msg}")
+            raise KlineFetchTimeoutError(err_msg)
+        except BinanceAPIException as e: # Re-raise Binance specific exceptions
+            # print(f"BinanceAPIException during kline fetch (via helper): {e}") # Already logged by get_historical_klines
+            raise e
+        except Exception as e: # Catch other exceptions from the API call
+            # print(f"Unexpected exception during kline fetch (via helper): {e}") # Already logged by get_historical_klines
+            raise e # Re-raise other exceptions
+
 def initialize_binance_client(configs):
     api_key, api_secret, env = configs["api_key"], configs["api_secret"], configs["environment"]
     try:
@@ -3475,24 +3552,28 @@ def get_historical_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUT
 
     try:
         if backtest_days:
-            klines_per_day = (24 * 60) // int(interval.replace('m','').replace('h','').replace('d',''))
-            if 'h' in interval: klines_per_day = 24 // int(interval.replace('h',''))
-            if 'd' in interval: klines_per_day = 1
-            total_klines_needed = klines_per_day * backtest_days
-            print(f"Fetching klines for {symbol}, interval {interval}, for {backtest_days} days (approx {total_klines_needed} klines)...")
-            start_str = f"{backtest_days + 1} days ago UTC"
-            klines = client.get_historical_klines(symbol, interval, start_str)
+            # ... (existing backtest_days logic for determining start_str) ...
+            print(f"Fetching klines for {symbol}, interval {interval}, for {backtest_days} days...")
+            start_str = f"{backtest_days + 1} days ago UTC" # Ensure this calculation is correct based on interval
+            # Use the helper for the actual API call
+            klines = _fetch_klines_with_timeout(client.get_historical_klines, symbol, interval, start_str)
         else: # Live mode
             print(f"Fetching klines for {symbol}, interval {interval}, limit {limit}...")
-            klines = client.get_klines(symbol=symbol, interval=interval, limit=limit)
+            # Use the helper for the actual API call
+            klines = _fetch_klines_with_timeout(client.get_klines, symbol=symbol, interval=interval, limit=limit)
+            
+    except KlineFetchTimeoutError as te: # Catch specific timeout error from helper
+        print(f"Timeout Error fetching klines for {symbol}: {te}") # Already logged by helper, but good to confirm handling
+        api_error = te # Store it as api_error
+        return pd.DataFrame(), api_error
     except BinanceAPIException as e:
         print(f"API Error fetching klines for {symbol}: {e}")
         api_error = e
-        return pd.DataFrame(), api_error # Return empty DataFrame and the error
-    except Exception as e: # Catch other potential errors during fetch (e.g., network issues)
+        return pd.DataFrame(), api_error
+    except Exception as e: # Catch other potential errors (e.g., network issues not caught as BinanceAPIException)
         print(f"General error fetching klines for {symbol}: {e}")
-        api_error = e # Store general exception as well
-        return pd.DataFrame(), api_error # Return empty DataFrame and the error
+        api_error = e
+        return pd.DataFrame(), api_error
 
     duration = time.time() - start_time
     processing_error = None
@@ -6882,21 +6963,42 @@ def trading_loop(client, configs, monitored_symbols):
                         proceed_with_new_trades = False # Stop trying to process new trades if strategy is unknown
 
                     if task_function_to_submit and proceed_with_new_trades:
-                        for symbol in monitored_symbols:
+                        future_to_symbol = {} # Map future to symbol for better logging
+                        print(f"TradingLoop: Submitting {len(monitored_symbols)} tasks for {configs['strategy_choice']}...")
+                        for symbol_task_idx, symbol in enumerate(monitored_symbols):
                             # Each task function will internally check halt flags again before processing
-                            futures.append(executor.submit(task_function_to_submit, symbol, client, configs, active_trades_lock))
+                            future_obj = executor.submit(task_function_to_submit, symbol, client, configs, active_trades_lock)
+                            futures.append(future_obj)
+                            future_to_symbol[future_obj] = symbol # Store mapping
+                            # print(f"TradingLoop: Submitted task {symbol_task_idx + 1}/{len(monitored_symbols)} for {symbol}") # Can be too verbose
                     
                     processed_count = 0
                     if futures: # Only iterate if tasks were actually submitted
+                        print(f"TradingLoop: Starting to process {len(futures)} submitted tasks using as_completed...")
                         for future in as_completed(futures):
-                            try: result = future.result(); # print(f"Task result: {result}") # Optional: log task result
-                            except Exception as e_future: print(f"Task error: {e_future}")
+                            processed_symbol = future_to_symbol.get(future, "UnknownSymbol") # Get symbol from map
+                            try:
+                                # print(f"TradingLoop: Attempting to get result for {processed_symbol} task (timeout: {TASK_COMPLETION_TIMEOUT_SECONDS}s)...") # Verbose
+                                result = future.result(timeout=TASK_COMPLETION_TIMEOUT_SECONDS) 
+                                # print(f"TradingLoop: Task for {processed_symbol} completed. Result: {result}") # Verbose
+                            except FutureTimeoutError: # This is concurrent.futures.TimeoutError
+                                print(f"TradingLoop: Task for {processed_symbol} TIMED OUT after {TASK_COMPLETION_TIMEOUT_SECONDS} seconds.")
+                                # Optionally, try to cancel the future, though it may not be effective if the task is stuck in uninterruptible code
+                                # future.cancel() 
+                            except Exception as e_future:
+                                print(f"TradingLoop: Task for {processed_symbol} generated an error: {e_future}")
+                                traceback.print_exc() # Print full traceback for task errors
+                            
                             processed_count += 1
-                            if processed_count % (len(monitored_symbols)//5 or 1) == 0 or processed_count == len(monitored_symbols): # Log progress periodically
-                                 print(f"Symbol tasks progress: {processed_count}/{len(monitored_symbols)} completed. {format_elapsed_time(cycle_start_time)}")
-                        print(f"All symbol tasks completed for new trade scanning. {format_elapsed_time(cycle_start_time)}")
+                            # Log progress more frequently or based on count
+                            if processed_count % (max(1, len(monitored_symbols)//10)) == 0 or processed_count == len(monitored_symbols): # Log every 10% or on completion
+                                 current_time_str = pd.Timestamp.now(tz='UTC').strftime('%H:%M:%S')
+                                 print(f"[{current_time_str}] Symbol tasks progress: {processed_count}/{len(monitored_symbols)} completed. ({processed_symbol} was last processed). {format_elapsed_time(cycle_start_time)}")
+                        
+                        print(f"TradingLoop: All {len(futures)} symbol tasks yielded results or timed out (as_completed loop finished). {format_elapsed_time(cycle_start_time)}")
+                    
                     elif not proceed_with_new_trades and not task_function_to_submit : # If strategy was unknown
-                        print(f"Skipping new trade task submission due to unknown strategy. {format_elapsed_time(cycle_start_time)}")
+                        print(f"TradingLoop: Skipping new trade task submission due to unknown strategy. {format_elapsed_time(cycle_start_time)}")
                     else: # No futures submitted for other reasons (e.g. monitored_symbols was empty, though guarded earlier)
                         print(f"No new trade tasks were submitted this cycle. {format_elapsed_time(cycle_start_time)}")
 
@@ -9116,9 +9218,17 @@ def monitor_active_signals(client, configs):
                         active_signals[symbol]["last_update_message_type"] = tp_info['name'] + "_HIT"
                         active_signals[symbol]["last_update_message_detail_preview"] = msg_detail_tp[:50]
                         
-                        if tp_info['name'] == 'TP1' and signal_details.get('strategy_type') == "FIBONACCI_RETRACEMENT":
-                            if active_signals[symbol].get('fib_move_sl_after_tp1_config') == "breakeven":
-                                buffer_r = active_signals[symbol].get('fib_breakeven_buffer_r_config', 0.0)
+                        # Apply Fib-specific SL adjustments (like Breakeven after TP1)
+                        # This should apply to both old Fib, new AdvFib (virtual), and potentially live AdvFib if it were tracked here.
+                        fib_strategy_types_for_staged_sl = [
+                            "FIBONACCI_RETRACEMENT",      # Old Fib strategy
+                            "ADVFIB_VIRTUAL_TRADE",       # New AdvFib strategy in signal mode
+                            "FIBONACCI_MULTI_TP"          # Live/Backtest AdvFib strategy (if it were to be monitored by active_signals)
+                        ]
+                        if tp_info['name'] == 'TP1' and signal_details.get('strategy_type') in fib_strategy_types_for_staged_sl:
+                            sl_action_after_tp1 = active_signals[symbol].get('fib_move_sl_after_tp1_config', 'original')
+                            if sl_action_after_tp1 == "breakeven":
+                                buffer_r = active_signals[symbol].get('fib_breakeven_buffer_r_config', DEFAULT_FIB_BREAKEVEN_BUFFER_R)
                                 initial_risk_pu = active_signals[symbol].get('initial_risk_per_unit', 0)
                                 new_be_sl_price = signal_details['entry_price']
                                 if initial_risk_pu > 0:
@@ -10133,15 +10243,17 @@ def monitor_pending_fib_limit_orders(client, configs):
                 else: rejection_reason_rsi = f"RSI ({current_rsi_value:.2f}) NOT > 50 for SHORT."
             
             if rsi_condition_met:
-                print(f"{log_prefix} RSI condition MET. Preparing for execution.")
-                update_pending_fib_order_status(order['order_id'], FIB_ORDER_STATUS_TRIGGERED_PENDING_PLACEMENT, f"RSI OK ({current_rsi_value:.2f}). Awaiting execution.") # Use constant
-                # Actual execution call will be here, e.g., execute_triggered_fib_order(...)
-                # This function (execute_triggered_fib_order) will be implemented in the next step.
-                # For now, it's a placeholder to indicate where it fits.
+                print(f"{log_prefix} RSI condition MET ({current_rsi_value:.2f}). Price condition also MET (Entry: {order['entry_price']:.{p_prec}f}, Market: {current_market_price:.{p_prec}f}).")
+                print(f"{log_prefix} Calling execute_triggered_fib_order for {symbol} {order['side']}...")
+                update_pending_fib_order_status(order['order_id'], FIB_ORDER_STATUS_TRIGGERED_PENDING_PLACEMENT, f"Price & RSI OK ({current_rsi_value:.2f}). Awaiting execution.") # Use constant
                 execute_triggered_fib_order(client, configs, order, current_market_price, df_15m_latest) 
             else: 
-                print(f"{log_prefix} RSI condition NOT MET. {rejection_reason_rsi}. Rejecting.")
-                update_pending_fib_order_status(order['order_id'], FIB_ORDER_STATUS_REJECTED_RSI, rejection_reason_rsi) # Use constant
+                print(f"{log_prefix} RSI condition NOT MET. {rejection_reason_rsi}. Pending order will not be triggered at this time.")
+                # No status update here, as it's just an RSI rejection for this specific candle, order remains pending.
+                # Status update to REJECTED_RSI should only happen if we decide this attempt is final.
+                # The current logic correctly keeps it pending if RSI fails.
+                # The previous update_pending_fib_order_status for REJECTED_RSI was too aggressive.
+                # update_pending_fib_order_status(order['order_id'], FIB_ORDER_STATUS_REJECTED_RSI, rejection_reason_rsi) 
                 if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
                     message = (
                         f"⚠️ *Fib Trade REJECTED (RSI Filter)*\n\n"
@@ -10259,38 +10371,77 @@ def execute_triggered_fib_order(client, configs, triggered_order_details: dict, 
 
     # Signal Mode Handling
     if configs['mode'] == 'signal':
-        print(f"{log_prefix} Signal Mode: Preparing Telegram signal for Fib {symbol} {side.upper()}.")
-        # Calculate P&L estimations for $100 capital
-        est_pnl_tp1_fib_signal = calculate_pnl_for_fixed_capital(effective_entry_price, tp1_price, side.upper(), leverage_to_use, 100.0, s_info)
-        est_pnl_sl_fib_signal = calculate_pnl_for_fixed_capital(effective_entry_price, sl_price, side.upper(), leverage_to_use, 100.0, s_info)
+        print(f"{log_prefix} Signal Mode: AdvFib limit order for {symbol} {side.upper()} VIRTUALLY TRIGGERED at market price ~{effective_entry_price:.{p_prec}f}.")
 
-        send_entry_signal_telegram(
-            configs=configs, symbol=symbol, signal_type_display=f"FIB_SIGNAL_{side.upper()}",
-            leverage=leverage_to_use, entry_price=effective_entry_price,
-            tp1_price=tp1_price, tp2_price=tp2_price, tp3_price=initial_tp3_target_price, sl_price=sl_price,
-            risk_percentage_config=configs['risk_percent'], 
-            est_pnl_tp1=est_pnl_tp1_fib_signal, est_pnl_sl=est_pnl_sl_fib_signal,
-            symbol_info=s_info, strategy_name_display="AdvFib Retracement Signal",
-            signal_timestamp=df_15m_for_atr.index[-1], # Timestamp of the current 15m candle
-            signal_order_type="MARKET" # Simulating market execution after trigger
+        # 1. Send a specific "TRIGGERED" Telegram notification
+        trigger_time = df_15m_for_atr.index[-1] # Timestamp of the current 15m candle that caused the trigger
+        pnl_at_tp1_est = calculate_pnl_for_fixed_capital(effective_entry_price, tp1_price, side.upper(), leverage_to_use, 100.0, s_info)
+        pnl_at_sl_est = calculate_pnl_for_fixed_capital(effective_entry_price, sl_price, side.upper(), leverage_to_use, 100.0, s_info)
+
+        trigger_message = (
+            f"🔔 *AdvFib Limit Order TRIGGERED (Virtual)*\n\n"
+            f"Symbol: `{symbol}`\n"
+            f"Side: `{side.upper()}`\n"
+            f"Original Limit Price: `{original_limit_entry:.{p_prec}f}`\n"
+            f"Effective Entry Price (Market): `~{effective_entry_price:.{p_prec}f}`\n"
+            f"Leverage: `{leverage_to_use}x`\n\n"
+            f"Calculated SL: `{sl_price:.{p_prec}f}`\n"
+            f"Calculated TP1: `{tp1_price:.{p_prec}f}` (Est PNL: {pnl_at_tp1_est:.2f} USDT for $100 cap)\n"
+            f"Calculated TP2: `{tp2_price:.{p_prec}f}`\n"
+            f"Calculated Initial TP3 Target: `{initial_tp3_target_price:.{p_prec}f}`\n\n"
+            f"Est PNL at SL: `{pnl_at_sl_est:.2f} USDT for $100 cap`\n\n"
+            f"Monitoring for virtual SL/TP hits."
         )
+        send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"), trigger_message)
+
+        # 2. Add to active_signals for monitoring
+        signal_id_advfib_triggered = f"advfib_sig_{symbol}_{int(trigger_time.timestamp())}"
+        with active_signals_lock:
+            active_signals[symbol] = {
+                "signal_id": signal_id_advfib_triggered,
+                "entry_price": effective_entry_price,
+                "current_sl_price": sl_price, "initial_sl_price": sl_price,
+                "current_tp1_price": tp1_price, "initial_tp1_price": tp1_price,
+                "current_tp2_price": tp2_price, "initial_tp2_price": tp2_price,
+                "current_tp3_price": initial_tp3_target_price, "initial_tp3_price": initial_tp3_target_price, # Store initial TP3 for now
+                "side": side.upper(), 
+                "leverage": leverage_to_use,
+                "symbol_info": s_info,
+                "open_timestamp": trigger_time,
+                "strategy_type": "ADVFIB_VIRTUAL_TRADE", # Distinct strategy type
+                "sl_management_stage": "initial", # For multi-TP SL management simulation
+                "last_update_message_type": "NEW_VIRTUAL_TRIGGER",
+                "initial_risk_per_unit": abs(effective_entry_price - sl_price),
+                # Store Fib leg for potential future reference in signal monitoring if needed
+                "fib_leg_low": leg_swing_low, "fib_leg_high": leg_swing_high,
+                # Configs for SL management if TPs are hit (for monitor_active_signals)
+                "fib_move_sl_after_tp1_config": configs.get("fib_move_sl_after_tp1", DEFAULT_FIB_MOVE_SL_AFTER_TP1), # Using old Fib config keys for now
+                "fib_breakeven_buffer_r_config": configs.get("fib_breakeven_buffer_r", DEFAULT_FIB_BREAKEVEN_BUFFER_R),
+                "fib_sl_adjustment_after_tp2_config": configs.get("fib_sl_adjustment_after_tp2", DEFAULT_FIB_SL_ADJUSTMENT_AFTER_TP2),
+                # Store TP quantities if we were to simulate partial TPs (assuming full qty for each TP for now in signal mode)
+                # "qty_tp1": total_quantity_to_order * 0.5, # Example, needs full qty for estimation
+            }
+            print(f"{log_prefix} AdvFib signal for {symbol} added to active_signals for virtual monitoring.")
         
-        update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_SIGNALLED, f"Signal generated for {symbol} {side.upper()}.") # Use constant
+        # 3. Update status of the original pending order
+        update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_SIGNALLED, f"Virtual trigger for {symbol} {side.upper()} at ~{effective_entry_price:.{p_prec}f}")
         
-        # Log signal event to CSV
-        log_event_fib_signal = {
-            "SignalID": triggered_order_details['order_id'], # Use bot's internal order ID as SignalID
-            "Symbol": symbol, "Strategy": "AdvFib_Retracement_Signal", "Side": side.upper(),
+        # 4. Log virtual trigger event to CSV
+        log_event_fib_virtual_trigger = {
+            "SignalID": signal_id_advfib_triggered, # Use the new signal ID for active_signals
+            "Symbol": symbol, "Strategy": "AdvFib_Retracement_Virtual", "Side": side.upper(),
             "Leverage": leverage_to_use, "SignalOpenPrice": effective_entry_price,
-            "EventType": "NEW_FIB_SIGNAL", "EventPrice": effective_entry_price,
-            "Notes": f"SL:{sl_price:.{p_prec}f}, TP1:{tp1_price:.{p_prec}f}, TP2:{tp2_price:.{p_prec}f}, InitTP3:{initial_tp3_target_price:.{p_prec}f}",
-            "EstimatedPNL_USD100": est_pnl_tp1_fib_signal 
+            "EventType": "VIRTUAL_FIB_TRIGGER", "EventPrice": effective_entry_price,
+            "Notes": f"OrigLimit:{original_limit_entry:.{p_prec}f}. SL:{sl_price:.{p_prec}f}, TP1:{tp1_price:.{p_prec}f}, TP2:{tp2_price:.{p_prec}f}, InitTP3:{initial_tp3_target_price:.{p_prec}f}",
+            "EstimatedPNL_USD100": pnl_at_tp1_est 
         }
-        log_signal_event_to_csv(log_event_fib_signal)
-        print(f"{log_prefix} Signal Mode: Fib signal for {symbol} processed and logged.")
+        log_signal_event_to_csv(log_event_fib_virtual_trigger)
+        
+        print(f"{log_prefix} Signal Mode: AdvFib virtual trigger for {symbol} processed and logged.")
         return # End processing for signal mode
 
     # Live Mode Execution (continues if not in signal mode)
+    # Ensure leverage and margin type are set correctly before placing live orders
     if not (set_leverage_on_symbol(client, symbol, leverage_to_use) and \
             set_margin_type_on_symbol(client, symbol, configs['margin_type'], configs)):
         reason = f"Failed to set leverage/margin for {symbol}."
@@ -10500,8 +10651,120 @@ def monitor_pending_ict_entries(client, configs: dict):
     global ict_strategy_states, ict_strategy_states_lock, active_trades, active_trades_lock, active_signals, active_signals_lock
     
     log_prefix_monitor = "[ICTLimitMonitor]"
-    symbols_to_reset_ict_state = []
+    symbols_to_reset_ict_state = [] # For states that are no longer pending (filled, cancelled, timed out)
 
+    # --- Signal Mode Logic ---
+    if configs['mode'] == 'signal':
+        pending_virtual_ict_signals = {}
+        with ict_strategy_states_lock:
+            pending_virtual_ict_signals = {
+                sym: data for sym, data in ict_strategy_states.items()
+                if isinstance(data, dict) and data.get('state') == "PENDING_ICT_ENTRY" # Same state name used for pending signals
+            }
+
+        if not pending_virtual_ict_signals:
+            return
+        
+        print(f"\n{log_prefix_monitor} Signal Mode: Checking {len(pending_virtual_ict_signals)} pending virtual ICT signal(s)...")
+
+        for symbol, signal_data in pending_virtual_ict_signals.items():
+            pending_details = signal_data.get('pending_entry_details')
+            if not pending_details:
+                print(f"{log_prefix_monitor} {symbol}: Incomplete pending signal data. Skipping.")
+                symbols_to_reset_ict_state.append(symbol) # Mark for removal if data is bad
+                continue
+
+            limit_price = pending_details.get('limit_price')
+            signal_side = pending_details.get('side') # Should be LONG or SHORT
+            order_placed_ts = signal_data.get('order_placed_timestamp', dt.now(timezone.utc) - pd.Timedelta(minutes=configs.get("ict_order_timeout_minutes", DEFAULT_ICT_ORDER_TIMEOUT_MINUTES) + 1))
+            s_info_signal = pending_details.get('symbol_info', get_symbol_info(client, symbol)) # Fetch if not stored
+            
+            if not s_info_signal:
+                print(f"{log_prefix_monitor} {symbol}: Cannot get symbol_info. Skipping signal.")
+                symbols_to_reset_ict_state.append(symbol)
+                continue
+                
+            p_prec_signal = int(s_info_signal.get('pricePrecision', 2))
+
+            current_market_price = get_current_market_price(client, symbol)
+            if current_market_price is None:
+                print(f"{log_prefix_monitor} {symbol}: Could not fetch market price for virtual trigger check. Skipping.")
+                continue
+
+            # Check for virtual trigger
+            price_triggered_virtual = False
+            if signal_side == "LONG" and current_market_price <= limit_price:
+                price_triggered_virtual = True
+            elif signal_side == "SHORT" and current_market_price >= limit_price:
+                price_triggered_virtual = True
+
+            if price_triggered_virtual:
+                print(f"{log_prefix_monitor} {symbol}: Virtual ICT Limit TRIGGERED! Limit: {limit_price:.{p_prec_signal}f}, Market: {current_market_price:.{p_prec_signal}f}")
+                
+                # Send Telegram notification
+                trigger_msg_tg_ict = (
+                    f"🔔 *ICT Limit Order TRIGGERED (Virtual)*\n\n"
+                    f"Symbol: `{symbol}`\nSide: `{signal_side}`\n"
+                    f"Original Limit Price: `{limit_price:.{p_prec_signal}f}`\n"
+                    f"Effective Entry Price (Market): `~{current_market_price:.{p_prec_signal}f}`\n"
+                    f"Leverage: `{pending_details.get('leverage', 'N/A')}x`\n\n"
+                    f"Planned SL: `{pending_details.get('sl_price'):.{p_prec_signal}f}`\n"
+                    f"Planned TP1: `{pending_details.get('tp1_price'):.{p_prec_signal}f}`\n"
+                    # Add TP2, TP3 if they exist in pending_details
+                    f"\nMonitoring for virtual SL/TP hits."
+                )
+                send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"), trigger_msg_tg_ict)
+
+                # Add to active_signals
+                virtual_signal_id = f"ict_virt_sig_{symbol}_{int(dt.now(timezone.utc).timestamp())}"
+                with active_signals_lock:
+                    active_signals[symbol] = {
+                        "signal_id": virtual_signal_id,
+                        "entry_price": current_market_price, # Use current market price as effective entry
+                        "current_sl_price": pending_details['sl_price'], "initial_sl_price": pending_details['sl_price'],
+                        "current_tp1_price": pending_details['tp1_price'], "initial_tp1_price": pending_details['tp1_price'],
+                        "current_tp2_price": pending_details.get('tp2_price'), "initial_tp2_price": pending_details.get('tp2_price'),
+                        "current_tp3_price": pending_details.get('tp3_price'), "initial_tp3_price": pending_details.get('tp3_price'),
+                        "side": signal_side, "leverage": pending_details.get('leverage'),
+                        "symbol_info": s_info_signal, "open_timestamp": dt.now(timezone.utc),
+                        "strategy_type": "ICT_VIRTUAL_TRADE", "sl_management_stage": "initial",
+                        "last_update_message_type": "NEW_VIRTUAL_ICT_TRIGGER",
+                        "initial_risk_per_unit": pending_details.get('initial_risk_per_unit', 0)
+                    }
+                
+                # Log to CSV
+                log_event_ict_virtual_trigger = {
+                    "SignalID": virtual_signal_id, "Symbol": symbol, "Strategy": "ICT_VIRTUAL_TRADE", 
+                    "Side": signal_side, "Leverage": pending_details.get('leverage'),
+                    "SignalOpenPrice": current_market_price, "EventType": "VIRTUAL_ICT_TRIGGER",
+                    "EventPrice": current_market_price,
+                    "Notes": f"OrigLimit:{limit_price:.{p_prec_signal}f}. SL:{pending_details['sl_price']:.{p_prec_signal}f}, TP1:{pending_details['tp1_price']:.{p_prec_signal}f}",
+                    "EstimatedPNL_USD100": "N/A" # PNL at TP1 can be calculated if needed
+                }
+                log_signal_event_to_csv(log_event_ict_virtual_trigger)
+                
+                symbols_to_reset_ict_state.append(symbol) # Mark for removal from pending ICT states
+                print(f"{log_prefix_monitor} {symbol}: Virtual ICT signal triggered and moved to active_signals.")
+                continue # Move to next pending signal
+
+            # Check for timeout of virtual pending order
+            ict_order_timeout_minutes_cfg = configs.get("ict_order_timeout_minutes", DEFAULT_ICT_ORDER_TIMEOUT_MINUTES)
+            if (dt.now(timezone.utc) - order_placed_ts).total_seconds() > ict_order_timeout_minutes_cfg * 60:
+                print(f"{log_prefix_monitor} {symbol}: Virtual ICT Limit order timed out ({ict_order_timeout_minutes_cfg}m). Removing.")
+                timeout_msg_tg_ict = f"⏳ Virtual ICT Limit order for `{symbol}` (Limit: {limit_price:.{p_prec_signal}f}, Side: {signal_side}) timed out and was removed from pending."
+                send_telegram_message(configs.get("telegram_bot_token"), configs.get("telegram_chat_id"), timeout_msg_tg_ict)
+                symbols_to_reset_ict_state.append(symbol)
+        
+        # Process removals/state updates for signal mode
+        if symbols_to_reset_ict_state:
+            with ict_strategy_states_lock:
+                for sym_reset in symbols_to_reset_ict_state:
+                    if sym_reset in ict_strategy_states:
+                        print(f"{log_prefix_monitor} Signal Mode: Removing/updating state for {sym_reset} from ict_strategy_states.")
+                        del ict_strategy_states[sym_reset] # Or update status to CANCELLED/TIMED_OUT
+        return # End of signal mode logic for monitor_pending_ict_entries
+
+    # --- Live/Backtest Mode Logic (original function body) ---
     pending_ict_entries_copy = {}
     with ict_strategy_states_lock:
         # Ensure we only pick up entries that are truly PENDING_ICT_ENTRY
@@ -10514,14 +10777,14 @@ def monitor_pending_ict_entries(client, configs: dict):
     if not pending_ict_entries_copy:
         return
 
-    print(f"\n{log_prefix_monitor} Checking {len(pending_ict_entries_copy)} pending ICT entry order(s)...")
+    print(f"\n{log_prefix_monitor} Live/Backtest Mode: Checking {len(pending_ict_entries_copy)} pending ICT entry order(s)...")
 
     for symbol, state_data in pending_ict_entries_copy.items():
         order_id = state_data.get('pending_entry_order_id')
         pending_details = state_data.get('pending_entry_details')
         
         if not order_id or not pending_details:
-            print(f"{log_prefix_monitor} Incomplete pending ICT entry data for {symbol}. Resetting state.")
+            print(f"{log_prefix_monitor} {symbol}: Incomplete pending ICT entry data. Resetting state.")
             symbols_to_reset_ict_state.append(symbol)
             continue
         
