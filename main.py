@@ -121,6 +121,15 @@ DEFAULT_ICT_SWEEP_CLOSE_BACK_WINDOW = 1        # e.g., 1 bar (sweep candle itsel
 PENDING_FIB_ORDERS_CSV = "pending_fib_limit_orders.csv"
 pending_fib_orders = [] 
 pending_fib_orders_lock = threading.Lock()
+
+# Status constants for pending Fibonacci orders
+FIB_ORDER_STATUS_PENDING = 'pending'
+FIB_ORDER_STATUS_TRIGGERED_PENDING_PLACEMENT = 'triggered_pending_placement'
+FIB_ORDER_STATUS_EXECUTED = 'executed'
+FIB_ORDER_STATUS_CANCELLED = 'cancelled'
+FIB_ORDER_STATUS_REJECTED_RSI = 'rejected_rsi'
+FIB_ORDER_STATUS_SIGNALLED = 'signalled' # For signal mode
+FIB_ORDER_STATUS_EXECUTION_FAILED = 'execution_failed'
 # --- End Global State for Pending Fibonacci Limit Orders ---
 
 active_trades = {}
@@ -196,7 +205,7 @@ def load_pending_fib_orders_from_csv():
                         row['timestamp_created'] = pd.Timestamp(row['timestamp_created'])
                         row['swing_low_of_leg'] = float(row['swing_low_of_leg'])
                         row['swing_high_of_leg'] = float(row['swing_high_of_leg'])
-                        if row['status'] == 'pending':
+                        if row['status'] == FIB_ORDER_STATUS_PENDING: # Use constant
                             pending_fib_orders.append(row)
                             loaded_count += 1
                     except Exception as e_row:
@@ -238,7 +247,7 @@ def add_new_pending_fib_order(opportunity_details: dict, configs: dict):
         'symbol': opportunity_details['symbol'],
         'side': opportunity_details['side'],
         'entry_price': opportunity_details['entry_price'],
-        'status': 'pending',
+        'status': FIB_ORDER_STATUS_PENDING, # Use constant
         'timestamp_created': pd.Timestamp.now(timezone.utc),
         'swing_low_of_leg': opportunity_details['swing_low_of_leg'],
         'swing_high_of_leg': opportunity_details['swing_high_of_leg'],
@@ -248,10 +257,10 @@ def add_new_pending_fib_order(opportunity_details: dict, configs: dict):
 
     with pending_fib_orders_lock:
         for existing_order in pending_fib_orders:
-            if existing_order['status'] == 'pending' and \
+            if existing_order['status'] == FIB_ORDER_STATUS_PENDING and \
                existing_order['symbol'] == new_order_data['symbol'] and \
                existing_order['side'] == new_order_data['side'] and \
-               abs(existing_order['entry_price'] - new_order_data['entry_price']) < (0.0001 * new_order_data['entry_price']):
+               abs(existing_order['entry_price'] - new_order_data['entry_price']) < (0.0001 * new_order_data['entry_price']): # Check against pending only
                 print(f"Skipping duplicate new pending Fib order for {new_order_data['symbol']} near {new_order_data['entry_price']:.{p_prec}f}")
                 return None
 
@@ -289,7 +298,7 @@ def update_pending_fib_order_status(order_id: str, new_status: str, reason: str 
                 if reason: 
                     order['notes'] = f"{order.get('notes', '')} | {new_status}: {reason}".strip(" | ")
                 updated = True
-                if new_status not in ['pending']:
+                if new_status not in [FIB_ORDER_STATUS_PENDING]: # Use constant
                     order_removed_from_active_pending = True
                 break
         
@@ -301,7 +310,7 @@ def update_pending_fib_order_status(order_id: str, new_status: str, reason: str 
             save_pending_fib_orders_to_csv()
             # If we want to remove it from the in-memory list immediately when it's no longer pending:
             if order_removed_from_active_pending:
-                 pending_fib_orders = [o for o in pending_fib_orders if o['order_id'] != order_id or o['status'] == 'pending']
+                 pending_fib_orders = [o for o in pending_fib_orders if o['order_id'] != order_id or o['status'] == FIB_ORDER_STATUS_PENDING] # Use constant
 
     if not updated:
         print(f"Warning: Could not find Fib order ID {order_id} to update status to {new_status}.")
@@ -4146,11 +4155,89 @@ def analyze_trend_from_swings(swing_points: list, lookback_swings: int = 4) -> t
     if is_downtrend:
         return "downtrend", last_high, last_low
         
-    return "ranging", last_high, last_low
+    return "ranging", None, None 
 
-def identify_market_trend_fib(df_15m: pd.DataFrame, symbol: str, configs: dict) -> tuple[str, dict | None, dict | None]:
+def determine_trend_and_fib_leg(swing_points: list, lookback_swings: int = 4, symbol_for_logging: str = "") -> tuple[str, dict | None, dict | None]:
     """
-    Identifies the market trend based on 15-minute swing highs/lows for the new Fibonacci strategy.
+    Analyzes a list of alternating swing points to determine the market trend and the specific leg for Fibonacci.
+    Args:
+        swing_points (list): List of alternating swing point dicts {'type', 'price', 'time'}, sorted by time.
+        lookback_swings (int): Number of recent swing points to analyze for trend. Must be >= 4.
+                               e.g., 4 means 2 highs and 2 lows.
+        symbol_for_logging (str): Symbol name for logging purposes.
+    Returns:
+        tuple: (trend_str, leg_start_swing, leg_end_swing)
+               trend_str: "uptrend", "downtrend", "ranging"
+               leg_start_swing: The swing point (dict) where the Fib leg starts (HL for uptrend, LH for downtrend).
+               leg_end_swing: The swing point (dict) where the Fib leg ends (HH for uptrend, LL for downtrend).
+    """
+    log_prefix = f"[{symbol_for_logging} FibLegDet]"
+    if not swing_points or len(swing_points) < lookback_swings or lookback_swings < 4:
+        # print(f"{log_prefix} Not enough swing points ({len(swing_points)}) or invalid lookback ({lookback_swings}). Required >=4.")
+        return "ranging", None, None
+    
+    # We need at least two highs and two lows from the *end* of the swing_points list.
+    # The number of highs/lows to consider depends on lookback_swings.
+    # If lookback_swings = 4, we need the last 2 highs and last 2 lows.
+    
+    recent_swings = swing_points[-(lookback_swings + 2):] # Get a bit more to ensure we can find pairs if last few are same type
+    
+    highs = [s for s in recent_swings if s['type'] == 'high']
+    lows = [s for s in recent_swings if s['type'] == 'low']
+
+    if len(highs) < 2 or len(lows) < 2:
+        # print(f"{log_prefix} Insufficient distinct highs ({len(highs)}) or lows ({len(lows)}) in recent {len(recent_swings)} swings for trend analysis (need at least 2 of each).")
+        return "ranging", None, None
+
+    # Most recent two highs (h1 is latest, h2 is previous)
+    h2, h1 = highs[-2], highs[-1]
+    # Most recent two lows (l1 is latest, l2 is previous)
+    l2, l1 = lows[-2], lows[-1]
+
+    trend = "ranging"
+    leg_start_swing, leg_end_swing = None, None
+
+    # Uptrend Check: Higher Highs (h1 > h2) and Higher Lows (l1 > l2)
+    # Leg for Fib: From last HL (l1) to last HH (h1)
+    # Sequence must be: l2 -> h2 -> l1 -> h1 (simplified, l1 must be after h2, h1 must be after l1)
+    if h1['price'] > h2['price'] and l1['price'] > l2['price']:
+        if h2['time'] < l1['time'] < h1['time']: # l1 (potential HL) formed after h2, and h1 (potential HH) formed after l1
+            # Check if l1 is indeed a "higher low" relative to the start of the h1 move.
+            # The leg is from l1 to h1.
+            trend = "uptrend"
+            leg_start_swing = l1 # Higher Low
+            leg_end_swing = h1   # Higher High
+            print(f"{log_prefix} UPTREND detected. Leg: HL {l1['price']:.4f} @ {l1['time']} to HH {h1['price']:.4f} @ {h1['time']}")
+        # else:
+            # print(f"{log_prefix} Potential uptrend (HH, HL) but swing sequence invalid: h2({h2['time']}) -> l1({l1['time']}) -> h1({h1['time']}).")
+
+
+    # Downtrend Check: Lower Highs (h1 < h2) and Lower Lows (l1 < l2)
+    # Leg for Fib: From last LH (h1) to last LL (l1)
+    # Sequence must be: h2 -> l2 -> h1 -> l1 (simplified, h1 must be after l2, l1 must be after h1)
+    if trend == "ranging" and h1['price'] < h2['price'] and l1['price'] < l2['price']:
+        if l2['time'] < h1['time'] < l1['time']: # h1 (potential LH) formed after l2, and l1 (potential LL) formed after h1
+            trend = "downtrend"
+            leg_start_swing = h1 # Lower High
+            leg_end_swing = l1   # Lower Low
+            print(f"{log_prefix} DOWNTREND detected. Leg: LH {h1['price']:.4f} @ {h1['time']} to LL {l1['price']:.4f} @ {l1['time']}")
+        # else:
+            # print(f"{log_prefix} Potential downtrend (LH, LL) but swing sequence invalid: l2({l2['time']}) -> h1({h1['time']}) -> l1({l1['time']}).")
+            
+    if trend == "ranging":
+        pass
+        # print(f"{log_prefix} Trend is RANGING. HH/HL or LH/LL conditions not met with valid sequence.")
+        # print(f"  Details: H1={h1['price']:.4f} ({h1['time']}), H2={h2['price']:.4f} ({h2['time']})")
+        # print(f"           L1={l1['price']:.4f} ({l1['time']}), L2={l2['price']:.4f} ({l2['time']})")
+
+
+    return trend, leg_start_swing, leg_end_swing
+
+
+def identify_market_trend_fib(df_15m: pd.DataFrame, symbol: str, configs: dict) -> tuple[str, float | None, float | None, pd.Timestamp | None, pd.Timestamp | None]:
+    """
+    Identifies the market trend and the specific leg for Fibonacci retracement
+    based on 15-minute swing highs/lows for the new Fibonacci strategy.
 
     Args:
         df_15m (pd.DataFrame): DataFrame of 15-minute klines ('high', 'low', 'volume', 'close').
@@ -4158,47 +4245,61 @@ def identify_market_trend_fib(df_15m: pd.DataFrame, symbol: str, configs: dict) 
         configs (dict): Bot configuration.
 
     Returns:
-        tuple: (trend, last_swing_high, last_swing_low)
+        tuple: (trend, leg_start_price, leg_end_price, leg_start_time, leg_end_time)
                trend (str): "uptrend", "downtrend", or "ranging".
-               last_swing_high (dict): {'price', 'time'} of the last confirmed swing high or None.
-               last_swing_low (dict): {'price', 'time'} of the last confirmed swing low or None.
+               leg_start_price (float | None): Price of the swing point where the Fib leg starts.
+               leg_end_price (float | None): Price of the swing point where the Fib leg ends.
+               leg_start_time (pd.Timestamp | None): Time of the leg's start swing.
+               leg_end_time (pd.Timestamp | None): Time of the leg's end swing.
     """
     log_prefix = f"[{symbol} FibTrendID]"
     
-    pivot_n_left_15m = configs.get("fib_trend_pivot_n_left", 3) 
-    pivot_n_right_15m = configs.get("fib_trend_pivot_n_right", 3)
-    trend_lookback_swings = configs.get("fib_trend_lookback_swings", 4) 
+    pivot_n_left_15m = configs.get("fib_trend_pivot_n_left", DEFAULT_FIB_TREND_PIVOT_N_LEFT) 
+    pivot_n_right_15m = configs.get("fib_trend_pivot_n_right", DEFAULT_FIB_TREND_PIVOT_N_RIGHT)
+    trend_lookback_swings = configs.get("fib_trend_lookback_swings", DEFAULT_FIB_TREND_LOOKBACK_SWINGS) 
 
-    min_data_len = pivot_n_left_15m + pivot_n_right_15m + trend_lookback_swings + 5 # Adjusted min length
+    min_data_len = pivot_n_left_15m + pivot_n_right_15m + trend_lookback_swings + 5 
     if df_15m.empty or len(df_15m) < min_data_len: 
-        print(f"{log_prefix} Insufficient 15m data ({len(df_15m)}, need {min_data_len}) for trend ID.")
-        return "ranging", None, None
+        # print(f"{log_prefix} Insufficient 15m data ({len(df_15m)}, need {min_data_len}) for trend ID.")
+        return "ranging", None, None, None, None
 
     all_swings = get_swing_points(df_15m, n_left=pivot_n_left_15m, n_right=pivot_n_right_15m)
     
-    if not all_swings or len(all_swings) < trend_lookback_swings :
-        print(f"{log_prefix} Not enough swing points ({len(all_swings)}) identified (need {trend_lookback_swings}).")
-        last_h = next((s for s in reversed(all_swings) if s['type'] == 'high'), None)
-        last_l = next((s for s in reversed(all_swings) if s['type'] == 'low'), None)
-        return "ranging", last_h, last_l
+    if not all_swings or len(all_swings) < trend_lookback_swings:
+        # print(f"{log_prefix} Not enough swing points ({len(all_swings)}) identified (need {trend_lookback_swings}).")
+        return "ranging", None, None, None, None
 
-    trend, last_confirmed_high, last_confirmed_low = analyze_trend_from_swings(all_swings, lookback_swings=trend_lookback_swings)
+    trend, leg_start_swing, leg_end_swing = determine_trend_and_fib_leg(all_swings, lookback_swings=trend_lookback_swings, symbol_for_logging=symbol)
     
-    lh_price_str = f"{last_confirmed_high['price']:.{configs.get('price_precision_default', 2)}f}" if last_confirmed_high else "N/A"
-    ll_price_str = f"{last_confirmed_low['price']:.{configs.get('price_precision_default', 2)}f}" if last_confirmed_low else "N/A"
-    lh_time_str = str(last_confirmed_high['time']) if last_confirmed_high else "N/A"
-    ll_time_str = str(last_confirmed_low['time']) if last_confirmed_low else "N/A"
+    leg_start_price, leg_end_price = None, None
+    leg_start_time, leg_end_time = None, None
 
-    print(f"{log_prefix} Trend: {trend.upper()}. Last High: {lh_price_str} at {lh_time_str}. Last Low: {ll_price_str} at {ll_time_str}")
+    if leg_start_swing and leg_end_swing:
+        leg_start_price = leg_start_swing['price']
+        leg_end_price = leg_end_swing['price']
+        leg_start_time = leg_start_swing['time']
+        leg_end_time = leg_end_swing['time']
+        
+        p_prec = configs.get(f"{symbol}_price_precision", configs.get("price_precision_default", 2))
+        if not isinstance(p_prec, int): p_prec = 2
+        
+        start_swing_type = leg_start_swing.get('type','N/A').upper()
+        end_swing_type = leg_end_swing.get('type','N/A').upper()
 
-    return trend, last_confirmed_high, last_confirmed_low
+        print(f"{log_prefix} Final Trend: {trend.upper()}. Leg from {start_swing_type} {leg_start_price:.{p_prec}f} @ {leg_start_time} "
+              f"to {end_swing_type} {leg_end_price:.{p_prec}f} @ {leg_end_time}")
+    # else:
+        # print(f"{log_prefix} Final Trend: {trend.upper()}. No valid leg identified for Fibonacci.")
+
+
+    return trend, leg_start_price, leg_end_price, leg_start_time, leg_end_time
 
 # --- End Trend Identification Functions ---
 
 # --- Fibonacci Retracement Opportunity Finding (New Fibonacci Strategy) ---
 def find_fib_retracement_opportunities(df_15m: pd.DataFrame, symbol: str, configs: dict) -> list:
     """
-    Identifies potential Fibonacci retracement trading opportunities based on the current trend.
+    Identifies potential Fibonacci retracement trading opportunities based on the current trend and defined leg.
 
     Args:
         df_15m (pd.DataFrame): DataFrame of 15-minute klines.
@@ -4216,68 +4317,58 @@ def find_fib_retracement_opportunities(df_15m: pd.DataFrame, symbol: str, config
     log_prefix = f"[{symbol} FibOppFind]"
     opportunities = []
 
-    # 1. Identify Market Trend and Key Swings
-    trend, last_swing_high, last_swing_low = identify_market_trend_fib(df_15m, symbol, configs)
+    # 1. Identify Market Trend and the Specific Leg for Fibonacci
+    trend, leg_start_price, leg_end_price, leg_start_time, leg_end_time = identify_market_trend_fib(df_15m, symbol, configs)
 
-    if trend == "ranging" or not last_swing_high or not last_swing_low:
-        # print(f"{log_prefix} Trend is ranging or key swings missing. No Fib opportunity.")
+    if trend == "ranging" or leg_start_price is None or leg_end_price is None:
+        # print(f"{log_prefix} Trend is ranging or leg undefined. No Fib opportunity.")
         return opportunities
 
     current_price = df_15m['close'].iloc[-1]
-    # Attempt to get specific price precision for the symbol, otherwise use a default
-    symbol_specific_price_precision_key = f"{symbol}_price_precision" # e.g. BTCUSDT_price_precision
-    p_prec = configs.get(symbol_specific_price_precision_key, configs.get("price_precision_default", 2))
-    if not isinstance(p_prec, int): # Fallback if config value is not int
-        p_prec = 2
-        # print(f"{log_prefix} Warning: Could not get valid integer price_precision for {symbol}. Defaulting to {p_prec}.")
-
-
-    leg_start_price = None
-    leg_end_price = None
+    p_prec = configs.get(f"{symbol}_price_precision", configs.get("price_precision_default", 2))
+    if not isinstance(p_prec, int): p_prec = 2
+    
     trade_side = None
+    # For Fibonacci calculation, we always need high_price_of_leg and low_price_of_leg
+    # The leg_start_price and leg_end_price from determine_trend_and_fib_leg define the move.
+    # If uptrend: leg is HL (start) to HH (end). So low_price_of_leg = leg_start_price, high_price_of_leg = leg_end_price.
+    # If downtrend: leg is LH (start) to LL (end). So high_price_of_leg = leg_start_price, low_price_of_leg = leg_end_price.
+    
+    high_price_of_leg = 0
+    low_price_of_leg = 0
 
     if trend == "uptrend":
-        if last_swing_low['time'] < last_swing_high['time']:
-            leg_start_price = last_swing_low['price'] 
-            leg_end_price = last_swing_high['price']  
-            trade_side = "long"
-            print(f"{log_prefix} Uptrend. Bullish leg: Low {leg_start_price:.{p_prec}f} ({last_swing_low['time']}) to High {leg_end_price:.{p_prec}f} ({last_swing_high['time']}).")
-        else:
-            print(f"{log_prefix} Uptrend, but swing sequence (L:{last_swing_low['time']}, H:{last_swing_high['time']}) not ideal. Skipping.")
-            return opportunities
-
+        trade_side = "long"
+        low_price_of_leg = leg_start_price  # This was HL
+        high_price_of_leg = leg_end_price # This was HH
+        print(f"{log_prefix} Uptrend. Bullish leg for Fib: Low {low_price_of_leg:.{p_prec}f} to High {high_price_of_leg:.{p_prec}f}.")
     elif trend == "downtrend":
-        if last_swing_high['time'] < last_swing_low['time']:
-            # For a downtrend, the leg is from LH to LL.
-            # calculate_fibonacci_retracement_levels expects (high, low, "short")
-            # So, high is LH (last_swing_high['price']), low is LL (last_swing_low['price'])
-            leg_start_price = last_swing_low['price']  # This is the LL
-            leg_end_price = last_swing_high['price'] # This is the LH
-            trade_side = "short"
-            print(f"{log_prefix} Downtrend. Bearish leg: High {leg_end_price:.{p_prec}f} ({last_swing_high['time']}) to Low {leg_start_price:.{p_prec}f} ({last_swing_low['time']}).")
-        else:
-            print(f"{log_prefix} Downtrend, but swing sequence (H:{last_swing_high['time']}, L:{last_swing_low['time']}) not ideal. Skipping.")
-            return opportunities
-            
-    if leg_start_price is None or leg_end_price is None or trade_side is None:
-        print(f"{log_prefix} Could not define valid leg. Trend: {trend}")
+        trade_side = "short"
+        high_price_of_leg = leg_start_price # This was LH
+        low_price_of_leg = leg_end_price  # This was LL
+        print(f"{log_prefix} Downtrend. Bearish leg for Fib: High {high_price_of_leg:.{p_prec}f} to Low {low_price_of_leg:.{p_prec}f}.")
+    else: # Should not happen if first check passed
+        print(f"{log_prefix} Undefined trend '{trend}' for leg definition.")
         return opportunities
 
-    actual_swing_low_for_fib = min(leg_start_price, leg_end_price)
-    actual_swing_high_for_fib = max(leg_start_price, leg_end_price)
-
-    if actual_swing_high_for_fib == actual_swing_low_for_fib:
-        print(f"{log_prefix} Swing high and low for Fib leg are identical ({actual_swing_high_for_fib:.{p_prec}f}).")
+    if high_price_of_leg == low_price_of_leg:
+        print(f"{log_prefix} Swing high and low for Fib leg are identical ({high_price_of_leg:.{p_prec}f}).")
         return opportunities
+
+    # Ensure high_price_of_leg is indeed greater than low_price_of_leg for calculate_fibonacci_retracement_levels
+    if high_price_of_leg < low_price_of_leg:
+        print(f"{log_prefix} Error: high_price_of_leg ({high_price_of_leg}) < low_price_of_leg ({low_price_of_leg}). This shouldn't happen.")
+        # Swap them as a fallback, but this indicates an issue in leg determination logic
+        high_price_of_leg, low_price_of_leg = low_price_of_leg, high_price_of_leg
 
     fib_levels = calculate_fibonacci_retracement_levels(
-        swing_high_price=actual_swing_high_for_fib,
-        swing_low_price=actual_swing_low_for_fib,
+        swing_high_price=high_price_of_leg,
+        swing_low_price=low_price_of_leg,
         direction=trade_side 
     )
 
     if not fib_levels:
-        print(f"{log_prefix} Failed to calculate Fib levels for leg: {actual_swing_low_for_fib} - {actual_swing_high_for_fib}, side: {trade_side}")
+        print(f"{log_prefix} Failed to calculate Fib levels for leg: {low_price_of_leg} - {high_price_of_leg}, side: {trade_side}")
         return opportunities
     
     golden_zone_lower = fib_levels['zone_lower']
@@ -4285,47 +4376,60 @@ def find_fib_retracement_opportunities(df_15m: pd.DataFrame, symbol: str, config
     
     target_entry_price = round((golden_zone_lower + golden_zone_upper) / 2.0, p_prec)
 
-    print(f"{log_prefix} Side: {trade_side.upper()}. Leg: {actual_swing_low_for_fib:.{p_prec}f}-{actual_swing_high_for_fib:.{p_prec}f}.")
-    print(f"{log_prefix} Golden Zone: [{golden_zone_lower:.{p_prec}f}-{golden_zone_upper:.{p_prec}f}]. Target Entry: {target_entry_price:.{p_prec}f}. Current: {current_price:.{p_prec}f}")
+    print(f"{log_prefix} Side: {trade_side.upper()}. Leg used for Fib: {low_price_of_leg:.{p_prec}f}-{high_price_of_leg:.{p_prec}f}.")
+    print(f"{log_prefix} Golden Zone: [{golden_zone_lower:.{p_prec}f}-{golden_zone_upper:.{p_prec}f}]. Target Entry: {target_entry_price:.{p_prec}f}. Current Mkt Price: {current_price:.{p_prec}f}")
+
+    # Validation: Ensure the target entry price makes sense for a pullback.
+    # For a long, entry should be below the high of the leg (high_price_of_leg) and above the low of the leg (low_price_of_leg).
+    # For a short, entry should be above the low of the leg (low_price_of_leg) and below the high of the leg (high_price_of_leg).
+    # The golden zone calculation should inherently place it within the leg.
+    # We also need to ensure current price hasn't already invalidated the setup (e.g., moved beyond the leg's start).
 
     is_opportunity_valid = False
-    if trade_side == "long":
-        if current_price < actual_swing_low_for_fib: 
-            print(f"{log_prefix} Long opp invalidated: Price ({current_price:.{p_prec}f}) < leg start ({actual_swing_low_for_fib:.{p_prec}f}).")
-        elif target_entry_price >= actual_swing_high_for_fib: 
-            print(f"{log_prefix} Long opp invalidated: Entry ({target_entry_price:.{p_prec}f}) not pullback from leg high ({actual_swing_high_for_fib:.{p_prec}f}).")
-        elif target_entry_price <= actual_swing_low_for_fib: # Entry should be above the start of the leg
-             print(f"{log_prefix} Long opp invalidated: Entry ({target_entry_price:.{p_prec}f}) is below or at leg start ({actual_swing_low_for_fib:.{p_prec}f}).")
+    if trade_side == "long": # Expecting pullback to buy
+        # Current price should ideally be above or near the golden zone, but not below the start of the leg (low_price_of_leg).
+        if current_price < low_price_of_leg: 
+            print(f"{log_prefix} Long opp invalidated: Current price ({current_price:.{p_prec}f}) already broke below leg's low ({low_price_of_leg:.{p_prec}f}).")
+        # Entry must be a pullback, i.e., below the high_price_of_leg (HH)
+        elif target_entry_price >= high_price_of_leg:
+            print(f"{log_prefix} Long opp invalidated: Target entry ({target_entry_price:.{p_prec}f}) is not a pullback from leg high ({high_price_of_leg:.{p_prec}f}).")
+        # Entry must be above the low_price_of_leg (HL)
+        elif target_entry_price <= low_price_of_leg:
+             print(f"{log_prefix} Long opp invalidated: Target entry ({target_entry_price:.{p_prec}f}) is at or below leg low ({low_price_of_leg:.{p_prec}f}).")
         else:
             is_opportunity_valid = True
             
-    elif trade_side == "short":
-        if current_price > actual_swing_high_for_fib: 
-            print(f"{log_prefix} Short opp invalidated: Price ({current_price:.{p_prec}f}) > leg start ({actual_swing_high_for_fib:.{p_prec}f}).")
-        elif target_entry_price <= actual_swing_low_for_fib: 
-            print(f"{log_prefix} Short opp invalidated: Entry ({target_entry_price:.{p_prec}f}) not pullback from leg low ({actual_swing_low_for_fib:.{p_prec}f}).")
-        elif target_entry_price >= actual_swing_high_for_fib: # Entry should be below the start of the leg
-             print(f"{log_prefix} Short opp invalidated: Entry ({target_entry_price:.{p_prec}f}) is above or at leg start ({actual_swing_high_for_fib:.{p_prec}f}).")
+    elif trade_side == "short": # Expecting pullback to sell
+        if current_price > high_price_of_leg: 
+            print(f"{log_prefix} Short opp invalidated: Current price ({current_price:.{p_prec}f}) already broke above leg's high ({high_price_of_leg:.{p_prec}f}).")
+        # Entry must be a pullback, i.e., above the low_price_of_leg (LL)
+        elif target_entry_price <= low_price_of_leg:
+            print(f"{log_prefix} Short opp invalidated: Target entry ({target_entry_price:.{p_prec}f}) is not a pullback from leg low ({low_price_of_leg:.{p_prec}f}).")
+        # Entry must be below the high_price_of_leg (LH)
+        elif target_entry_price >= high_price_of_leg:
+             print(f"{log_prefix} Short opp invalidated: Target entry ({target_entry_price:.{p_prec}f}) is at or above leg high ({high_price_of_leg:.{p_prec}f}).")
         else:
             is_opportunity_valid = True
 
     if is_opportunity_valid:
-        trend_time = df_15m.index[-1]
+        trend_time = df_15m.index[-1] # Timestamp of the current 15m candle
         opportunity_details = {
             'symbol': symbol,
             'side': trade_side,
             'entry_price': target_entry_price,
-            'swing_low_of_leg': actual_swing_low_for_fib, 
-            'swing_high_of_leg': actual_swing_high_for_fib,
+            'swing_low_of_leg': low_price_of_leg, # This is the actual low of the leg used for Fib
+            'swing_high_of_leg': high_price_of_leg, # This is the actual high of the leg used for Fib
             'trend_identified': trend,
-            'trend_determination_time': trend_time,
+            'trend_determination_time': trend_time, # Time of current 15m candle when opp was found
             'golden_zone_low': golden_zone_lower,
-            'golden_zone_high': golden_zone_upper
+            'golden_zone_high': golden_zone_upper,
+            'leg_start_time_actual': leg_start_time, # Actual time of the swing that started the leg
+            'leg_end_time_actual': leg_end_time     # Actual time of the swing that ended the leg
         }
         opportunities.append(opportunity_details)
-        print(f"{log_prefix} Potential Fib {trade_side.upper()} opportunity found. Entry: {target_entry_price:.{p_prec}f}")
-    else:
-        print(f"{log_prefix} No valid Fib opportunity for {trade_side if trade_side else 'N/A'} setup after validation.")
+        print(f"{log_prefix} Potential Fib {trade_side.upper()} opportunity found. Target Entry: {target_entry_price:.{p_prec}f}")
+    # else:
+        # print(f"{log_prefix} No valid Fib opportunity for {trade_side if trade_side else 'N/A'} setup after validation checks.")
         
     return opportunities
 
@@ -9946,7 +10050,7 @@ def monitor_pending_fib_limit_orders(client, configs):
     
     orders_to_check = []
     with pending_fib_orders_lock:
-        orders_to_check = [order for order in pending_fib_orders if order.get('status') == 'pending']
+        orders_to_check = [order for order in pending_fib_orders if order.get('status') == FIB_ORDER_STATUS_PENDING] # Use constant
 
     if not orders_to_check:
         return
@@ -9988,7 +10092,7 @@ def monitor_pending_fib_limit_orders(client, configs):
 
         if invalidation_reason:
             print(f"{log_prefix} Order invalidated. Reason: {invalidation_reason}")
-            update_pending_fib_order_status(order['order_id'], 'cancelled', invalidation_reason)
+            update_pending_fib_order_status(order['order_id'], FIB_ORDER_STATUS_CANCELLED, invalidation_reason) # Use constant
             if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
                 message = (
                     f"❌ *Fib Limit Order Removed (Trend Invalidated)*\n\n"
@@ -10030,14 +10134,14 @@ def monitor_pending_fib_limit_orders(client, configs):
             
             if rsi_condition_met:
                 print(f"{log_prefix} RSI condition MET. Preparing for execution.")
-                update_pending_fib_order_status(order['order_id'], 'triggered', f"RSI OK ({current_rsi_value:.2f}).")
+                update_pending_fib_order_status(order['order_id'], FIB_ORDER_STATUS_TRIGGERED_PENDING_PLACEMENT, f"RSI OK ({current_rsi_value:.2f}). Awaiting execution.") # Use constant
                 # Actual execution call will be here, e.g., execute_triggered_fib_order(...)
                 # This function (execute_triggered_fib_order) will be implemented in the next step.
                 # For now, it's a placeholder to indicate where it fits.
                 execute_triggered_fib_order(client, configs, order, current_market_price, df_15m_latest) 
             else: 
                 print(f"{log_prefix} RSI condition NOT MET. {rejection_reason_rsi}. Rejecting.")
-                update_pending_fib_order_status(order['order_id'], 'rejected_rsi', rejection_reason_rsi)
+                update_pending_fib_order_status(order['order_id'], FIB_ORDER_STATUS_REJECTED_RSI, rejection_reason_rsi) # Use constant
                 if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
                     message = (
                         f"⚠️ *Fib Trade REJECTED (RSI Filter)*\n\n"
@@ -10071,7 +10175,7 @@ def execute_triggered_fib_order(client, configs, triggered_order_details: dict, 
     s_info = get_symbol_info(client, symbol)
     if not s_info:
         print(f"{log_prefix} Failed to get symbol_info. Cannot execute trade.")
-        update_pending_fib_order_status(triggered_order_details['order_id'], 'execution_failed', "Failed to get symbol_info")
+        update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_EXECUTION_FAILED, "Failed to get symbol_info") # Use constant
         return
 
     p_prec = int(s_info['pricePrecision'])
@@ -10101,7 +10205,7 @@ def execute_triggered_fib_order(client, configs, triggered_order_details: dict, 
     fib_extensions = calculate_fibonacci_extension_levels(leg_swing_high, leg_swing_low, effective_entry_price, side)
     if not fib_extensions:
         print(f"{log_prefix} Failed to calculate Fibonacci extension levels.")
-        update_pending_fib_order_status(triggered_order_details['order_id'], 'execution_failed', "Fibonacci extension calculation failed")
+        update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_EXECUTION_FAILED, "Fibonacci extension calculation failed") # Use constant
         return
 
     tp1_price = round(fib_extensions['ext_0_0'], p_prec) 
@@ -10114,27 +10218,27 @@ def execute_triggered_fib_order(client, configs, triggered_order_details: dict, 
        (side == "short" and (sl_price <= effective_entry_price or tp1_price >= effective_entry_price)):
         reason = f"Invalid SL/TP. Entry:{effective_entry_price}, SL:{sl_price}, TP1:{tp1_price}"
         print(f"{log_prefix} {reason}")
-        update_pending_fib_order_status(triggered_order_details['order_id'], 'execution_failed', reason)
+        update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_EXECUTION_FAILED, reason) # Use constant
         return
 
     acc_bal = get_account_balance(client, configs)
     if acc_bal is None or acc_bal <= 0:
         reason = f"Invalid balance ({acc_bal})."
         print(f"{log_prefix} {reason}")
-        update_pending_fib_order_status(triggered_order_details['order_id'], 'execution_failed', reason)
+        update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_EXECUTION_FAILED, reason) # Use constant
         return
 
-    if abs(effective_entry_price - sl_price) < (1 / (10**p_prec)):
-        reason = f"SL ({sl_price}) too close to entry ({effective_entry_price})."
+    if abs(effective_entry_price - sl_price) < (1 / (10**p_prec)): # Check if SL is too close to entry
+        reason = f"SL ({sl_price}) too close to entry ({effective_entry_price}). Risk calculation may be invalid."
         print(f"{log_prefix} {reason}")
-        update_pending_fib_order_status(triggered_order_details['order_id'], 'execution_failed', reason)
+        update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_EXECUTION_FAILED, reason) # Use constant
         return
 
     total_quantity_to_order = calculate_position_size(acc_bal, configs['risk_percent'], effective_entry_price, sl_price, s_info, configs)
     if total_quantity_to_order is None or total_quantity_to_order <= 0:
         reason = f"Invalid position size ({total_quantity_to_order})."
         print(f"{log_prefix} {reason}")
-        update_pending_fib_order_status(triggered_order_details['order_id'], 'execution_failed', reason)
+        update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_EXECUTION_FAILED, reason) # Use constant
         return
     
     print(f"{log_prefix} Total quantity: {total_quantity_to_order:.{q_prec}f}")
@@ -10148,16 +10252,50 @@ def execute_triggered_fib_order(client, configs, triggered_order_details: dict, 
     if not sanity_passed:
         reason = f"Sanity checks FAILED: {sanity_reason}"
         print(f"{log_prefix} {reason}")
-        update_pending_fib_order_status(triggered_order_details['order_id'], 'execution_failed', reason)
+        update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_EXECUTION_FAILED, reason) # Use constant
         send_trade_rejection_notification(symbol, f"FIB_{side.upper()}", reason, effective_entry_price, sl_price, tp1_price, total_quantity_to_order, s_info, configs)
         return
     print(f"{log_prefix} Sanity checks PASSED.")
 
+    # Signal Mode Handling
+    if configs['mode'] == 'signal':
+        print(f"{log_prefix} Signal Mode: Preparing Telegram signal for Fib {symbol} {side.upper()}.")
+        # Calculate P&L estimations for $100 capital
+        est_pnl_tp1_fib_signal = calculate_pnl_for_fixed_capital(effective_entry_price, tp1_price, side.upper(), leverage_to_use, 100.0, s_info)
+        est_pnl_sl_fib_signal = calculate_pnl_for_fixed_capital(effective_entry_price, sl_price, side.upper(), leverage_to_use, 100.0, s_info)
+
+        send_entry_signal_telegram(
+            configs=configs, symbol=symbol, signal_type_display=f"FIB_SIGNAL_{side.upper()}",
+            leverage=leverage_to_use, entry_price=effective_entry_price,
+            tp1_price=tp1_price, tp2_price=tp2_price, tp3_price=initial_tp3_target_price, sl_price=sl_price,
+            risk_percentage_config=configs['risk_percent'], 
+            est_pnl_tp1=est_pnl_tp1_fib_signal, est_pnl_sl=est_pnl_sl_fib_signal,
+            symbol_info=s_info, strategy_name_display="AdvFib Retracement Signal",
+            signal_timestamp=df_15m_for_atr.index[-1], # Timestamp of the current 15m candle
+            signal_order_type="MARKET" # Simulating market execution after trigger
+        )
+        
+        update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_SIGNALLED, f"Signal generated for {symbol} {side.upper()}.") # Use constant
+        
+        # Log signal event to CSV
+        log_event_fib_signal = {
+            "SignalID": triggered_order_details['order_id'], # Use bot's internal order ID as SignalID
+            "Symbol": symbol, "Strategy": "AdvFib_Retracement_Signal", "Side": side.upper(),
+            "Leverage": leverage_to_use, "SignalOpenPrice": effective_entry_price,
+            "EventType": "NEW_FIB_SIGNAL", "EventPrice": effective_entry_price,
+            "Notes": f"SL:{sl_price:.{p_prec}f}, TP1:{tp1_price:.{p_prec}f}, TP2:{tp2_price:.{p_prec}f}, InitTP3:{initial_tp3_target_price:.{p_prec}f}",
+            "EstimatedPNL_USD100": est_pnl_tp1_fib_signal 
+        }
+        log_signal_event_to_csv(log_event_fib_signal)
+        print(f"{log_prefix} Signal Mode: Fib signal for {symbol} processed and logged.")
+        return # End processing for signal mode
+
+    # Live Mode Execution (continues if not in signal mode)
     if not (set_leverage_on_symbol(client, symbol, leverage_to_use) and \
             set_margin_type_on_symbol(client, symbol, configs['margin_type'], configs)):
         reason = f"Failed to set leverage/margin for {symbol}."
         print(f"{log_prefix} {reason}")
-        update_pending_fib_order_status(triggered_order_details['order_id'], 'execution_failed', reason)
+        update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_EXECUTION_FAILED, reason) # Use constant
         send_trade_rejection_notification(symbol, f"FIB_{side.upper()}", reason, effective_entry_price, sl_price, tp1_price, total_quantity_to_order, s_info, configs)
         return
 
@@ -10172,7 +10310,7 @@ def execute_triggered_fib_order(client, configs, triggered_order_details: dict, 
     if not entry_market_order or entry_market_order.get('status') != 'FILLED':
         reason = f"Market entry failed. Status: {entry_market_order.get('status') if entry_market_order else 'N/A'}. Err: {entry_error_msg}"
         print(f"{log_prefix} {reason}")
-        update_pending_fib_order_status(triggered_order_details['order_id'], 'execution_failed', reason)
+        update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_EXECUTION_FAILED, reason) # Use constant
         send_trade_rejection_notification(symbol, f"FIB_{side.upper()}", reason, effective_entry_price, sl_price, tp1_price, total_quantity_to_order, s_info, configs)
         return
 
@@ -10180,30 +10318,102 @@ def execute_triggered_fib_order(client, configs, triggered_order_details: dict, 
     actual_filled_quantity = float(entry_market_order['executedQty']) 
     print(f"{log_prefix} Market entry FILLED. Entry: {actual_filled_entry_price:.{p_prec}f}, Qty: {actual_filled_quantity:.{q_prec}f}")
 
-    qty_tp1 = round(actual_filled_quantity * 0.50, q_prec)
-    qty_tp2 = round(actual_filled_quantity * 0.40, q_prec)
-    
-    min_qty_val = float(s_info.get('filters', [{}])[0].get('minQty', '0.001')) # Simplified
-    if qty_tp1 > 0 and qty_tp1 < min_qty_val : qty_tp1 = min_qty_val
-    if qty_tp2 > 0 and qty_tp2 < min_qty_val : qty_tp2 = min_qty_val
-    
-    if (qty_tp1 + qty_tp2) > actual_filled_quantity:
-        if qty_tp1 >= actual_filled_quantity: 
-            qty_tp1 = actual_filled_quantity; qty_tp2 = 0
-        else: 
-            qty_tp2 = round(actual_filled_quantity - qty_tp1, q_prec)
-            if qty_tp2 < 0: qty_tp2 = 0
-    
+    # --- TP Quantity Distribution (50%, 40%, 10%) ---
+    qty_tp1_pct = 0.50  # 50% for TP1
+    qty_tp2_pct = 0.40  # 40% for TP2
+    # qty_tp3_pct is the remainder (10%)
+
+    # Initial calculation based on percentages
+    qty_tp1 = round(actual_filled_quantity * qty_tp1_pct, q_prec)
+    qty_tp2 = round(actual_filled_quantity * qty_tp2_pct, q_prec)
+
+    min_qty_val = float(s_info.get('filters', [{}])[0].get('minQty', '0.001')) 
+
+    # Step 1: Ensure TP1 and TP2 meet min_qty if their percentages were non-zero
+    # And that they don't individually exceed actual_filled_quantity due to min_qty enforcement.
+    if qty_tp1_pct > 0 and qty_tp1 < min_qty_val and actual_filled_quantity >= min_qty_val:
+        qty_tp1 = min_qty_val
+    qty_tp1 = min(qty_tp1, actual_filled_quantity) # Cap TP1 at total quantity
+
+    if qty_tp2_pct > 0 and qty_tp2 < min_qty_val and actual_filled_quantity >= min_qty_val :
+        qty_tp2 = min_qty_val
+    # Cap TP2 at remaining quantity after TP1
+    qty_tp2 = min(qty_tp2, round(actual_filled_quantity - qty_tp1, q_prec)) 
+    if qty_tp2 < 0: qty_tp2 = 0.0
+
+
+    # Step 2: Calculate TP3 as the remainder
     qty_tp3 = round(actual_filled_quantity - qty_tp1 - qty_tp2, q_prec)
-    if qty_tp3 < 0: qty_tp3 = 0
-    if qty_tp3 > 0 and qty_tp3 < min_qty_val: 
-        if qty_tp2 > 0: qty_tp2 = round(qty_tp2 + qty_tp3, q_prec)
-        elif qty_tp1 > 0: qty_tp1 = round(qty_tp1 + qty_tp3, q_prec)
-        qty_tp3 = 0 
+    if qty_tp3 < 0: qty_tp3 = 0.0 # Safety
 
-    print(f"{log_prefix} TP Qtys: TP1={qty_tp1}, TP2={qty_tp2}, TP3={qty_tp3}")
+    # Step 3: Handle TP3 dust. If TP3 is dust, try to add to TP2, then TP1.
+    if qty_tp3 > 0 and qty_tp3 < min_qty_val:
+        print(f"{log_prefix} TP3 quantity ({qty_tp3}) is dust. Attempting to reallocate.")
+        # Try adding to TP2 first, if TP2 has capacity (i.e., TP1+TP2+TP3_dust <= total)
+        if qty_tp2_pct > 0 : # If TP2 was intended to have quantity
+            potential_tp2_plus_dust = round(qty_tp2 + qty_tp3, q_prec)
+            if round(qty_tp1 + potential_tp2_plus_dust, q_prec) <= actual_filled_quantity:
+                qty_tp2 = potential_tp2_plus_dust
+                print(f"{log_prefix} Reallocated TP3 dust to TP2. New TP2 Qty: {qty_tp2}")
+                qty_tp3 = 0.0
+            # Else, if adding to TP2 makes it too large, try adding to TP1
+            elif qty_tp1_pct > 0 : # If TP1 was intended to have quantity
+                potential_tp1_plus_dust = round(qty_tp1 + qty_tp3, q_prec)
+                if round(potential_tp1_plus_dust + qty_tp2, q_prec) <= actual_filled_quantity: # Check sum with original qty_tp2
+                    qty_tp1 = potential_tp1_plus_dust
+                    print(f"{log_prefix} Reallocated TP3 dust to TP1 (TP2 was full). New TP1 Qty: {qty_tp1}")
+                    qty_tp3 = 0.0
+                else:
+                    print(f"{log_prefix} Could not reallocate TP3 dust to TP1 or TP2 without exceeding total. TP3 remains dust or zero.")
+                    # If TP3 is still > 0 here, it means it's dust and couldn't be reallocated.
+                    # Set it to 0 if it's below min_qty and couldn't be reallocated.
+                    if qty_tp3 < min_qty_val: qty_tp3 = 0.0
+        elif qty_tp1_pct > 0 : # If TP2 was not intended, try adding dust to TP1
+            potential_tp1_plus_dust = round(qty_tp1 + qty_tp3, q_prec)
+            if potential_tp1_plus_dust <= actual_filled_quantity: # TP2 is 0 here
+                 qty_tp1 = potential_tp1_plus_dust
+                 print(f"{log_prefix} Reallocated TP3 dust to TP1 (TP2 was zero). New TP1 Qty: {qty_tp1}")
+                 qty_tp3 = 0.0
+            else:
+                print(f"{log_prefix} Could not reallocate TP3 dust to TP1. TP3 remains dust or zero.")
+                if qty_tp3 < min_qty_val: qty_tp3 = 0.0
+        else: # TP1 and TP2 were not intended (e.g. 100% on TP3 initially - not our case but defensive)
+            if qty_tp3 < min_qty_val: qty_tp3 = 0.0 # TP3 becomes 0 if it's dust and no other TPs to allocate to
 
-    sl_order_obj, tp1_order_obj, tp2_order_obj = None, None, None
+    # Step 4: Final sum validation and adjustment if necessary
+    # This step ensures the sum of TP quantities equals the total filled quantity.
+    # It prioritizes TP1, then TP2, then TP3.
+    current_sum_tps = round(qty_tp1 + qty_tp2 + qty_tp3, q_prec)
+    if abs(current_sum_tps - actual_filled_quantity) > (1 / (10**(q_prec+1))): # If sum is off by more than rounding dust
+        print(f"{log_prefix} Adjusting sum of TP quantities. Current Sum: {current_sum_tps}, Target: {actual_filled_quantity}")
+        # Recalculate ensuring caps and order
+        qty_tp1 = min(qty_tp1, actual_filled_quantity)
+        qty_tp2 = min(qty_tp2, round(actual_filled_quantity - qty_tp1, q_prec))
+        if qty_tp2 < 0: qty_tp2 = 0.0
+        qty_tp3 = round(actual_filled_quantity - qty_tp1 - qty_tp2, q_prec)
+        if qty_tp3 < 0: qty_tp3 = 0.0
+        
+        # If TP3 is now dust again after this adjustment, and it wasn't zero before, try to add to TP2/TP1
+        if 0 < qty_tp3 < min_qty_val:
+            print(f"{log_prefix} TP3 became dust ({qty_tp3}) after sum adjustment. Reallocating again.")
+            if qty_tp2 > 0 : qty_tp2 = round(qty_tp2 + qty_tp3, q_prec)
+            elif qty_tp1 > 0 : qty_tp1 = round(qty_tp1 + qty_tp3, q_prec)
+            else: # This case means qty_tp1 and qty_tp2 were 0, so qty_tp3 should be total
+                  # but it's dust, which means total is dust. Set TP3 to total if it's the only one.
+                  if qty_tp1 == 0 and qty_tp2 == 0 : qty_tp3 = actual_filled_quantity 
+            
+            # If after adding to TP2/TP1, TP3 was reallocated, ensure it's set to 0 unless it was the sole recipient
+            if not (qty_tp1 == 0 and qty_tp2 == 0 and qty_tp3 == actual_filled_quantity):
+                qty_tp3 = 0.0
+        
+        # Final check on TP3 if it was intended to have quantity but is now 0 due to adjustments
+        # This path assumes that if qty_tp3_pct was > 0, it should ideally have some quantity.
+        # However, min_qty rules and distribution to TP1/TP2 might make it zero.
+        # The current logic prioritizes TP1, then TP2, then TP3 for quantity.
+
+    print(f"{log_prefix} Final TP Qtys: TP1={qty_tp1}, TP2={qty_tp2}, TP3={qty_tp3}. Sum: {round(qty_tp1+qty_tp2+qty_tp3, q_prec)}")
+
+    sl_order_obj, tp1_order_obj, tp2_order_obj, tp3_order_obj = None, None, None, None
     
     sl_order_obj, sl_err = place_new_order(client, s_info, "SELL" if side == "long" else "BUY", "STOP_MARKET", 
                                            actual_filled_quantity, stop_price=sl_price, 
@@ -10222,11 +10432,23 @@ def execute_triggered_fib_order(client, configs, triggered_order_details: dict, 
                                                 position_side=position_side_api, is_closing_order=True)
         if not tp2_order_obj: print(f"{log_prefix} Warn: TP2 FAIL. Err: {tp2_err}")
     
+    if qty_tp3 > 0: # Place initial TP order for TP3
+        tp3_order_obj, tp3_err = place_new_order(client, s_info, "SELL" if side == "long" else "BUY", "TAKE_PROFIT_MARKET",
+                                                 qty_tp3, stop_price=initial_tp3_target_price,
+                                                 position_side=position_side_api, is_closing_order=True)
+        if not tp3_order_obj: print(f"{log_prefix} Warn: Initial TP3 order FAIL. Err: {tp3_err}")
+
+
     tp_orders_list = []
     if tp1_order_obj: tp_orders_list.append({'id': tp1_order_obj.get('orderId'), 'price': tp1_price, 'quantity': qty_tp1, 'status': 'OPEN', 'name': 'TP1'})
     if tp2_order_obj: tp_orders_list.append({'id': tp2_order_obj.get('orderId'), 'price': tp2_price, 'quantity': qty_tp2, 'status': 'OPEN', 'name': 'TP2'})
+    # For TP3, store its initial target and quantity. The ID will be from tp3_order_obj if placed. Status indicates it's special.
     if qty_tp3 > 0: 
-        tp_orders_list.append({'id': None, 'price': initial_tp3_target_price, 'quantity': qty_tp3, 'status': 'FLOATING_ATR_TRAIL', 'name': 'TP3'})
+        tp_orders_list.append({'id': tp3_order_obj.get('orderId') if tp3_order_obj else None, 
+                               'price': initial_tp3_target_price, 
+                               'quantity': qty_tp3, 
+                               'status': 'FLOATING_ATR_TRAIL' if tp3_order_obj else 'FLOATING_ATR_TRAIL_ORDER_FAIL', 
+                               'name': 'TP3'})
 
     with active_trades_lock:
         active_trades[symbol] = {
@@ -10235,24 +10457,25 @@ def execute_triggered_fib_order(client, configs, triggered_order_details: dict, 
             "tp_orders": tp_orders_list, 
             "entry_price": actual_filled_entry_price,
             "current_sl_price": sl_price, "initial_sl_price": sl_price,
-            "quantity": actual_filled_quantity, "side": side.upper(),
+            "quantity": actual_filled_quantity, "side": side.upper(), # Ensure side is uppercase
             "symbol_info": s_info,
             "open_timestamp": pd.Timestamp(entry_market_order.get('updateTime', datetime.now(timezone.utc).timestamp()*1000), unit='ms', tz='UTC'),
             "strategy_type": "FIBONACCI_MULTI_TP", 
             "sl_management_stage": "initial", 
             "initial_risk_per_unit": abs(actual_filled_entry_price - sl_price),
-            "fib_leg_low": leg_swing_low, "fib_leg_high": leg_swing_high,
-            "tp3_last_trail_price": initial_tp3_target_price, 
-            "tp3_last_trail_sl": sl_price 
+            "fib_leg_low": leg_swing_low, "fib_leg_high": leg_swing_high, # Store the leg for reference
+            "tp3_last_trail_price": initial_tp3_target_price, # For TP3 ATR trailing
+            "tp3_last_trail_sl": sl_price # Initial SL for TP3 portion is the main SL
         }
     print(f"{log_prefix} Trade for {symbol} added to active_trades.")
-    update_pending_fib_order_status(triggered_order_details['order_id'], 'executed', f"Market order {entry_market_order['orderId']} filled.")
+    update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_EXECUTED, f"Market order {entry_market_order['orderId']} filled.") # Use constant
 
+    # Updated Telegram Message
     if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
         tp_summary_lines = []
-        if qty_tp1 > 0: tp_summary_lines.append(f"  TP1: {qty_tp1:.{q_prec}f} @ {tp1_price:.{p_prec}f} (ID: {tp1_order_obj.get('orderId') if tp1_order_obj else 'FAIL'})")
-        if qty_tp2 > 0: tp_summary_lines.append(f"  TP2: {qty_tp2:.{q_prec}f} @ {tp2_price:.{p_prec}f} (ID: {tp2_order_obj.get('orderId') if tp2_order_obj else 'FAIL'})")
-        if qty_tp3 > 0: tp_summary_lines.append(f"  TP3: {qty_tp3:.{q_prec}f} @ {initial_tp3_target_price:.{p_prec}f} (Floating ATR Trail)")
+        if qty_tp1 > 0: tp_summary_lines.append(f"  TP1 (50%): {qty_tp1:.{q_prec}f} @ {tp1_price:.{p_prec}f} (ID: {tp1_order_obj.get('orderId') if tp1_order_obj else 'FAIL'})")
+        if qty_tp2 > 0: tp_summary_lines.append(f"  TP2 (40%): {qty_tp2:.{q_prec}f} @ {tp2_price:.{p_prec}f} (ID: {tp2_order_obj.get('orderId') if tp2_order_obj else 'FAIL'})")
+        if qty_tp3 > 0: tp_summary_lines.append(f"  TP3 (10%): {qty_tp3:.{q_prec}f} @ {initial_tp3_target_price:.{p_prec}f} (ID: {tp3_order_obj.get('orderId') if tp3_order_obj else 'FAIL'} - Floating ATR Trail)")
         tp_summary_str = "\n".join(tp_summary_lines) if tp_summary_lines else "  No TPs configured or failed."
 
         message = (
