@@ -114,6 +114,7 @@ DEFAULT_FIB_TP3_ATR_PERIOD = 14
 DEFAULT_FIB_TP3_ATR_MULTIPLIER_TP = 1.5
 DEFAULT_FIB_TP3_ATR_MULTIPLIER_SL = 1.0
 DEFAULT_PRICE_PRECISION_DEFAULT = 2 # General default for price precision formatting
+DEFAULT_ADV_FIB_ORDER_PLACEMENT_STRATEGY = "virtual_limit_first" # New Default
 
 # ICT Sweep Detection Enhancement Defaults
 DEFAULT_ICT_SWEEP_PENETRATION_PERCENT = 0.25   # e.g., 0.25 for 25% penetration of virtual zone width
@@ -477,6 +478,7 @@ def validate_configurations(loaded_configs: dict) -> tuple[bool, str, dict]:
         "fib_tp3_atr_multiplier_tp": {"type": float, "optional": True, "condition": lambda x: 0.1 <= x <= 10.0},
         "fib_tp3_atr_multiplier_sl": {"type": float, "optional": True, "condition": lambda x: 0.1 <= x <= 10.0},
         "price_precision_default": {"type": int, "optional": True, "condition": lambda x: 0 <= x <= 8},
+        "adv_fib_order_placement_strategy": {"type": str, "optional": True, "valid_values": ["virtual_limit_first", "direct_market_order"]},
 
         # API keys and telegram details are not part of this CSV validation
     }
@@ -519,6 +521,15 @@ def validate_configurations(loaded_configs: dict) -> tuple[bool, str, dict]:
             else: # Should not happen with defined rules
                 return False, f"Unknown expected type for '{key}'.", {}
             
+            # Specific adjustment for risk_percent if it looks like a percentage value (e.g., 4.0 for 4%)
+            # The validation rule expects a decimal (e.g., 0.04 for 4%).
+            if key == "risk_percent" and rules["type"] == float: # Ensure this applies only to risk_percent when it's a float
+                if converted_val > 1.0 and converted_val <= 100.0: # Plausible percentage range
+                    print(f"Adjusting CSV/loaded risk_percent value '{converted_val}' (assumed percentage) to decimal '{converted_val / 100.0}' for validation.")
+                    converted_val = converted_val / 100.0
+                # Also handle if it's exactly 100 (stored as 1.0) for 100% risk, though 0 < x <= 1.0 is the rule.
+                # The condition lambda x: 0 < x <= 1.0 will correctly handle it.
+
             validated_configs[key] = converted_val
 
             # Value validation (e.g., enums, ranges)
@@ -938,9 +949,35 @@ def send_telegram_message(bot_token, chat_id, message):
     # This is a "fire-and-forget" approach for notifications.
     # Error handling within _send() will print to console.
     # The main thread (e.g., symbol processing task) will not wait for Telegram send completion.
-    sender_thread = threading.Thread(target=lambda: asyncio.run(_send()), daemon=True)
-    sender_thread.start()
-    return True # Assume submission to thread is success; actual send success is logged by _send()
+    
+    global ptb_event_loop_for_sending
+    if ptb_event_loop_for_sending and ptb_event_loop_for_sending.is_running():
+        # Use run_coroutine_threadsafe if the target loop is available and running
+        # print(f"Attempting to send Telegram message via run_coroutine_threadsafe to loop {ptb_event_loop_for_sending}")
+        future = asyncio.run_coroutine_threadsafe(_send(), ptb_event_loop_for_sending)
+        try:
+            # Optionally wait for the result with a timeout, or just fire and forget
+            future.result(timeout=10) # Wait up to 10 seconds for the send to complete
+            # print(f"Telegram message future result obtained for chat ID {chat_id}.") # Verbose
+            return True
+        except FutureTimeoutError: # concurrent.futures.TimeoutError
+            print(f"Timeout sending Telegram message via run_coroutine_threadsafe to {chat_id}.")
+            # The coroutine is still scheduled and might complete later.
+            return False # Indicate timeout, though it might still send
+        except Exception as e_rcs:
+            print(f"Error scheduling Telegram message with run_coroutine_threadsafe: {e_rcs}")
+            traceback.print_exc()
+            return False
+    else:
+        # Fallback to old method if loop is not available (e.g., during very early startup or if Telegram thread died)
+        if not ptb_event_loop_for_sending:
+            print("Warning: ptb_event_loop_for_sending is None. Using fallback send method for Telegram.")
+        elif not ptb_event_loop_for_sending.is_running():
+             print(f"Warning: ptb_event_loop_for_sending ({ptb_event_loop_for_sending}) is not running. Using fallback send method for Telegram.")
+
+        sender_thread = threading.Thread(target=lambda: asyncio.run(_send()), daemon=True)
+        sender_thread.start()
+        return True # Assume submission to thread is success for fallback
 
 def send_entry_signal_telegram(configs: dict, symbol: str, signal_type_display: str, leverage: int, entry_price: float, 
                                tp1_price: float, tp2_price: float | None, tp3_price: float | None, sl_price: float,
@@ -2298,8 +2335,15 @@ def start_telegram_polling(bot_token: str, app_configs: dict):
     print("Telegram ▶ run_polling() starting…")
     # Initialize and run polling within this function
     # application.initialize() # Included in ApplicationBuilder with .build()
+    
+    # Store the loop that run_polling will use, so send_telegram_message can use it
+    global ptb_event_loop_for_sending
+    ptb_event_loop_for_sending = asyncio.get_event_loop()
+    print(f"Telegram ▶ Stored event loop: {ptb_event_loop_for_sending}")
+
     application.run_polling()       # blocks here, polling updates forever
     print("Telegram ▶ run_polling() exited.")
+    ptb_event_loop_for_sending = None # Clear when loop exits
 
 # --- Telegram Notification for Trade Rejection ---
 def send_trade_rejection_notification(symbol, signal_type, reason, entry_price, sl_price, tp_price, quantity, symbol_info, configs):
@@ -3052,6 +3096,28 @@ def get_user_configurations(load_choice_override: str = None, make_changes_overr
                 if 0 <= val <= 8: configs["price_precision_default"] = val; break
                 print("Must be between 0 and 8.")
             except ValueError: print("Invalid input.")
+        
+        # Advanced Fibonacci Strategy Order Placement Choice
+        while True:
+            adv_fib_order_strat_default_display_val = configs.get("adv_fib_order_placement_strategy", DEFAULT_ADV_FIB_ORDER_PLACEMENT_STRATEGY)
+            # Map internal value to user-friendly number for display
+            adv_fib_order_strat_default_display_num = "1" if adv_fib_order_strat_default_display_val == "virtual_limit_first" else "2"
+            
+            adv_fib_order_strat_input = input(f"Adv Fib Order Placement (1:Virtual Limit First / 2:Direct Market) (default: {adv_fib_order_strat_default_display_num} - {adv_fib_order_strat_default_display_val}): ").strip()
+            chosen_adv_fib_order_strat = None
+
+            if not adv_fib_order_strat_input: # User hit enter, use default from config or constant
+                chosen_adv_fib_order_strat = configs.get("adv_fib_order_placement_strategy", DEFAULT_ADV_FIB_ORDER_PLACEMENT_STRATEGY)
+            elif adv_fib_order_strat_input == "1":
+                chosen_adv_fib_order_strat = "virtual_limit_first"
+            elif adv_fib_order_strat_input == "2":
+                chosen_adv_fib_order_strat = "direct_market_order"
+            
+            if chosen_adv_fib_order_strat in ["virtual_limit_first", "direct_market_order"]:
+                configs["adv_fib_order_placement_strategy"] = chosen_adv_fib_order_strat
+                break
+            print("Invalid choice for Adv Fib Order Placement. Please enter '1' or '2'.")
+
     else: # Not new Advanced Fib strategy, remove these specific keys if they were in loaded CSV
         configs.pop("fib_trend_pivot_n_left", None)
         configs.pop("fib_trend_pivot_n_right", None)
@@ -3063,6 +3129,7 @@ def get_user_configurations(load_choice_override: str = None, make_changes_overr
         configs.pop("fib_tp3_atr_multiplier_tp", None)
         configs.pop("fib_tp3_atr_multiplier_sl", None)
         configs.pop("price_precision_default", None)
+        configs.pop("adv_fib_order_placement_strategy", None) # Also remove the new strategy choice if AdvFib not selected
 
 
     # Micro-Pivot Trailing SL Configurations (Applicable to any strategy if enabled)
@@ -5510,14 +5577,23 @@ def process_symbol_adv_fib_task(symbol, client, configs, lock):
     log_prefix_task = f"[{thread_name}] {symbol} AdvFib_Task:"
     
     try:
+        # Determine required klines for trend identification and general buffer
         required_klines_for_trend = configs.get("fib_trend_pivot_n_left", DEFAULT_FIB_TREND_PIVOT_N_LEFT) + \
                                     configs.get("fib_trend_pivot_n_right", DEFAULT_FIB_TREND_PIVOT_N_RIGHT) + \
-                                    configs.get("fib_trend_lookback_swings", DEFAULT_FIB_TREND_LOOKBACK_SWINGS) + 50 
+                                    configs.get("fib_trend_lookback_swings", DEFAULT_FIB_TREND_LOOKBACK_SWINGS) + 50 # General buffer
         
-        klines_15m_df, klines_error = get_historical_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=max(200, required_klines_for_trend))
+        # For RSI and ATR (used in direct execution path or by execute_triggered_fib_order)
+        rsi_period_req = configs.get("fib_rsi_period", DEFAULT_FIB_RSI_PERIOD)
+        atr_period_req = configs.get("fib_sl_atr_period_exec", DEFAULT_FIB_SL_ATR_PERIOD_EXEC) # ATR for SL buffer
+        min_klines_for_indicators = max(rsi_period_req, atr_period_req) + 50 # Buffer for indicator calculation stability
+        
+        # Fetch enough klines to satisfy both trend ID and indicator calculations
+        fetch_limit_adv_fib = max(200, required_klines_for_trend, min_klines_for_indicators)
+        
+        klines_15m_df, klines_error = get_historical_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=fetch_limit_adv_fib)
         
         if klines_error:
-            msg = f"Skipped: Error fetching 15m klines ({str(klines_error)})."
+            msg = f"Skipped: Error fetching 15m klines (limit {fetch_limit_adv_fib}) - {str(klines_error)}."
             print(f"{log_prefix_task} {msg} {format_elapsed_time(cycle_start_ref)}")
             return f"{symbol}: AdvFib Error - {msg}"
 
@@ -5529,13 +5605,27 @@ def process_symbol_adv_fib_task(symbol, client, configs, lock):
         opportunities = find_fib_retracement_opportunities(klines_15m_df, symbol, configs)
 
         if opportunities:
-            print(f"{log_prefix_task} Found {len(opportunities)} potential AdvFib opportunities for {symbol}.")
-            for opp in opportunities:
-                added_order_id = add_new_pending_fib_order(opp, configs)
+            adv_fib_placement_mode = configs.get("adv_fib_order_placement_strategy", DEFAULT_ADV_FIB_ORDER_PLACEMENT_STRATEGY)
+            print(f"{log_prefix_task} Found {len(opportunities)} potential AdvFib opportunities for {symbol}. Placement mode: {adv_fib_placement_mode}")
+
+        for opp in opportunities: # Usually find_fib_retracement_opportunities returns one or none
+            if adv_fib_placement_mode == "direct_market_order":
+                print(f"{log_prefix_task} Direct Market Order mode selected. Evaluating opportunity immediately...")
+                # Pass `lock` (active_trades_lock) to this function as it calls execute_triggered_fib_order
+                attempt_direct_adv_fib_execution(client, configs, opp, klines_15m_df, lock, log_prefix_task)
+
+            elif adv_fib_placement_mode == "virtual_limit_first":
+                print(f"{log_prefix_task} Virtual Limit First mode selected. Adding as pending order.")
+                added_order_id = add_new_pending_fib_order(opp, configs) # Existing logic
                 if added_order_id:
                     print(f"{log_prefix_task} Added pending AdvFib order ID: {added_order_id} for {symbol}.")
+            else: # Should not happen if config validation is correct
+                print(f"{log_prefix_task} Unknown AdvFib placement mode: {adv_fib_placement_mode}. Defaulting to pending.")
+                added_order_id = add_new_pending_fib_order(opp, configs)
+                if added_order_id: # Log if fallback occurs
+                    print(f"{log_prefix_task} Added pending AdvFib order ID (fallback due to unknown mode): {added_order_id} for {symbol}.")
         
-        return f"{symbol}: AdvFib Processed, {len(opportunities)} opps."
+        return f"{symbol}: AdvFib Processed ({adv_fib_placement_mode}), {len(opportunities)} opps."
 
     except Exception as e:
         error_detail = f"Unhandled error in {log_prefix_task}: {e}"
@@ -6814,26 +6904,30 @@ def trading_loop(client, configs, monitored_symbols):
     # active_trades is modified via helpers or within locks.
 
     current_cycle_number = 0
+    print("DEBUG: trading_loop - Before ThreadPoolExecutor init") # New debug print
     executor = ThreadPoolExecutor(max_workers=configs.get('max_scan_threads', DEFAULT_MAX_SCAN_THREADS))
+    print("DEBUG: trading_loop - After ThreadPoolExecutor init") # New debug print
     
     try:
+        global bot_shutdown_requested, bot_restart_requested  # Added bot_restart_requested
+        global active_signals, active_signals_lock  # For attempt_direct_adv_fib_execution signal mode
+
         while True:
-            global bot_shutdown_requested, bot_restart_requested # Added bot_restart_requested
             if bot_shutdown_requested:
                 print("Shutdown requested via Telegram command. Exiting trading loop...")
                 if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
-                     send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], "ℹ️ Bot is shutting down now as requested...")
-                break # Exit the trading loop
-            
+                    send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], "ℹ️ Bot is shutting down now as requested...")
+                break  # Exit the trading loop
+
             if bot_restart_requested:
                 print("Restart requested via Telegram command. Exiting trading loop for restart...")
                 if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
                     send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], "⏳ Bot is preparing to restart...")
-                break # Exit the trading loop to allow main to handle restart
+                break  # Exit the trading loop to allow main to handle restart
 
             current_cycle_number += 1
             cycle_start_time = time.time()
-            configs['cycle_start_time_ref'] = cycle_start_time # For threads to use consistent base
+            configs['cycle_start_time_ref'] = cycle_start_time  # For threads to use consistent base
             iter_ts = pd.Timestamp.now(tz='UTC').strftime('%Y-%m-%d %H:%M:%S UTC')
             print(f"\n--- Starting Scan Cycle #{current_cycle_number}: {iter_ts} {format_elapsed_time(cycle_start_time)} ---")
 
@@ -7145,8 +7239,115 @@ def trading_loop(client, configs, monitored_symbols):
             # The status update logic can remain common after the main try/except of the cycle.
     finally:
         print("Shutting down thread pool executor...")
-        executor.shutdown(wait=True) # Ensure all threads finish before exiting loop/program
+        executor.shutdown(wait=True)  # Ensure all threads finish before exiting loop/program
         print("Thread pool executor shut down.")
+
+
+# --- New AdvFib Direct Execution Logic ---
+def attempt_direct_adv_fib_execution(client, configs, opportunity_details: dict, df_15m_for_trigger_check: pd.DataFrame, lock, parent_log_prefix: str):
+    """
+    Attempts direct market execution for an Advanced Fibonacci opportunity if conditions (price, RSI) are met.
+    Called when adv_fib_order_placement_strategy is "direct_market_order".
+    """
+    global active_signals, active_signals_lock # For signal mode
+
+    symbol = opportunity_details['symbol']
+    side = opportunity_details['side']
+    potential_entry_zone_mid = opportunity_details['entry_price'] # Mid of golden zone
+    golden_zone_low = opportunity_details['golden_zone_low']
+    golden_zone_high = opportunity_details['golden_zone_high']
+
+    log_prefix = f"[{parent_log_prefix} DirectExec]" # Use parent's log prefix for context
+    print(f"{log_prefix} Attempting direct execution for {symbol} {side.upper()} near GZ_Mid {potential_entry_zone_mid:.{configs.get(f'{symbol}_price_precision', 2)}f}")
+
+    s_info = get_symbol_info(client, symbol)
+    if not s_info:
+        print(f"{log_prefix} Failed to get symbol_info. Cannot execute directly.")
+        return
+
+    p_prec = int(s_info.get('pricePrecision', configs.get("price_precision_default", 2)))
+    
+    current_market_price = get_current_market_price(client, symbol)
+    if current_market_price is None:
+        print(f"{log_prefix} Could not fetch current market price for {symbol}. Cannot execute directly.")
+        return
+
+    price_favorable = False
+    # Define a tolerance for being "near" the golden zone for direct market entry
+    # Example: allow entry if price is within GZ or up to 20% of GZ height beyond the favorable edge.
+    gz_height = abs(golden_zone_high - golden_zone_low)
+    tolerance = gz_height * 0.20 
+
+    if side == "long":
+        # Favorable if current price is within GZ, or slightly above GZ_high (but not too far),
+        # or slightly below GZ_low (but still attractive for a long).
+        # For direct market, we want to be AT or BETTER than the intended zone.
+        # If current_market_price <= golden_zone_high (meaning at or better than the top of buy zone)
+        # and current_market_price >= (golden_zone_low - tolerance) (not too far below the bottom of buy zone)
+        if current_market_price <= (golden_zone_high + tolerance) and current_market_price >= (golden_zone_low - tolerance) : # More generous check for direct entry
+             price_favorable = True
+             if not (golden_zone_low <= current_market_price <= golden_zone_high):
+                 print(f"{log_prefix} Price {current_market_price:.{p_prec}f} is outside GZ [{golden_zone_low:.{p_prec}f}-{golden_zone_high:.{p_prec}f}] but within tolerance for direct long.")
+    elif side == "short":
+        # Favorable if current price is within GZ, or slightly below GZ_low,
+        # or slightly above GZ_high.
+        # If current_market_price >= golden_zone_low (at or better than bottom of sell zone)
+        # and current_market_price <= (golden_zone_high + tolerance) (not too far above top of sell zone)
+        if current_market_price >= (golden_zone_low - tolerance) and current_market_price <= (golden_zone_high + tolerance): # More generous
+            price_favorable = True
+            if not (golden_zone_low <= current_market_price <= golden_zone_high):
+                print(f"{log_prefix} Price {current_market_price:.{p_prec}f} is outside GZ [{golden_zone_low:.{p_prec}f}-{golden_zone_high:.{p_prec}f}] but within tolerance for direct short.")
+
+    if not price_favorable:
+        print(f"{log_prefix} Price condition for direct execution NOT MET. Market: {current_market_price:.{p_prec}f}, Golden Zone: [{golden_zone_low:.{p_prec}f} - {golden_zone_high:.{p_prec}f}] (Tolerance: {tolerance:.{p_prec}f})")
+        return
+
+    rsi_period = configs.get("fib_rsi_period", 14)
+    # Ensure df_15m_for_trigger_check is a DataFrame before passing to calculate_rsi
+    if not isinstance(df_15m_for_trigger_check, pd.DataFrame) or df_15m_for_trigger_check.empty:
+        print(f"{log_prefix} Invalid or empty DataFrame for RSI check. Cannot execute directly.")
+        return
+        
+    current_rsi_series = calculate_rsi(df_15m_for_trigger_check.copy(), period=rsi_period)
+
+    if current_rsi_series is None or current_rsi_series.empty or pd.isna(current_rsi_series.iloc[-1]):
+        print(f"{log_prefix} Could not calculate RSI for {symbol}. Direct execution deferred.")
+        return
+    
+    current_rsi_value = current_rsi_series.iloc[-1]
+    rsi_condition_met = False
+    rejection_reason_rsi = ""
+
+    if side == 'long':
+        if current_rsi_value < 50: rsi_condition_met = True
+        else: rejection_reason_rsi = f"RSI ({current_rsi_value:.2f}) NOT < 50 for LONG."
+    elif side == 'short':
+        if current_rsi_value > 50: rsi_condition_met = True
+        else: rejection_reason_rsi = f"RSI ({current_rsi_value:.2f}) NOT > 50 for SHORT."
+
+    if not rsi_condition_met:
+        print(f"{log_prefix} RSI condition for direct execution NOT MET. {rejection_reason_rsi}")
+        if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+             send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], 
+                                   f"ℹ️ AdvFib Direct Market for `{symbol}` {side.upper()} SKIPPED. Reason: {escape_markdown_v1(rejection_reason_rsi)}")
+        return
+
+    print(f"{log_prefix} Conditions MET for direct execution: Price favorable (Market: {current_market_price:.{p_prec}f}), RSI ({current_rsi_value:.2f}) OK.")
+
+    mock_triggered_order = {
+        'order_id': f"direct_advfib_{symbol}_{int(dt.now(timezone.utc).timestamp())}",
+        'symbol': symbol, 'side': side, 'entry_price': potential_entry_zone_mid, 
+        'swing_low_of_leg': opportunity_details['swing_low_of_leg'],
+        'swing_high_of_leg': opportunity_details['swing_high_of_leg'],
+        'trend_at_creation': opportunity_details['trend_identified'],
+        'status': 'direct_execution_initiated', # Custom status
+        'notes': 'Direct market execution initiated'
+    }
+    
+    # For direct execution, market_price_at_trigger in execute_triggered_fib_order will be our current_market_price.
+    # The df_15m_for_atr will be df_15m_for_trigger_check.
+    execute_triggered_fib_order(client, configs, mock_triggered_order, current_market_price, df_15m_for_trigger_check.copy(), execution_type="direct_market")
+
 
 # --- ICT Strategy Core Components ---
 
@@ -10186,7 +10387,12 @@ def monitor_pending_fib_limit_orders(client, configs):
         p_prec = configs.get(f"{symbol}_price_precision", configs.get("price_precision_default", 2))
         if not isinstance(p_prec, int): p_prec = 2
 
-        current_trend, current_lh, current_ll = identify_market_trend_fib(df_15m_latest, symbol, configs)
+        # Unpack all 5 values returned by identify_market_trend_fib
+        current_trend, current_leg_start_price, current_leg_end_price, current_leg_start_time, current_leg_end_time = identify_market_trend_fib(df_15m_latest, symbol, configs)
+        
+        # For logging or more advanced validation, we can use the new current_leg values.
+        # For existing invalidation logic, it uses order['swing_low_of_leg'] and order['swing_high_of_leg'].
+        # The variables current_lh and current_ll were not used further down in the original function.
         
         invalidation_reason = None
         if order['side'] == 'long':
@@ -10266,31 +10472,33 @@ def monitor_pending_fib_limit_orders(client, configs):
                     send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], message)
 
 # --- Execute Triggered Fibonacci Order (New Fibonacci Strategy) ---
-def execute_triggered_fib_order(client, configs, triggered_order_details: dict, market_price_at_trigger: float, df_15m_for_atr: pd.DataFrame):
+def execute_triggered_fib_order(client, configs, triggered_order_details: dict, market_price_at_trigger: float, df_15m_for_atr: pd.DataFrame, execution_type: str = "pending_limit"):
     """
     Executes a Fibonacci trade that has been price-triggered and passed the RSI filter.
     Calculates SL/TP, position size, places market order, and then SL/TP orders.
+    `execution_type` can be "pending_limit" or "direct_market".
     """
     global active_trades, active_trades_lock 
 
     symbol = triggered_order_details['symbol']
     side = triggered_order_details['side'] 
     original_limit_entry = triggered_order_details['entry_price'] 
-    effective_entry_price = market_price_at_trigger 
+    effective_entry_price = market_price_at_trigger # This is the actual entry price for the market order
 
     leg_swing_low = triggered_order_details['swing_low_of_leg']
     leg_swing_high = triggered_order_details['swing_high_of_leg']
 
-    log_prefix = f"[{symbol} FibExec ID:{triggered_order_details['order_id']}]"
-    print(f"{log_prefix} Executing {side} trade. Original Limit: {original_limit_entry}, Market Trigger: {market_price_at_trigger}")
+    log_prefix = f"[{symbol} FibExec ID:{triggered_order_details['order_id']} Type:{execution_type}]" # Added execution_type
+    print(f"{log_prefix} Executing {side.upper()} trade. Original Limit Target: {original_limit_entry}, Effective Market Entry: {effective_entry_price}")
 
     s_info = get_symbol_info(client, symbol)
     if not s_info:
         print(f"{log_prefix} Failed to get symbol_info. Cannot execute trade.")
-        update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_EXECUTION_FAILED, "Failed to get symbol_info") # Use constant
+        if execution_type == "pending_limit":
+            update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_EXECUTION_FAILED, "Failed to get symbol_info")
         return
 
-    p_prec = int(s_info['pricePrecision'])
+    p_prec = int(s_info.get('pricePrecision', configs.get("price_precision_default", 2)))
     q_prec = int(s_info['quantityPrecision'])
 
     atr_period_sl = configs.get("fib_sl_atr_period_exec", 14) 
@@ -10317,7 +10525,8 @@ def execute_triggered_fib_order(client, configs, triggered_order_details: dict, 
     fib_extensions = calculate_fibonacci_extension_levels(leg_swing_high, leg_swing_low, effective_entry_price, side)
     if not fib_extensions:
         print(f"{log_prefix} Failed to calculate Fibonacci extension levels.")
-        update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_EXECUTION_FAILED, "Fibonacci extension calculation failed") # Use constant
+        if execution_type == "pending_limit":
+            update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_EXECUTION_FAILED, "Fibonacci extension calculation failed")
         return
 
     tp1_price = round(fib_extensions['ext_0_0'], p_prec) 
@@ -10330,27 +10539,31 @@ def execute_triggered_fib_order(client, configs, triggered_order_details: dict, 
        (side == "short" and (sl_price <= effective_entry_price or tp1_price >= effective_entry_price)):
         reason = f"Invalid SL/TP. Entry:{effective_entry_price}, SL:{sl_price}, TP1:{tp1_price}"
         print(f"{log_prefix} {reason}")
-        update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_EXECUTION_FAILED, reason) # Use constant
+        if execution_type == "pending_limit":
+            update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_EXECUTION_FAILED, reason)
         return
 
     acc_bal = get_account_balance(client, configs)
     if acc_bal is None or acc_bal <= 0:
         reason = f"Invalid balance ({acc_bal})."
         print(f"{log_prefix} {reason}")
-        update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_EXECUTION_FAILED, reason) # Use constant
+        if execution_type == "pending_limit":
+            update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_EXECUTION_FAILED, reason)
         return
 
     if abs(effective_entry_price - sl_price) < (1 / (10**p_prec)): # Check if SL is too close to entry
         reason = f"SL ({sl_price}) too close to entry ({effective_entry_price}). Risk calculation may be invalid."
         print(f"{log_prefix} {reason}")
-        update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_EXECUTION_FAILED, reason) # Use constant
+        if execution_type == "pending_limit":
+            update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_EXECUTION_FAILED, reason)
         return
 
     total_quantity_to_order = calculate_position_size(acc_bal, configs['risk_percent'], effective_entry_price, sl_price, s_info, configs)
     if total_quantity_to_order is None or total_quantity_to_order <= 0:
         reason = f"Invalid position size ({total_quantity_to_order})."
         print(f"{log_prefix} {reason}")
-        update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_EXECUTION_FAILED, reason) # Use constant
+        if execution_type == "pending_limit":
+            update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_EXECUTION_FAILED, reason)
         return
     
     print(f"{log_prefix} Total quantity: {total_quantity_to_order:.{q_prec}f}")
@@ -10364,8 +10577,10 @@ def execute_triggered_fib_order(client, configs, triggered_order_details: dict, 
     if not sanity_passed:
         reason = f"Sanity checks FAILED: {sanity_reason}"
         print(f"{log_prefix} {reason}")
-        update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_EXECUTION_FAILED, reason) # Use constant
-        send_trade_rejection_notification(symbol, f"FIB_{side.upper()}", reason, effective_entry_price, sl_price, tp1_price, total_quantity_to_order, s_info, configs)
+        if execution_type == "pending_limit":
+            update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_EXECUTION_FAILED, reason)
+        # Send rejection notification regardless of execution type if sanity check fails
+        send_trade_rejection_notification(symbol, f"FIB_ADV_{side.upper()}_{execution_type.upper()}", reason, effective_entry_price, sl_price, tp1_price, total_quantity_to_order, s_info, configs)
         return
     print(f"{log_prefix} Sanity checks PASSED.")
 
@@ -10446,8 +10661,9 @@ def execute_triggered_fib_order(client, configs, triggered_order_details: dict, 
             set_margin_type_on_symbol(client, symbol, configs['margin_type'], configs)):
         reason = f"Failed to set leverage/margin for {symbol}."
         print(f"{log_prefix} {reason}")
-        update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_EXECUTION_FAILED, reason) # Use constant
-        send_trade_rejection_notification(symbol, f"FIB_{side.upper()}", reason, effective_entry_price, sl_price, tp1_price, total_quantity_to_order, s_info, configs)
+        if execution_type == "pending_limit":
+            update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_EXECUTION_FAILED, reason)
+        send_trade_rejection_notification(symbol, f"FIB_ADV_{side.upper()}_{execution_type.upper()}", reason, effective_entry_price, sl_price, tp1_price, total_quantity_to_order, s_info, configs)
         return
 
     market_order_side_api = "BUY" if side == "long" else "SELL"
@@ -10461,8 +10677,9 @@ def execute_triggered_fib_order(client, configs, triggered_order_details: dict, 
     if not entry_market_order or entry_market_order.get('status') != 'FILLED':
         reason = f"Market entry failed. Status: {entry_market_order.get('status') if entry_market_order else 'N/A'}. Err: {entry_error_msg}"
         print(f"{log_prefix} {reason}")
-        update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_EXECUTION_FAILED, reason) # Use constant
-        send_trade_rejection_notification(symbol, f"FIB_{side.upper()}", reason, effective_entry_price, sl_price, tp1_price, total_quantity_to_order, s_info, configs)
+        if execution_type == "pending_limit":
+            update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_EXECUTION_FAILED, reason)
+        send_trade_rejection_notification(symbol, f"FIB_ADV_{side.upper()}_{execution_type.upper()}", reason, effective_entry_price, sl_price, tp1_price, total_quantity_to_order, s_info, configs)
         return
 
     actual_filled_entry_price = float(entry_market_order['avgPrice'])
@@ -10619,7 +10836,13 @@ def execute_triggered_fib_order(client, configs, triggered_order_details: dict, 
             "tp3_last_trail_sl": sl_price # Initial SL for TP3 portion is the main SL
         }
     print(f"{log_prefix} Trade for {symbol} added to active_trades.")
-    update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_EXECUTED, f"Market order {entry_market_order['orderId']} filled.") # Use constant
+    
+    if execution_type == "pending_limit":
+        update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_EXECUTED, f"Market order {entry_market_order['orderId']} filled.")
+    else: # Direct market execution
+        print(f"{log_prefix} Direct execution successful. Market order {entry_market_order['orderId']} filled for mock order {triggered_order_details['order_id']}.")
+        # For direct execution, there's no pending order in the global list to update.
+        # The mock_triggered_order's status was informational.
 
     # Updated Telegram Message
     if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
@@ -10628,9 +10851,12 @@ def execute_triggered_fib_order(client, configs, triggered_order_details: dict, 
         if qty_tp2 > 0: tp_summary_lines.append(f"  TP2 (40%): {qty_tp2:.{q_prec}f} @ {tp2_price:.{p_prec}f} (ID: {tp2_order_obj.get('orderId') if tp2_order_obj else 'FAIL'})")
         if qty_tp3 > 0: tp_summary_lines.append(f"  TP3 (10%): {qty_tp3:.{q_prec}f} @ {initial_tp3_target_price:.{p_prec}f} (ID: {tp3_order_obj.get('orderId') if tp3_order_obj else 'FAIL'} - Floating ATR Trail)")
         tp_summary_str = "\n".join(tp_summary_lines) if tp_summary_lines else "  No TPs configured or failed."
+        
+        exec_type_display = "Direct Market Entry" if execution_type == "direct_market" else "Limit Order Filled"
+        message_title = f"🚀 *AdvFib Trade EXECUTED ({exec_type_display})* 🚀" # More specific title
 
         message = (
-            f"🚀 *Fib Trade EXECUTED*\n\n"
+            f"{message_title}\n\n"
             f"Symbol: `{symbol}`\nSide: `{side.upper()}`\n"
             f"Total Quantity: `{actual_filled_quantity:.{q_prec}f}`\n"
             f"Actual Entry Price: `{actual_filled_entry_price:.{p_prec}f}`\n"
@@ -12178,7 +12404,8 @@ def backtesting_loop(client, configs, monitored_symbols):
 
 # --- Global variables for Telegram Handlers and Bot Control ---
 # client instance will be populated in main()
-client = None 
+client = None
+ptb_event_loop_for_sending = None # Global loop for run_coroutine_threadsafe
 # configs dictionary will be populated in main() and is treated as global in many functions
 # active_trades, active_trades_lock, etc. are already defined at the top level.
 
