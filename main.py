@@ -2338,7 +2338,8 @@ def start_telegram_polling(bot_token: str, app_configs: dict):
     
     # Store the loop that run_polling will use, so send_telegram_message can use it
     global ptb_event_loop_for_sending
-    ptb_event_loop_for_sending = asyncio.get_event_loop()
+    # ptb_event_loop_for_sending = asyncio.get_event_loop() # Deprecated
+    ptb_event_loop_for_sending = loop # Use the loop created and set for this thread
     print(f"Telegram ▶ Stored event loop: {ptb_event_loop_for_sending}")
 
     application.run_polling()       # blocks here, polling updates forever
@@ -5577,6 +5578,9 @@ def process_symbol_adv_fib_task(symbol, client, configs, lock):
     log_prefix_task = f"[{thread_name}] {symbol} AdvFib_Task:"
     
     try:
+        # Initialize adv_fib_placement_mode at the beginning of the try block
+        adv_fib_placement_mode = configs.get("adv_fib_order_placement_strategy", DEFAULT_ADV_FIB_ORDER_PLACEMENT_STRATEGY)
+
         # Determine required klines for trend identification and general buffer
         required_klines_for_trend = configs.get("fib_trend_pivot_n_left", DEFAULT_FIB_TREND_PIVOT_N_LEFT) + \
                                     configs.get("fib_trend_pivot_n_right", DEFAULT_FIB_TREND_PIVOT_N_RIGHT) + \
@@ -5605,7 +5609,9 @@ def process_symbol_adv_fib_task(symbol, client, configs, lock):
         opportunities = find_fib_retracement_opportunities(klines_15m_df, symbol, configs)
 
         if opportunities:
-            adv_fib_placement_mode = configs.get("adv_fib_order_placement_strategy", DEFAULT_ADV_FIB_ORDER_PLACEMENT_STRATEGY)
+            # adv_fib_placement_mode is already initialized at the start of the try block.
+            # The value would be the same. This line can be removed or commented.
+            # adv_fib_placement_mode = configs.get("adv_fib_order_placement_strategy", DEFAULT_ADV_FIB_ORDER_PLACEMENT_STRATEGY) 
             print(f"{log_prefix_task} Found {len(opportunities)} potential AdvFib opportunities for {symbol}. Placement mode: {adv_fib_placement_mode}")
 
         for opp in opportunities: # Usually find_fib_retracement_opportunities returns one or none
