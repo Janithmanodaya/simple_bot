@@ -103,7 +103,8 @@ def initialize_app_binance_client(env="mainnet"): # Removed app_configs paramete
     Stores it in the global `app_binance_client`.
     If Telegram alerts on init failure are needed, it will use global `app_trading_configs`.
     """
-    #global app_binance_client, app_trading_configs # Ensure app_trading_configs is accessible if needed for alerts
+    global app_binance_client # Ensure we are modifying the global client instance
+    # global app_trading_configs # app_trading_configs is already global, typically accessed directly if needed for alerts
     api_key, api_secret, _, _ = load_app_api_keys(env) # Telegram keys not used directly in init
 
     try:
@@ -1304,36 +1305,34 @@ def prune_and_label_pivots(df, atr_col_name, atr_distance_factor=MIN_ATR_DISTANC
     last_confirmed_pivot_price = 0
     last_confirmed_pivot_type = None
 
-    # atr_col_name (e.g., 'atr_14') must be passed if ATR_PERIOD is dynamic
-    # atr_distance_factor and min_bar_gap are now parameters
-    
-    # Ensure ATR column exists; if not, calculate it using the provided (or default) period.
-    # This internal call to calculate_atr needs the correct period if atr_col_name implies it.
-    # For simplicity, assume atr_col_name is passed and exists.
-    # If it doesn't, the caller should have ensured it.
-    # However, for robustness, if we only have atr_period, we can derive atr_col_name.
-    # Let's assume atr_col_name is like 'atr_XX' and we can parse XX or it's passed.
-    # For this refactor, the function will expect atr_col_name to be valid.
-    
-    # The original code used global ATR_PERIOD if f'atr_{ATR_PERIOD}' was not in df.columns.
-    # Now, it relies on the caller to ensure the correct ATR column (based on tuned atr_period) is present.
-    # We will pass atr_col_name to this function.
-
     if atr_col_name not in df.columns:
-        print(f"Warning (prune_and_label_pivots): ATR column '{atr_col_name}' not found. Pivots might be incorrect if ATR is needed and not present.")
-        # Or, if an atr_period was also passed, it could calculate it:
-        # current_atr_period = int(atr_col_name.split('_')[-1]) # Simple parse
-        # df = calculate_atr(df, period=current_atr_period)
-        # For now, assume caller provides df with the correct atr_col_name.
+        print(f"Warning (prune_and_label_pivots): ATR column '{atr_col_name}' not found. Pivots might be incorrect if ATR is needed and not present. Returning df as is.")
+        return df # Cannot proceed without ATR column if it's expected
 
+    # Parse ATR period from atr_col_name for warmup period calculation
+    try:
+        parsed_atr_period = int(atr_col_name.split('_')[-1])
+        if parsed_atr_period <= 0:
+            raise ValueError("Parsed ATR period must be positive.")
+    except (ValueError, IndexError):
+        print(f"Error (prune_and_label_pivots): Could not parse ATR period from '{atr_col_name}'. Assuming 14 for warmup. This may be incorrect.")
+        parsed_atr_period = 14 # Fallback
 
+    min_index_for_valid_atr = parsed_atr_period - 1
+
+    # Iterate starting from where ATR is expected to be valid
     for i in range(len(df)):
-        # Use the dynamic atr_col_name
-        atr_val_at_pivot = df.get(atr_col_name, pd.Series(np.nan, index=df.index)).iloc[i] # Graceful fetch
-        if pd.isna(atr_val_at_pivot) and atr_distance_factor > 0 : # Only skip if ATR is needed for distance check
-            # If atr_distance_factor is 0, ATR is not needed for distance pruning.
-            # print(f"Debug: ATR NaN at index {i} for {atr_col_name}, but atr_distance_factor is {atr_distance_factor}")
-            pass # Allow processing if ATR not strictly needed for this pivot
+        if i < min_index_for_valid_atr and atr_distance_factor > 0: # Skip early bars if ATR is used for pruning
+            continue
+
+        # ATR at the current candidate pivot `i`
+        atr_val_at_current_pivot = df.loc[df.index[i], atr_col_name] 
+        
+        # If ATR is needed for distance factor and current ATR is invalid, skip this candidate
+        if atr_distance_factor > 0 and (pd.isna(atr_val_at_current_pivot) or atr_val_at_current_pivot == 0):
+            # This warning helps identify if candidates are skipped due to their own invalid ATR.
+            # print(f"Debug (prune_and_label_pivots): Skipping candidate at index {df.index[i]} due to invalid ATR: {atr_val_at_current_pivot} (ATR distance factor is active).")
+            continue
 
         is_ch = df['is_candidate_high'].iloc[i]
         is_cl = df['is_candidate_low'].iloc[i]
@@ -1342,8 +1341,14 @@ def prune_and_label_pivots(df, atr_col_name, atr_distance_factor=MIN_ATR_DISTANC
             continue
 
         # Check bar gap
-        if last_confirmed_pivot_idx != -1 and (i - last_confirmed_pivot_idx) < min_bar_gap:
-            continue
+        if last_confirmed_pivot_idx != -1 and (df.index[i] - last_confirmed_pivot_idx) < min_bar_gap:
+            # Note: This assumes df.index[i] and last_confirmed_pivot_idx are comparable.
+            # If df.index is not a simple range index, direct subtraction might be an issue.
+            # However, 'i' is from range(len(df)), and last_confirmed_pivot_idx stores 'i'.
+            # So, this comparison is on the integer position.
+            if (i - last_confirmed_pivot_idx) < min_bar_gap: # Corrected to use integer index i
+                 continue
+
 
         current_price = 0
         current_type = None
@@ -1351,22 +1356,30 @@ def prune_and_label_pivots(df, atr_col_name, atr_distance_factor=MIN_ATR_DISTANC
         if is_ch:
             current_price = df['high'].iloc[i]
             current_type = 'high'
-        elif is_cl: # Check is_cl, can't be both ch and cl with current logic, but good practice
+        elif is_cl:
             current_price = df['low'].iloc[i]
             current_type = 'low'
 
-        # Check ATR distance (if there's a previous pivot)
-        if last_confirmed_pivot_idx != -1 and atr_distance_factor > 0: # Only check if factor > 0
-            # Use ATR at the time of the last confirmed pivot for distance check
-            atr_at_last_pivot = df.get(atr_col_name, pd.Series(np.nan, index=df.index)).iloc[last_confirmed_pivot_idx]
-            if pd.notna(atr_at_last_pivot) and atr_at_last_pivot > 0:
-                price_diff = abs(current_price - last_confirmed_pivot_price)
-                if price_diff < (atr_distance_factor * atr_at_last_pivot):
-                    # Too close to the last pivot in terms of price * ATR
-                    continue
-            # else: Cannot perform ATR distance check if ATR at last pivot is NaN/zero, proceed without this specific pruning for this candidate.
+        # Check ATR distance (if there's a previous pivot and ATR distance pruning is active)
+        if last_confirmed_pivot_idx != -1 and atr_distance_factor > 0:
+            # ATR at the last confirmed pivot
+            # Ensure last_confirmed_pivot_idx is also >= min_index_for_valid_atr for its ATR to be valid.
+            # This should be true by construction if the loop starts after warmup.
+            atr_at_last_pivot = df.loc[df.index[last_confirmed_pivot_idx], atr_col_name]
 
+            if pd.isna(atr_at_last_pivot) or atr_at_last_pivot == 0:
+                # If ATR at the *last* pivot is invalid, we cannot reliably apply ATR distance.
+                # Skip the current candidate as a rule cannot be checked.
+                # print(f"Debug (prune_and_label_pivots): Skipping candidate at index {df.index[i]} because ATR at last pivot (index {df.index[last_confirmed_pivot_idx]}) is invalid: {atr_at_last_pivot}.")
+                continue
+            
+            price_diff = abs(current_price - last_confirmed_pivot_price)
+            if price_diff < (atr_distance_factor * atr_at_last_pivot):
+                # Too close to the last pivot in terms of price * ATR
+                continue
+        
         # Confirm pivot
+        # Note: last_confirmed_pivot_idx stores the integer position 'i', not the DataFrame label index.
         if current_type == 'high':
             # Ensure it's not immediately followed by a higher high or preceded by a higher high (within candidate window)
             # This is somewhat handled by generate_candidate_pivots, but an extra check can be useful
@@ -1410,18 +1423,43 @@ def simulate_fib_entries(df, atr_col_name): # Added atr_col_name
         print(f"Error (simulate_fib_entries): Required ATR column '{atr_col_name}' not found in DataFrame. Cannot simulate entries.")
         return df
 
-    pivots = df[(df['is_swing_high'] == 1) | (df['is_swing_low'] == 1)].copy()
+    # Parse ATR period from atr_col_name (e.g., 'atr_14' -> 14)
+    try:
+        parsed_atr_period = int(atr_col_name.split('_')[-1])
+        if parsed_atr_period <= 0:
+            raise ValueError("Parsed ATR period must be positive.")
+    except (ValueError, IndexError):
+        print(f"Error (simulate_fib_entries): Could not parse ATR period from '{atr_col_name}'. Using a default of 14 for warmup calculation, but this may be incorrect.")
+        parsed_atr_period = 14 # Fallback, though ideally this shouldn't happen
+
+    # ATR Warmup: Only consider pivots after the initial ATR calculation period.
+    # DataFrame indices must be comparable to parsed_atr_period - 1.
+    # Assuming df has a simple range index [0, 1, ..., len(df)-1] or that index 'i' corresponds to row number.
+    # The first valid ATR will be at index `parsed_atr_period - 1`.
+    # So, pivots should be considered from this index onwards.
+    min_pivot_index_for_valid_atr = parsed_atr_period -1 
+
+    all_pivots = df[(df['is_swing_high'] == 1) | (df['is_swing_low'] == 1)].copy()
+    
+    # Filter pivots to only include those that occur at or after the ATR warmup period.
+    # The index 'i' from iterrows() is the DataFrame index of the pivot.
+    pivots = all_pivots[all_pivots.index >= min_pivot_index_for_valid_atr].copy()
+
+    if pivots.empty:
+        # print(f"Debug (simulate_fib_entries): No pivots found after ATR warmup period ({min_pivot_index_for_valid_atr}). Original pivots: {len(all_pivots)}")
+        return df # No pivots to simulate after warmup
+
+    # print(f"Debug (simulate_fib_entries): Total pivots before warmup filter: {len(all_pivots)}, After filter (index >= {min_pivot_index_for_valid_atr}): {len(pivots)}")
 
     for i, pivot_row in pivots.iterrows():
         # Use the dynamic atr_col_name
         atr_at_pivot = df.loc[i, atr_col_name] # ATR at the time of the pivot/signal
-        if pd.isna(atr_at_pivot) or atr_at_pivot == 0: # If ATR is NaN or zero, cannot reliably set SL or Fib levels based on it for some strategies.
-            # Depending on how Fib levels are defined (e.g. if they use ATR), this might be an issue.
-            # For SL based on ATR, it's definitely an issue.
-            # For now, we'll allow it to proceed if Fibs are purely price-based, but SL might be problematic.
-            # If SL is critical for the simulation logic here, then 'continue' might be appropriate.
-            # The current SL logic `pivot_price - atr_at_pivot` requires a valid ATR.
-            print(f"Warning (simulate_fib_entries): ATR is NaN or zero at index {i} for pivot. SL calculation might be invalid. Skipping simulation for this pivot.")
+        
+        # Defensive ATR Check: Ensure ATR is valid before using it.
+        if pd.isna(atr_at_pivot) or atr_at_pivot == 0:
+            # This warning should ideally not occur frequently if the warmup logic above is correct,
+            # but it's a good safeguard.
+            print(f"Warning (simulate_fib_entries): ATR is NaN or zero at index {i} (pivot index) for pivot despite warmup. Value: {atr_at_pivot}. Skipping simulation for this pivot.")
             df.loc[i, 'trade_outcome'] = -1 # Mark as no trade due to bad ATR
             continue
 
