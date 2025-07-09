@@ -430,7 +430,17 @@ def load_app_settings(filepath=APP_CONFIG_FILE):
         "app_auto_start_trading_after_train": False,
         "app_force_retrain_on_startup": False,
         # Add other ML training specific defaults if needed (e.g., Optuna trials)
-        "app_optuna_trials": 20 # Default Optuna trials for app.py training
+        "app_optuna_trials": 20, # Default Optuna trials for app.py training
+        
+        # New settings for the trading/signal loop
+        "app_trading_symbols": "BTCUSDT", # Comma-separated list of symbols
+        "app_trading_kline_interval": Client.KLINE_INTERVAL_15MINUTE, # Kline interval for live processing
+        "app_scan_interval_seconds": 60,    # How often the main loop runs
+        "app_delay_between_symbols_seconds": 2, # Delay between processing multiple symbols in a cycle
+        "app_sim_sl_atr_multiplier": 1.0,   # ATR multiplier for SL simulation for entry feature calculation
+        "app_sl_atr_multiplier": 2.0,       # ATR multiplier for actual trade SL
+        "app_tp_rr_ratio": 1.5,             # R:R ratio for actual trade TP
+        "app_symbols_csv_path": "app_symbols.csv" # Default path for symbols CSV
     }
 
     loaded_json_settings = {}
@@ -1409,6 +1419,236 @@ def escape_app_markdown_v1(text: str) -> str:
     text = text.replace('_', r'\_').replace('*', r'\*').replace('`', r'\`').replace('[', r'\[')
     return text
 
+def app_send_entry_signal_telegram(current_app_settings: dict, symbol: str, signal_type_display: str, 
+                                   leverage: int, entry_price: float, 
+                                   tp1_price: float, tp2_price: float | None, tp3_price: float | None, 
+                                   sl_price: float, risk_percentage_config: float, 
+                                   est_pnl_tp1: float | None, est_pnl_sl: float | None,
+                                   symbol_info: dict, strategy_name_display: str = "App ML Signal",
+                                   signal_timestamp: pd.Timestamp = None, signal_order_type: str = "N/A",
+                                   p_swing_score: float = None, p_profit_score: float = None):
+    """
+    Formats and sends a new trade signal notification via app.py's Telegram sender.
+    Mirrors main.py's send_entry_signal_telegram formatting.
+    """
+    log_prefix = f"[AppSendEntrySignal-{symbol}]"
+    bot_token = current_app_settings.get("app_telegram_bot_token")
+    chat_id = current_app_settings.get("app_telegram_chat_id")
+
+    if not bot_token or not chat_id:
+        print(f"{log_prefix} Telegram token/chat_id not configured in app_settings. Cannot send signal.")
+        return
+
+    if signal_timestamp is None:
+        signal_timestamp = pd.Timestamp.now(tz='UTC')
+    
+    p_prec = int(symbol_info.get('pricePrecision', 2)) if symbol_info else 2
+
+    tp1_str = f"{tp1_price:.{p_prec}f}" if tp1_price is not None else "N/A"
+    tp2_str = f"{tp2_price:.{p_prec}f}" if tp2_price is not None else "N/A"
+    tp3_str = f"{tp3_price:.{p_prec}f}" if tp3_price is not None else "N/A"
+    sl_str = f"{sl_price:.{p_prec}f}" if sl_price is not None else "N/A"
+    
+    # P&L estimations are passed in, so no need for calculate_pnl_for_fixed_capital here
+    # unless we want to standardize that helper within app.py too. For now, assume they are provided.
+    pnl_tp1_str = f"{est_pnl_tp1:.2f} USDT" if est_pnl_tp1 is not None else "Not Calculated"
+    pnl_sl_str = f"{est_pnl_sl:.2f} USDT" if est_pnl_sl is not None else "Not Calculated"
+
+    side_emoji = "🔼" if "LONG" in signal_type_display.upper() else "🔽" if "SHORT" in signal_type_display.upper() else "↔️"
+    signal_side_text = "LONG" if "LONG" in signal_type_display.upper() else "SHORT" if "SHORT" in signal_type_display.upper() else "N/A"
+    formatted_timestamp = signal_timestamp.strftime('%Y-%m-%d %H:%M:%S %Z')
+
+    # Escape dynamic string parts
+    escaped_symbol = escape_app_markdown_v1(symbol)
+    escaped_strategy_name = escape_app_markdown_v1(strategy_name_display)
+    escaped_signal_type = escape_app_markdown_v1(signal_type_display)
+    escaped_order_type = escape_app_markdown_v1(signal_order_type)
+    
+    message = (
+        f"🔔 *NEW TRADE SIGNAL* | {escaped_strategy_name} {side_emoji}\n\n"
+        f"🗓️ Time: `{formatted_timestamp}`\n"
+        f"📈 Symbol: `{escaped_symbol}`\n"
+        f"SIDE: *{signal_side_text}*\n"
+        f"🔩 Strategy: `{escaped_signal_type}`\n"
+        f"📊 Order Type: `{escaped_order_type}`\n"
+        f"Leverage: `{leverage}x`\n\n"
+        f"➡️ Entry Price: `{entry_price:.{p_prec}f}`\n"
+        f"🛡️ Stop Loss: `{sl_str}`\n"
+    )
+    
+    tps_message_part = ""
+    if tp1_price is not None: tps_message_part += f"🎯 Take Profit 1: `{tp1_str}`\n"
+    if tp2_price is not None: tps_message_part += f"🎯 Take Profit 2: `{tp2_str}`\n"
+    if tp3_price is not None: tps_message_part += f"🎯 Take Profit 3: `{tp3_str}`\n"
+    if not tps_message_part and tp1_price is None: tps_message_part = "🎯 Take Profit Levels: `N/A`\n"
+    message += tps_message_part
+    
+    message += f"\n📊 Configured Risk: `{risk_percentage_config * 100:.2f}%`\n"
+
+    if p_swing_score is not None and p_profit_score is not None:
+        message += f"📈 ML Scores: P_Swing=`{p_swing_score:.3f}`, P_Profit=`{p_profit_score:.3f}`\n"
+
+    # P&L estimation based on $100 capital is often part of main.py's message.
+    # If est_pnl_tp1 and est_pnl_sl are provided, we use them.
+    message += (
+        f"\n💰 *Est. P&L ($100 Capital Trade):*\n"
+        f"  - TP1 Hit: `{pnl_tp1_str}`\n"
+        f"  - SL Hit: `{pnl_sl_str}`\n\n"
+    )
+
+    message += f"⚠️ _This is a signal only. No order has been placed by app.py in 'signal' mode._"
+    
+    print(f"{log_prefix} Formatted entry signal message for Telegram.")
+    send_app_telegram_message(message) # Uses app.py's sender
+
+def app_send_signal_update_telegram(current_app_settings: dict, signal_details: dict, update_type: str, 
+                                    message_detail: str, current_market_price: float, 
+                                    pnl_estimation_fixed_capital: float | None = None):
+    """
+    Formats and sends updates on an existing signal (e.g., SL/TP hit) via app.py's sender.
+    Mirrors main.py's send_signal_update_telegram formatting.
+    `signal_details` should be a dictionary from `app_active_trades` or similar structure.
+    """
+    log_prefix = f"[AppSendSignalUpdate-{signal_details.get('symbol', 'N/A')}]"
+    bot_token = current_app_settings.get("app_telegram_bot_token")
+    chat_id = current_app_settings.get("app_telegram_chat_id")
+
+    if not bot_token or not chat_id:
+        print(f"{log_prefix} Telegram token/chat_id not configured. Cannot send signal update.")
+        return
+
+    symbol = signal_details.get('symbol', 'N/A')
+    side = signal_details.get('side', 'N/A')
+    entry_price = signal_details.get('entry_price', 0.0) # This should be the actual entry price
+    s_info = signal_details.get('symbol_info', {})
+    p_prec = int(s_info.get('pricePrecision', 2)) if s_info else 2
+    strategy_type_display = escape_app_markdown_v1(signal_details.get('strategy_type', "App Signal"))
+    escaped_symbol = escape_app_markdown_v1(symbol)
+    escaped_update_type = escape_app_markdown_v1(update_type)
+    escaped_message_detail = escape_app_markdown_v1(message_detail)
+
+    title_emoji = "⚙️" # Default
+    if update_type.startswith("TP"): title_emoji = "✅"
+    elif "SL_HIT" in update_type.upper(): title_emoji = "❌" # More robust check
+    elif "SL_ADJUSTED" in update_type.upper(): title_emoji = "🛡️"
+    elif "CLOSED" in update_type.upper(): title_emoji = "🎉" # For general closures like all TPs hit
+    
+    pnl_info_str = ""
+    if pnl_estimation_fixed_capital is not None:
+        pnl_info_str = f"\nEst. P&L ($100 Capital): `{pnl_estimation_fixed_capital:.2f} USDT`"
+
+    message = (
+        f"{title_emoji} *SIGNAL UPDATE* ({strategy_type_display}) {title_emoji}\n\n"
+        f"Symbol: `{escaped_symbol}` ({side})\n"
+        f"Entry: `{entry_price:.{p_prec}f}`\n"
+        f"Update Type: `{escaped_update_type}`\n"
+        f"Details: _{escaped_message_detail}_\n"
+        f"Current Market Price: `{current_market_price:.{p_prec}f}`"
+        f"{pnl_info_str}"
+    )
+    
+    # Simple spam prevention (can be enhanced if signal_details is mutable and tracks last message)
+    # For now, this function doesn't modify signal_details.
+    
+    print(f"{log_prefix} Formatted signal update message for Telegram.")
+    send_app_telegram_message(message)
+
+def app_send_trade_rejection_notification(current_app_settings: dict, symbol: str, signal_type: str, 
+                                          reason: str, entry_price: float | None, sl_price: float | None, 
+                                          tp_price: float | None, quantity: float | None, 
+                                          symbol_info: dict | None):
+    """
+    Formats and sends a trade rejection notification via app.py's sender.
+    Mirrors main.py's send_trade_rejection_notification formatting.
+    """
+    log_prefix = f"[AppSendTradeRejection-{symbol}]"
+    bot_token = current_app_settings.get("app_telegram_bot_token")
+    chat_id = current_app_settings.get("app_telegram_chat_id")
+
+    if not bot_token or not chat_id:
+        print(f"{log_prefix} Telegram token/chat_id not configured. Cannot send rejection notification.")
+        return
+
+    p_prec = int(symbol_info.get('pricePrecision', 2)) if symbol_info else 2
+    q_prec = int(symbol_info.get('quantityPrecision', 0)) if symbol_info else 0
+
+    entry_price_str = f"{entry_price:.{p_prec}f}" if entry_price is not None else "N/A"
+    sl_price_str = f"{sl_price:.{p_prec}f}" if sl_price is not None else "N/A"
+    tp_price_str = f"{tp_price:.{p_prec}f}" if tp_price is not None else "N/A"
+    quantity_str = f"{quantity:.{q_prec}f}" if quantity is not None else "N/A"
+
+    escaped_symbol = escape_app_markdown_v1(symbol)
+    escaped_signal_type = escape_app_markdown_v1(signal_type)
+    escaped_reason = escape_app_markdown_v1(reason)
+
+    message = (
+        f"⚠️ TRADE REJECTED (App.py) ⚠️\n\n"
+        f"Symbol: `{escaped_symbol}`\n"
+        f"Signal Type: `{escaped_signal_type}`\n"
+        f"Reason: _{escaped_reason}_\n\n"
+        f"*Attempted Parameters:*\n"
+        f"Entry: `{entry_price_str}`\n"
+        f"SL: `{sl_price_str}`\n"
+        f"TP: `{tp_price_str}`\n"
+        f"Qty: `{quantity_str}`"
+    )
+
+    print(f"{log_prefix} Formatted trade rejection message for Telegram.")
+    send_app_telegram_message(message)
+
+def app_calculate_pnl_for_fixed_capital(entry_price: float, exit_price: float, side: str, 
+                                        leverage: int, fixed_capital_usdt: float = 100.0, 
+                                        symbol_info: dict = None) -> float | None:
+    """
+    Calculates estimated P&L for a trade based on a fixed capital amount (e.g., $100) for app.py.
+    """
+    log_prefix = "[AppCalcPnlFixedCap]"
+    if entry_price is None or exit_price is None:
+        print(f"{log_prefix} Entry price ({entry_price}) or Exit price ({exit_price}) is None.")
+        return None
+    if not all([isinstance(entry_price, (int,float)) and entry_price > 0, 
+                isinstance(exit_price, (int,float)) and exit_price > 0, 
+                leverage > 0, fixed_capital_usdt > 0]):
+        print(f"{log_prefix} Invalid inputs (entry_price:{entry_price}, exit_price:{exit_price}, leverage:{leverage}, capital:{fixed_capital_usdt})")
+        return None
+    if side.upper() not in ["LONG", "SHORT"]:
+        print(f"{log_prefix} Invalid side '{side}'")
+        return None
+    if entry_price == exit_price:
+        return 0.0
+
+    position_value_usdt = fixed_capital_usdt * leverage
+    quantity_base_asset = position_value_usdt / entry_price # Ideal quantity
+
+    if symbol_info:
+        q_prec = int(symbol_info.get('quantityPrecision', 8))
+        lot_size_filter = next((f for f in symbol_info.get('filters', []) if f.get('filterType') == 'LOT_SIZE'), None)
+        
+        min_qty_val = 0.0
+        if lot_size_filter:
+            min_qty_val = float(lot_size_filter.get('minQty', 0.0))
+            step_size = float(lot_size_filter.get('stepSize', 0.0))
+            if step_size > 0:
+                 quantity_base_asset = math.floor(quantity_base_asset / step_size) * step_size
+        
+        quantity_base_asset = round(quantity_base_asset, q_prec)
+        
+        if quantity_base_asset < min_qty_val and min_qty_val > 0 : # If calculated qty is less than min_qty, PNL is effectively 0 for this estimation
+            print(f"{log_prefix} Calculated quantity {quantity_base_asset} for ${fixed_capital_usdt} is less than min_qty {min_qty_val} for {symbol_info.get('symbol', 'N/A')}. Estimating PNL as 0.")
+            return 0.0
+    
+    if quantity_base_asset == 0:
+        print(f"{log_prefix} Calculated quantity for ${fixed_capital_usdt} is zero for {symbol_info.get('symbol', 'N/A') if symbol_info else 'N/A'}. PNL is 0.")
+        return 0.0
+
+    pnl = 0.0
+    if side.upper() == "LONG":
+        pnl = (exit_price - entry_price) * quantity_base_asset
+    elif side.upper() == "SHORT":
+        pnl = (entry_price - exit_price) * quantity_base_asset
+    
+    return pnl
+
 # Placeholder for starting a dedicated Telegram listener for app.py commands
 # def start_app_telegram_listener():
 #     global app_ptb_event_loop, app_trading_configs
@@ -1514,6 +1754,555 @@ def check_ml_models_exist():
         return False, pivot_model_path, entry_model_path, models_params_path
 
 # --- End ML Model File Utilities ---
+
+# --- Live Feature Calculation Functions ---
+def app_calculate_live_pivot_features(df_live: pd.DataFrame, atr_period: int, pivot_feature_names: list, current_app_settings: dict):
+    """
+    Calculates features for the pivot detection model on live data.
+    `df_live` should be a DataFrame of historical klines ending with the current (or last closed) candle.
+    `atr_period` must match the period used during training.
+    `pivot_feature_names` is the list of feature names the model expects.
+    `current_app_settings` provides access to app configurations if needed (e.g. for logging or specific parameters).
+    Returns a pd.Series of features for the latest candle, or None if an error occurs.
+    """
+    log_prefix = "[AppLivePivotFeatures]"
+    if df_live.empty or len(df_live) < atr_period + 50: # Min data for ATR, EMAs, rolling features
+        print(f"{log_prefix} Insufficient data ({len(df_live)} candles) for live pivot feature calculation. Need at least {atr_period + 50}.")
+        return None
+
+    df = df_live.copy() # Work on a copy
+
+    # ATR Calculation (consistent with app.py's training method)
+    # The `calculate_atr` function in app.py uses rolling().mean() for TR.
+    # It adds a column like 'atr_14' if period is 14.
+    df = calculate_atr(df, period=atr_period) # This should add f'atr_{atr_period}'
+    atr_col_name = f'atr_{atr_period}'
+
+    if atr_col_name not in df.columns or df[atr_col_name].iloc[-1] is None or pd.isna(df[atr_col_name].iloc[-1]):
+        print(f"{log_prefix} ATR calculation failed or resulted in NaN for the latest candle. ATR Column: '{atr_col_name}'.")
+        # Attempt to log more details about the ATR series end
+        if atr_col_name in df.columns:
+            print(f"{log_prefix} Last few ATR values: {df[atr_col_name].tail().to_dict()}")
+        else:
+            print(f"{log_prefix} ATR column '{atr_col_name}' was not even created.")
+        return None
+    
+    # Ensure ATR is not zero to prevent division by zero errors for normalized features
+    if df[atr_col_name].iloc[-1] == 0:
+        print(f"{log_prefix} Warning: ATR for the latest candle is zero. Normalizing features might lead to inf. Using a small epsilon for ATR.")
+        # Replace zero ATR with a very small number to avoid division by zero
+        # This should only affect the last row for feature calculation.
+        # A more robust way might be to check and adjust df[atr_col_name].iloc[-1] before it's used in divisions.
+        # However, feature engineering functions below might use the whole column.
+        # For safety, let's ensure the last ATR value used in division is non-zero.
+        # The functions like engineer_pivot_features might need to be aware of this.
+        # The current engineer_pivot_features in app.py uses the atr_col_name directly.
+        # We will rely on it to handle or propagate NaNs/Infs if ATR is zero.
+
+    # Re-call app.py's engineer_pivot_features function.
+    # It's designed to add features to the DataFrame.
+    # We need to ensure it's using the correct atr_col_name.
+    # The existing `engineer_pivot_features` in `app.py` takes `atr_col_name` as an argument.
+    
+    # The global PIVOT_N_LEFT, PIVOT_N_RIGHT are used by prune_and_label_pivots,
+    # which is part of the training data generation. For live feature calculation for a *pre-trained model*,
+    # we only need to generate the input features the model expects.
+    # The `engineer_pivot_features` function calculates features like 'bars_since_last_pivot'.
+    # This specific feature's live calculation needs careful consideration if it relied on labels.
+    # Looking at app.py's `engineer_pivot_features`:
+    # `bars_since_last_pivot` is calculated based on `is_swing_high` or `is_swing_low` columns.
+    # These columns are typically generated by `prune_and_label_pivots` during training.
+    # For live data, these labels won't exist.
+    # Solution: `engineer_pivot_features` needs to be adapted or a live-specific version created
+    # that does not depend on pre-existing labels for features like `bars_since_last_pivot`.
+    # For now, let's assume `engineer_pivot_features` can run and we'll address `bars_since_last_pivot` if it causes issues.
+    # A simple fix for 'bars_since_last_pivot' if labels are missing: set it to 0 or a high number.
+    # Add dummy label columns if engineer_pivot_features strictly requires them, but they won't be used for actual labeling.
+    if 'is_swing_high' not in df.columns: df['is_swing_high'] = 0
+    if 'is_swing_low' not in df.columns: df['is_swing_low'] = 0
+    
+    df_with_features, calculated_feature_names = engineer_pivot_features(df, atr_col_name=atr_col_name)
+    
+    # Verify that the `calculated_feature_names` from `engineer_pivot_features` match the expected `pivot_feature_names`.
+    # This is a sanity check. The `pivot_feature_names` list (from best_hyperparams) is the source of truth.
+
+    # Select the required features for the latest candle
+    live_features_series = df_with_features.iloc[-1][pivot_feature_names].copy()
+    
+    # Replace Inf values (e.g., from division by zero if ATR was zero and not handled robustly)
+    live_features_series.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+    if live_features_series.isnull().any():
+        print(f"{log_prefix} NaN values found in live pivot features for the latest candle:")
+        print(live_features_series[live_features_series.isnull()])
+        # Impute NaNs with -1 (consistent with Optuna trial feature preparation in app.py)
+        live_features_series.fillna(-1, inplace=True)
+        print(f"{log_prefix} NaNs filled with -1.")
+
+    print(f"{log_prefix} Successfully calculated live pivot features for the latest candle.")
+    return live_features_series
+
+def app_calculate_live_entry_features(df_live: pd.DataFrame, atr_period: int, entry_feature_names_base: list,
+                                      p_swing_score: float, simulated_entry_price: float, simulated_sl_price: float,
+                                      pivot_price_for_dist: float, current_app_settings: dict):
+    """
+    Calculates features for the entry evaluation model on live data.
+    `df_live` should be klines ending with the current (pivot) candle.
+    `atr_period` must match training.
+    `entry_feature_names_base` are base features the model expects.
+    `p_swing_score`, `simulated_entry_price`, `simulated_sl_price`, `pivot_price_for_dist` are contextual.
+    Returns a pd.Series of features for the current context, or None.
+    """
+    log_prefix = "[AppLiveEntryFeatures]"
+    if df_live.empty or len(df_live) < atr_period + 50: # Min data for ATR, EMAs, etc.
+        print(f"{log_prefix} Insufficient data ({len(df_live)} candles) for live entry feature calculation. Need {atr_period + 50}.")
+        return None
+
+    df = df_live.copy()
+    atr_col_name = f'atr_{atr_period}'
+
+    # Ensure ATR column from pivot feature calculation is present or recalculate
+    if atr_col_name not in df.columns or df[atr_col_name].iloc[-1] is None or pd.isna(df[atr_col_name].iloc[-1]):
+        print(f"{log_prefix} ATR column '{atr_col_name}' missing or NaN. Attempting recalculation for entry features.")
+        df = calculate_atr(df, period=atr_period) # Use app.py's version
+        if atr_col_name not in df.columns or df[atr_col_name].iloc[-1] is None or pd.isna(df[atr_col_name].iloc[-1]):
+            print(f"{log_prefix} Critical: ATR recalculation failed or resulted in NaN. Cannot proceed.")
+            return None
+
+    current_atr_value = df[atr_col_name].iloc[-1]
+    if current_atr_value == 0:
+        print(f"{log_prefix} Warning: Current ATR for entry features is zero. Using small epsilon.")
+        current_atr_value = 1e-9 # Avoid division by zero
+
+    # Add contextual features to the last row of the DataFrame (current candle)
+    # These are calculated based on the current event/pivot.
+    last_candle_idx = df.index[-1]
+    df.loc[last_candle_idx, 'P_swing'] = p_swing_score
+    
+    # Normalized distance features
+    # norm_dist_entry_pivot = (simulated_entry_price - pivot_price_for_dist) / ATR
+    # norm_dist_entry_sl = abs(simulated_entry_price - simulated_sl_price) / ATR
+    # Ensure pivot_price_for_dist is not None
+    if pivot_price_for_dist is None:
+        print(f"{log_prefix} pivot_price_for_dist is None. Cannot calculate norm_dist_entry_pivot.")
+        return None # Critical feature missing
+
+    df.loc[last_candle_idx, 'norm_dist_entry_pivot'] = (simulated_entry_price - pivot_price_for_dist) / current_atr_value
+    df.loc[last_candle_idx, 'norm_dist_entry_sl'] = abs(simulated_entry_price - simulated_sl_price) / current_atr_value
+
+    # Call app.py's engineer_entry_features to calculate the base features
+    # It takes `entry_features_base_list_arg` which should be `entry_feature_names_base`
+    df_with_base_features, calculated_base_feature_names = engineer_entry_features(
+        df, 
+        atr_col_name=atr_col_name,
+        entry_features_base_list_arg=entry_feature_names_base
+    )
+
+    # The full list of features the entry model expects
+    # (base features + P_swing + normalized distances)
+    full_entry_feature_list = entry_feature_names_base + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']
+    
+    # Ensure all features in full_entry_feature_list are present in df_with_base_features.
+    # engineer_entry_features adds its columns. P_swing, norm_dist_... were added above.
+    missing_cols = [col for col in full_entry_feature_list if col not in df_with_base_features.columns]
+    if missing_cols:
+        print(f"{log_prefix} Error: The following expected entry features are missing from the DataFrame after calculation: {missing_cols}")
+        # This indicates a discrepancy between `entry_feature_names_base` (from params) and what `engineer_entry_features` produced,
+        # or an issue with adding the contextual features.
+        return None
+
+    # Select the full feature set for the latest candle
+    live_features_series = df_with_base_features.iloc[-1][full_entry_feature_list].copy()
+
+    # Replace Inf values
+    live_features_series.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+    if live_features_series.isnull().any():
+        print(f"{log_prefix} NaN values found in live entry features for the latest candle:")
+        print(live_features_series[live_features_series.isnull()])
+        live_features_series.fillna(-1, inplace=True) # Impute with -1
+        print(f"{log_prefix} NaNs filled with -1.")
+    
+    print(f"{log_prefix} Successfully calculated live entry features.")
+    return live_features_series
+
+# --- Symbol Loading Utilities ---
+def app_load_symbols_from_csv(filepath: str) -> list[str]:
+    """Loads symbols from a CSV file, expecting a single 'symbol' column."""
+    log_prefix = "[AppLoadSymbols]"
+    if not os.path.exists(filepath):
+        print(f"{log_prefix} Info: Symbol CSV file '{filepath}' not found.")
+        return []
+    try:
+        df = pd.read_csv(filepath)
+        if 'symbol' not in df.columns:
+            print(f"{log_prefix} Error: Symbol CSV file '{filepath}' must contain a 'symbol' column.")
+            return []
+        
+        symbols_list = sorted(list(set(df['symbol'].dropna().astype(str).str.upper().tolist())))
+        
+        if not symbols_list:
+            print(f"{log_prefix} Info: Symbol CSV file '{filepath}' is empty or contains no valid symbols.")
+            return []
+        print(f"{log_prefix} Loaded {len(symbols_list)} unique symbols from '{filepath}'.")
+        return symbols_list
+    except pd.errors.EmptyDataError:
+        print(f"{log_prefix} Info: Symbol CSV file '{filepath}' is empty.")
+        return []
+    except Exception as e:
+        print(f"{log_prefix} Error loading symbols from CSV '{filepath}': {e}")
+        return []
+
+# --- End Symbol Loading Utilities ---
+
+def app_process_symbol_for_signal(symbol: str, client, current_app_settings: dict, 
+                                  pivot_model_loaded, entry_model_loaded, current_best_hyperparams: dict):
+    """
+    Processes a single symbol to detect trading signals using loaded ML models.
+    Fetches data, calculates features, gets predictions, and then either sends
+    a Telegram notification (signal mode) or executes a trade (live mode).
+    """
+    log_prefix = f"[AppProcessSymbol-{symbol}]"
+    print(f"{log_prefix} Starting processing for symbol.")
+
+    if not pivot_model_loaded or not entry_model_loaded:
+        print(f"{log_prefix} Models not loaded. Skipping.")
+        return
+
+    if not current_best_hyperparams:
+        print(f"{log_prefix} Best hyperparameters not loaded. Skipping.")
+        return
+
+    # --- Parameters from best_hyperparams ---
+    atr_period_for_features = current_best_hyperparams.get('model_training_atr_period_used')
+    pivot_feature_names_list = current_best_hyperparams.get('pivot_feature_names_used')
+    entry_feature_names_base_list = current_best_hyperparams.get('entry_feature_names_base_used')
+    p_swing_thresh = current_best_hyperparams.get('p_swing_threshold')
+    p_profit_thresh = current_best_hyperparams.get('profit_threshold') # Assuming this is prob of profitable class
+
+    if not all([atr_period_for_features, pivot_feature_names_list, entry_feature_names_base_list, p_swing_thresh, p_profit_thresh]):
+        print(f"{log_prefix} Critical parameters missing from best_hyperparams. Skipping. Check app_model_params.json.")
+        print(f"  ATR Period: {atr_period_for_features}, P-Swing Thresh: {p_swing_thresh}, P-Profit Thresh: {p_profit_thresh}")
+        print(f"  Pivot Features List Empty: {not pivot_feature_names_list}, Entry Features Base List Empty: {not entry_feature_names_base_list}")
+        return
+
+    # --- Data Fetching ---
+    # Determine kline interval (e.g., from app_settings or fixed based on training)
+    # Assuming training used 15-minute interval as per app.py's get_processed_data_for_symbol defaults
+    kline_interval_live = current_app_settings.get("app_trading_kline_interval", Client.KLINE_INTERVAL_15MINUTE) # Add this setting
+    
+    # Fetch enough klines for feature calculations (e.g., ATR period + EMA periods + buffer)
+    # A common need is around 200-250 candles for 15-min interval.
+    # Max lookback for features in app.py: EMA50, rolling volume 20, ATR period (e.g. 14-20).
+    # So, atr_period + 50 (for EMA50) + some buffer = e.g., 20 + 50 + 30 = 100. Let's use more to be safe.
+    num_klines_to_fetch = atr_period_for_features + 50 + 150 # ~200-250 depending on ATR period
+    
+    print(f"{log_prefix} Fetching {num_klines_to_fetch} klines at {kline_interval_live} for {symbol}...")
+    try:
+        # Assuming get_historical_bars is suitable for fetching live-ish data by not passing end_str
+        df_live_raw = get_historical_bars(symbol, kline_interval_live, start_str=f"{num_klines_to_fetch + 5} days ago UTC") # Fetch a bit more initially
+        if df_live_raw.empty:
+            print(f"{log_prefix} No kline data returned for {symbol}. Skipping.")
+            return
+        # Ensure we have exactly num_klines_to_fetch of the most recent data
+        df_live_raw = df_live_raw.iloc[-num_klines_to_fetch:]
+        if len(df_live_raw) < num_klines_to_fetch * 0.9: # If significantly less data than requested
+             print(f"{log_prefix} Insufficient klines ({len(df_live_raw)}/{num_klines_to_fetch}) after fetch for {symbol}. Skipping.")
+             return
+
+    except Exception as e:
+        print(f"{log_prefix} Error fetching kline data for {symbol}: {e}")
+        return
+    
+    print(f"{log_prefix} Kline data fetched. Length: {len(df_live_raw)}. Last candle time: {df_live_raw.index[-1]}")
+
+    # --- Stage 1: Pivot Model Prediction ---
+    live_pivot_features = app_calculate_live_pivot_features(df_live_raw, atr_period_for_features, pivot_feature_names_list, current_app_settings)
+    if live_pivot_features is None:
+        print(f"{log_prefix} Failed to calculate live pivot features. Skipping.")
+        return
+
+    try:
+        pivot_probs = pivot_model_loaded.predict_proba(live_pivot_features.values.reshape(1, -1))[0]
+        # Assuming class 0: none, 1: high, 2: low (from app.py's pivot_label)
+        p_swing_high = pivot_probs[1] if len(pivot_probs) > 1 else 0
+        p_swing_low = pivot_probs[2] if len(pivot_probs) > 2 else 0
+        p_swing_score_live = max(p_swing_high, p_swing_low)
+        predicted_pivot_class_live = np.argmax(pivot_probs)
+    except Exception as e:
+        print(f"{log_prefix} Error during pivot model prediction: {e}")
+        return
+
+    print(f"{log_prefix} Pivot Model: P_Swing={p_swing_score_live:.3f} (H:{p_swing_high:.2f}, L:{p_swing_low:.2f}), PredClass={predicted_pivot_class_live}, Thresh={p_swing_thresh:.2f}")
+
+    if p_swing_score_live < p_swing_thresh or predicted_pivot_class_live == 0:
+        # print(f"{log_prefix} No significant pivot detected by model. P_Swing: {p_swing_score_live:.3f}")
+        return
+
+    # --- Pivot Detected, Proceed to Entry Model ---
+    current_candle = df_live_raw.iloc[-1]
+    pivot_price_sim = current_candle['high'] if predicted_pivot_class_live == 1 else current_candle['low'] # High for short, Low for long
+    trade_side_potential = "short" if predicted_pivot_class_live == 1 else "long"
+    print(f"{log_prefix} Pivot detected: {trade_side_potential.upper()} setup. PivotPrice_Sim={pivot_price_sim}, P_Swing={p_swing_score_live:.3f}")
+
+    # Simulate entry/SL for entry feature calculation
+    # This simulation is only for generating features, not actual trade parameters yet.
+    # Uses ATR at the current candle.
+    atr_val_current = df_live_raw[f'atr_{atr_period_for_features}'].iloc[-1]
+    if pd.isna(atr_val_current) or atr_val_current == 0:
+        print(f"{log_prefix} Invalid ATR ({atr_val_current}) for simulating entry/SL for features. Skipping.")
+        return
+        
+    # Simplified simulation for feature calculation (e.g., entry at close, SL is ATR based from pivot_price_sim)
+    # This might differ from actual trade SL calculation later.
+    # The objective_optuna uses specific fib-based simulation. Here, we need a generic way for live.
+    # Let's use a simple ATR-based SL from the pivot price for feature input.
+    # `model_best_params` might have `sl_atr_multiplier_opt` or similar if SL calculation was tuned.
+    # For now, use a generic multiplier or one from general app_settings if available.
+    # `app.py`'s `objective_optuna` uses `simulate_fib_entries` which is complex.
+    # `main.py`'s `process_symbol_adv_fib_ml_task` uses `sim_sl_dist_feat = atr_val_for_sim_features * sl_mult_feat`
+    # where `sl_mult_feat` is `configs.get("fib_sl_atr_multiplier_exec")`.
+    # Let's assume `app_settings` or `best_hyperparams` has a suitable `sim_sl_atr_multiplier`.
+    sim_sl_atr_mult = current_app_settings.get('app_sim_sl_atr_multiplier', 1.0) # Add to settings if needed
+    
+    sim_entry_for_features = current_candle['close']
+    sim_sl_dist_for_features = atr_val_current * sim_sl_atr_mult
+    sim_sl_for_features = (pivot_price_sim - sim_sl_dist_for_features) if trade_side_potential == "long" else (pivot_price_sim + sim_sl_dist_for_features)
+    
+    live_entry_features = app_calculate_live_entry_features(
+        df_live_raw, atr_period_for_features, entry_feature_names_base_list,
+        p_swing_score_live, sim_entry_for_features, sim_sl_for_features,
+        pivot_price_sim, current_app_settings
+    )
+
+    if live_entry_features is None:
+        print(f"{log_prefix} Failed to calculate live entry features. Skipping.")
+        return
+
+    try:
+        entry_probs = entry_model_loaded.predict_proba(live_entry_features.values.reshape(1, -1))[0]
+        # Assuming binary classification: class 1 is "profitable"
+        p_profit_live = entry_probs[1] if len(entry_probs) > 1 else 0
+    except Exception as e:
+        print(f"{log_prefix} Error during entry model prediction: {e}")
+        return
+
+    print(f"{log_prefix} Entry Model: P_Profit={p_profit_live:.3f}, Thresh={p_profit_thresh:.2f}")
+
+    if p_profit_live < p_profit_thresh:
+        # print(f"{log_prefix} Entry signal not strong enough. P_Profit: {p_profit_live:.3f}")
+        return
+
+    # --- Entry Confirmed by Both Models ---
+    print(f"{log_prefix} ENTRY CONFIRMED: {trade_side_potential.upper()} for {symbol}. P_Swing={p_swing_score_live:.2f}, P_Profit={p_profit_live:.2f}")
+
+    # Determine actual entry price, SL, TP for trade/signal
+    # Entry: Current market price (last close for simulation, or fetch live ticker for live)
+    actual_entry_price = current_candle['close'] # For now, use close of the signal candle
+    
+    # SL: Could be ATR-based from the `pivot_price_sim` or from `actual_entry_price`.
+    # Let's use `pivot_price_sim` as the anchor for SL, consistent with how features might interpret it.
+    # The multiplier for actual SL can come from `app_settings` (e.g., `app_sl_atr_multiplier`)
+    actual_sl_atr_mult = current_app_settings.get('app_sl_atr_multiplier', 2.0) # Example setting
+    actual_sl_distance = atr_val_current * actual_sl_atr_mult
+    actual_sl_price = (pivot_price_sim - actual_sl_distance) if trade_side_potential == "long" else (pivot_price_sim + actual_sl_distance)
+    
+    # TP: Could be fixed R:R from `actual_sl_price`
+    tp_rr_ratio = current_app_settings.get('app_tp_rr_ratio', 1.5) # Example setting
+    risk_amount_per_unit = abs(actual_entry_price - actual_sl_price)
+    if risk_amount_per_unit == 0: # Should be handled by sanity checks later too
+        print(f"{log_prefix} Risk amount is zero. Cannot calculate TP. Skipping.")
+        return
+        
+    actual_tp_price = (actual_entry_price + (risk_amount_per_unit * tp_rr_ratio)) if trade_side_potential == "long" else \
+                      (actual_entry_price - (risk_amount_per_unit * tp_rr_ratio))
+
+    # Round prices to symbol precision (fetch from symbol_info if available, or use a default)
+    # This should ideally be done by execute_app_trade_signal or before sending telegram.
+    # For now, raw calculation.
+    # Example: p_prec = get_app_symbol_info(symbol).get('pricePrecision', 2)
+    # actual_sl_price = round(actual_sl_price, p_prec)
+    # actual_tp_price = round(actual_tp_price, p_prec)
+
+    # --- Perform Action based on Operational Mode ---
+    if current_app_settings.get('app_operational_mode') == 'signal':
+            # Send Telegram signal using the new rich wrapper
+            symbol_info_for_signal = get_app_symbol_info(symbol) # Fetch for precision and other details
+            if not symbol_info_for_signal:
+                print(f"{log_prefix} Could not get symbol_info for Telegram message. Sending basic notification.")
+                send_app_telegram_message(f"Basic ML Signal: {symbol} {trade_side_potential.upper()} @ {actual_entry_price}, SL {actual_sl_price}, TP {actual_tp_price}")
+            else:
+                # Placeholder for P&L estimation - ideally, a helper function would calculate this.
+                # For now, passing None for est_pnl_tp1 and est_pnl_sl.
+                # These would require a fixed capital assumption (e.g., $100) and leverage.
+                # Leverage can be taken from current_app_settings.get('app_leverage', 20)
+                # Calculate P&L estimations for the signal message
+                current_leverage_for_signal = current_app_settings.get('app_leverage', 20)
+                fixed_capital_for_est = 100.0 # Standard $100 assumption
+
+                est_pnl_at_tp = app_calculate_pnl_for_fixed_capital(
+                    entry_price=actual_entry_price,
+                    exit_price=actual_tp_price,
+                    side=trade_side_potential.upper(),
+                    leverage=current_leverage_for_signal,
+                    fixed_capital_usdt=fixed_capital_for_est,
+                    symbol_info=symbol_info_for_signal
+                )
+                est_pnl_at_sl = app_calculate_pnl_for_fixed_capital(
+                    entry_price=actual_entry_price,
+                    exit_price=actual_sl_price,
+                    side=trade_side_potential.upper(),
+                    leverage=current_leverage_for_signal,
+                    fixed_capital_usdt=fixed_capital_for_est,
+                    symbol_info=symbol_info_for_signal
+                )
+
+                app_send_entry_signal_telegram(
+                    current_app_settings=current_app_settings,
+                    symbol=symbol,
+                    signal_type_display=f"ML_PIVOT_{trade_side_potential.upper()}", # More specific type
+                    leverage=current_leverage_for_signal, 
+                    entry_price=actual_entry_price,
+                    tp1_price=actual_tp_price, # Assuming single TP from ML strategy for now
+                    tp2_price=None,
+                    tp3_price=None,
+                    sl_price=actual_sl_price,
+                    risk_percentage_config=current_app_settings.get('app_risk_percent', 0.01),
+                    est_pnl_tp1=est_pnl_at_tp, 
+                    est_pnl_sl=est_pnl_at_sl,
+                    symbol_info=symbol_info_for_signal,
+                    strategy_name_display="App ML Model",
+                    signal_timestamp=current_candle.name, # Timestamp of the signal candle
+                    signal_order_type="MARKET", # Assuming signal implies market execution
+                    p_swing_score=p_swing_score_live,
+                    p_profit_score=p_profit_live
+                )
+
+    elif current_app_settings.get('app_operational_mode') == 'live':
+        print(f"{log_prefix} Executing LIVE trade for {symbol} {trade_side_potential.upper()}.")
+        # Ensure client is initialized and available
+        if client is None:
+            print(f"{log_prefix} Binance client not available for live trade. Skipping.")
+            return
+
+        # The execute_app_trade_signal function expects entry_price_target.
+        # For market orders, it fetches current price. We can pass our calculated actual_entry_price.
+        # It also needs SL, TP1, TP2, TP3. We have one TP.
+        execute_app_trade_signal(
+            symbol=symbol,
+            side=trade_side_potential.upper(),
+            sl_price=actual_sl_price,
+            tp1_price=actual_tp_price, 
+            tp2_price=None, # ML model currently gives one overall profit signal
+            tp3_price=None,
+            entry_price_target=actual_entry_price, # Pass our calculated entry
+            order_type="MARKET" # Assume market execution for now
+        )
+    else:
+        print(f"{log_prefix} Unknown operational mode: {current_app_settings.get('app_operational_mode')}")
+
+    print(f"{log_prefix} Finished processing for symbol.")
+
+def app_trading_signal_loop(current_app_settings: dict, pivot_model_loaded, entry_model_loaded, current_best_hyperparams: dict):
+    """
+    Main continuous loop for live trading or signal generation.
+    """
+    log_prefix = "[AppTradingLoop]"
+    print(f"{log_prefix} Starting trading/signal loop...")
+    
+    global app_binance_client # Ensure global client is accessible
+
+    # Ensure client is initialized (should be by start_app_main_flow, but double check)
+    if app_binance_client is None:
+        print(f"{log_prefix} Binance client not initialized. Attempting to initialize...")
+        if not initialize_app_binance_client(env=current_app_settings.get("app_trading_environment")):
+            print(f"{log_prefix} CRITICAL: Failed to initialize Binance client. Exiting loop.")
+            return
+        print(f"{log_prefix} Binance client initialized successfully within loop startup.")
+
+    try:
+        while True:
+            loop_start_time = time.time()
+            print(f"\n{log_prefix} --- New Scan Cycle --- | Mode: {current_app_settings.get('app_operational_mode', 'UNKNOWN')}")
+
+            trading_symbols = []
+            symbols_source_config = current_app_settings.get("app_trading_symbols", "BTCUSDT") # Default to BTCUSDT string
+            
+            if isinstance(symbols_source_config, str) and symbols_source_config.lower().endswith(".csv"):
+                # Attempt to load from CSV file specified in app_trading_symbols
+                print(f"{log_prefix} Attempting to load symbols from CSV: {symbols_source_config}")
+                trading_symbols = app_load_symbols_from_csv(symbols_source_config)
+                if not trading_symbols:
+                    print(f"{log_prefix} Failed to load symbols from {symbols_source_config} or file is empty. Defaulting to BTCUSDT.")
+                    trading_symbols = ["BTCUSDT"]
+            elif isinstance(symbols_source_config, str):
+                # Parse as comma-separated string
+                trading_symbols = [s.strip().upper() for s in symbols_source_config.split(',') if s.strip()]
+                if not trading_symbols: # If string was empty or only commas
+                    print(f"{log_prefix} 'app_trading_symbols' string ('{symbols_source_config}') resulted in no symbols. Defaulting to BTCUSDT.")
+                    trading_symbols = ["BTCUSDT"]
+            else: # Fallback if config is not a string (e.g. error or unexpected type)
+                print(f"{log_prefix} 'app_trading_symbols' has unexpected type or value. Defaulting to BTCUSDT.")
+                trading_symbols = ["BTCUSDT"]
+
+            if not trading_symbols: # Final fallback, though logic above should ensure trading_symbols is not empty
+                print(f"{log_prefix} No trading symbols configured after all checks. Skipping cycle.")
+            else:
+                print(f"{log_prefix} Processing symbols: {trading_symbols}")
+                for symbol_to_trade in trading_symbols:
+                    print(f"{log_prefix} Processing symbol: {symbol_to_trade}")
+                    app_process_symbol_for_signal(
+                        symbol=symbol_to_trade,
+                        client=app_binance_client, # Use the global client
+                        current_app_settings=current_app_settings,
+                        pivot_model_loaded=pivot_model_loaded,
+                        entry_model_loaded=entry_model_loaded,
+                        current_best_hyperparams=current_best_hyperparams
+                    )
+                    # Optional: Short delay between processing symbols if multiple are listed
+                    time.sleep(current_app_settings.get("app_delay_between_symbols_seconds", 2)) # Default 2s
+
+            # Monitor existing trades/signals (if any were placed)
+            # monitor_app_trades uses the global app_binance_client and app_active_trades
+            if current_app_settings.get('app_operational_mode') == 'live':
+                 print(f"{log_prefix} Monitoring active live trades...")
+                 monitor_app_trades() 
+            elif current_app_settings.get('app_operational_mode') == 'signal':
+                 # If signal mode also needs monitoring (e.g. for virtual SL/TP hits), call a similar function.
+                 # For now, monitor_app_trades is primarily for live order management.
+                 # We might need a separate `monitor_app_virtual_signals` or adapt `monitor_app_trades`.
+                 # The current `monitor_app_trades` has logic for "signal" mode signals if they are in `app_active_trades`.
+                 # The `execute_app_trade_signal` does not add to `app_active_trades` in signal mode.
+                 # This part needs refinement if signal mode requires active monitoring beyond just sending initial signal.
+                 # For now, let's assume `monitor_app_trades` is primarily for live logic.
+                 # If `app_process_symbol_for_signal` were to add signals to a list for tracking,
+                 # a `monitor_app_signals` function would go here.
+                 pass
+
+
+            # Loop delay
+            scan_interval_seconds = current_app_settings.get("app_scan_interval_seconds", 60) # Default to 60 seconds
+            loop_duration = time.time() - loop_start_time
+            sleep_time = max(0, scan_interval_seconds - loop_duration)
+            
+            if sleep_time > 0:
+                print(f"{log_prefix} Cycle completed in {loop_duration:.2f}s. Sleeping for {sleep_time:.2f}s...")
+                time.sleep(sleep_time)
+            else:
+                print(f"{log_prefix} Cycle completed in {loop_duration:.2f}s. Starting next cycle immediately (scan interval too short or processing too long).")
+
+    except KeyboardInterrupt:
+        print(f"\n{log_prefix} Loop interrupted by user (Ctrl+C). Shutting down...")
+    except Exception as e:
+        print(f"\n{log_prefix} CRITICAL UNEXPECTED ERROR in trading loop: {e}")
+        import traceback
+        traceback.print_exc()
+        # Optionally send a Telegram alert about the critical error
+        error_message = f"🆘 CRITICAL ERROR in AppTradingLoop 🆘\nSymbol: {symbol_to_trade if 'symbol_to_trade' in locals() else 'N/A'}\nError: {str(e)[:1000]}"
+        send_app_telegram_message(error_message) # Uses global app_trading_configs for token/chat_id
+    finally:
+        print(f"{log_prefix} Trading/signal loop stopped.")
+        # Potential cleanup logic here if needed (e.g. ensuring client connections are closed if managed locally)
 
 # --- Main Orchestration & Startup Logic ---
 def start_app_main_flow():
@@ -1702,10 +2491,18 @@ def start_app_main_flow():
                     print("CRITICAL: Failed to initialize Binance client. Exiting.")
                     sys.exit(1)
             
-            print("Placeholder: Initiate live trading/signal generation loop here.")
-            # Conceptual: start_app_trading_loop(universal_pivot_model, universal_entry_model, best_hyperparams)
-            print("Application will exit for now as the trading loop is not yet implemented in this step.")
-            sys.exit(0) 
+            # --- Call the main trading/signal loop ---
+            print(f"{log_prefix} Initializing trading/signal loop with mode: {app_settings['app_operational_mode']}")
+            app_trading_signal_loop(
+                current_app_settings=app_settings, # Pass the global app_settings
+                pivot_model_loaded=universal_pivot_model,
+                entry_model_loaded=universal_entry_model,
+                current_best_hyperparams=best_hyperparams
+            )
+            # The loop will run until explicitly stopped (e.g., Ctrl+C or a shutdown command if implemented)
+            # If the loop exits, the application can then terminate.
+            print(f"{log_prefix} Trading/signal loop has exited. Application will now terminate.")
+            sys.exit(0) # Exit after the loop finishes
         
         elif user_action == '2':
             print("User chose to retrain models.")
