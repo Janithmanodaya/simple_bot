@@ -29,10 +29,12 @@ app_binance_client = None
 # --- Global Telegram Loop for app.py ---
 app_ptb_event_loop = None
 
-# --- Global App Trading Configurations ---
-# This will be populated by load_app_trading_configs
-app_trading_configs = {}
-APP_TRADE_CONFIG_FILE = "app_trade_config.csv"
+import json # For JSON operations
+
+# --- Global App Settings ---
+# This will be populated by load_app_settings
+app_settings = {}
+APP_CONFIG_FILE = "app_settings.json" # Changed from APP_TRADE_CONFIG_FILE and to JSON
 
 # --- Global App Active Trades ---
 # Stores details of trades initiated and managed by app.py
@@ -360,103 +362,160 @@ def get_or_download_historical_data(symbol: str, interval: str,
             existing_df = existing_df[existing_df['timestamp'] >= overall_start_dt]
             return existing_df
 
-# --- Configuration Management for App Trading ---
-def load_app_trading_configs(filepath=APP_TRADE_CONFIG_FILE):
+# --- Configuration Management ---
+def get_user_input(prompt, default_value, value_type=str, choices=None):
+    """Helper function to get validated user input."""
+    while True:
+        user_val_str = input(f"{prompt} (default: {default_value}): ").strip()
+        if not user_val_str:
+            user_val_str = str(default_value) # Use default if empty
+
+        try:
+            if value_type == bool:
+                if user_val_str.lower() in ['true', 't', 'yes', 'y', '1']:
+                    converted_value = True
+                elif user_val_str.lower() in ['false', 'f', 'no', 'n', '0']:
+                    converted_value = False
+                else:
+                    raise ValueError("Invalid boolean value.")
+            else:
+                converted_value = value_type(user_val_str)
+
+            if choices and converted_value not in choices:
+                raise ValueError(f"Invalid choice. Must be one of {choices}.")
+            
+            # Specific range checks can be added here if needed, e.g., for risk_percent
+            if prompt.startswith("Risk percent per trade") and not (0 < converted_value <= 1.0): # Assuming input is decimal
+                 raise ValueError("Risk percent must be between 0.0 (exclusive) and 1.0 (inclusive). E.g., 0.01 for 1%.")
+            if prompt.startswith("Leverage") and not (1 <= converted_value <= 125):
+                 raise ValueError("Leverage must be between 1 and 125.")
+
+            return converted_value
+        except ValueError as e:
+            print(f"Invalid input: {e}. Please try again.")
+
+
+def load_app_settings(filepath=APP_CONFIG_FILE):
     """
-    Loads trading configurations for app.py from a CSV file.
-    Uses defaults if the file or specific settings are not found.
-    Populates the global `app_trading_configs` dictionary.
+    Loads app settings from a JSON file.
+    Uses defaults and prompts user if the file or specific settings are not found/incomplete.
+    Populates the global `app_settings` dictionary.
     """
-    global app_trading_configs
+    global app_settings # Use the renamed global dict
 
     defaults = {
-        "app_trading_environment": "mainnet", # 'mainnet' or 'testnet'
-        "app_operational_mode": "signal", # 'live' or 'signal'
-        "app_risk_percent": 0.01, # e.g., 0.01 for 1%
+        "app_trading_environment": "mainnet",
+        "app_operational_mode": "signal", # 'live', 'signal', or 'train_only'
+        "app_risk_percent": 0.01,
         "app_leverage": 20,
         "app_allow_exceed_risk_for_min_notional": False,
-        "app_telegram_bot_token": None, # To be loaded from keys.py if needed by app.py independently
-        "app_telegram_chat_id": None,   # To be loaded from keys.py
-        "app_tp1_qty_pct": 0.25, # Default TP1 quantity percentage
-        "app_tp2_qty_pct": 0.50, # Default TP2 quantity percentage
-        # TP3 is remainder
+        "app_telegram_bot_token": None,
+        "app_telegram_chat_id": None,
+        "app_tp1_qty_pct": 0.25,
+        "app_tp2_qty_pct": 0.50,
+        "app_pivot_model_path": "app_pivot_model.joblib",
+        "app_entry_model_path": "app_entry_model.joblib",
+        "app_model_params_path": "app_model_params.json",
+        "app_auto_start_trading_after_train": False,
+        "app_force_retrain_on_startup": False,
+        # Add other ML training specific defaults if needed (e.g., Optuna trials)
+        "app_optuna_trials": 20 # Default Optuna trials for app.py training
     }
 
-    loaded_csv_configs = {}
-    if os.path.exists(filepath):
+    loaded_json_settings = {}
+    config_file_exists = os.path.exists(filepath)
+
+    if config_file_exists:
         try:
-            df_config = pd.read_csv(filepath)
-            if 'name' in df_config.columns and 'value' in df_config.columns:
-                # Convert to dictionary, handling potential NaN values
-                loaded_csv_configs = pd.Series(df_config.value.values, index=df_config.name).dropna().to_dict()
-                print(f"app.py: Trading configurations loaded from '{filepath}'.")
-            else:
-                print(f"app.py: Trading config file '{filepath}' is missing 'name' or 'value' columns. Using defaults.")
-        except pd.errors.EmptyDataError:
-            print(f"app.py: Trading config file '{filepath}' is empty. Using defaults.")
+            with open(filepath, 'r') as f:
+                loaded_json_settings = json.load(f)
+            print(f"app.py: Settings loaded from '{filepath}'.")
+        except json.JSONDecodeError:
+            print(f"app.py: Error decoding JSON from '{filepath}'. File might be corrupted. Using defaults and prompting.")
+            # config_file_exists = False # Treat as if file doesn't exist for prompting
         except Exception as e:
-            print(f"app.py: Error loading trading configs from '{filepath}': {e}. Using defaults.")
+            print(f"app.py: Error loading settings from '{filepath}': {e}. Using defaults and prompting.")
+            # config_file_exists = False
     else:
-        print(f"app.py: Trading config file '{filepath}' not found. Using default trading configurations.")
+        print(f"app.py: Settings file '{filepath}' not found. Using default settings and prompting for essentials.")
 
-    # Merge loaded CSV configs with defaults (defaults take precedence if key not in CSV or CSV load failed)
-    # No, it should be: CSV overrides defaults if key exists and is valid.
-    
-    final_configs = defaults.copy() # Start with defaults
-    
-    # Type conversion and validation for loaded CSV values
-    for key, str_val in loaded_csv_configs.items():
-        if key in final_configs: # Only process keys that are expected (defined in defaults)
-            expected_type = type(defaults[key])
-            try:
-                if expected_type == bool:
-                    if str(str_val).lower() in ['true', '1', 'yes', 'y']: final_configs[key] = True
-                    elif str(str_val).lower() in ['false', '0', 'no', 'n']: final_configs[key] = False
-                    else: print(f"app.py config: Invalid boolean value '{str_val}' for '{key}'. Using default.")
-                elif expected_type == int:
-                    final_configs[key] = int(float(str_val)) # float first to handle "20.0"
-                elif expected_type == float:
-                    final_configs[key] = float(str_val)
-                elif defaults[key] is None and isinstance(str_val, str): # For string types that might be None by default (like telegram keys)
-                    final_configs[key] = str_val if str_val.lower() != 'none' else None
-                elif isinstance(defaults[key], str): # For string types that have a string default
-                     final_configs[key] = str(str_val)
-                # Add more type handlers if needed
-            except ValueError:
-                print(f"app.py config: Could not convert value '{str_val}' for '{key}' to {expected_type}. Using default.")
-        # else: Key from CSV is not in defaults, ignore it for app_trading_configs
+    # Start with defaults, then override with loaded JSON settings
+    current_settings = defaults.copy()
+    current_settings.update(loaded_json_settings) # Loaded values override defaults
 
-    # Specific validation for critical numeric values
-    if not (0 < final_configs["app_risk_percent"] <= 1.0): # Risk percent should be decimal
-        print(f"app.py config: Invalid app_risk_percent ({final_configs['app_risk_percent']}). Resetting to default {defaults['app_risk_percent']}.")
-        final_configs["app_risk_percent"] = defaults["app_risk_percent"]
-    if not (1 <= final_configs["app_leverage"] <= 125):
-        print(f"app.py config: Invalid app_leverage ({final_configs['app_leverage']}). Resetting to default {defaults['app_leverage']}.")
-        final_configs["app_leverage"] = defaults["app_leverage"]
+    # --- Interactive prompting for essential/missing settings ---
+    # Environment
+    current_settings["app_trading_environment"] = get_user_input(
+        "Trading environment ('mainnet' or 'testnet')", 
+        current_settings["app_trading_environment"], 
+        str, choices=['mainnet', 'testnet']
+    )
+    # Risk Percent (ensure it's decimal, e.g., 0.01 for 1%)
+    # The get_user_input helper will need modification to handle percentage input if desired.
+    # For now, assume user enters decimal like 0.01.
+    current_settings["app_risk_percent"] = get_user_input(
+        "Risk percent per trade (e.g., 0.01 for 1%)",
+        current_settings["app_risk_percent"],
+        float
+    )
+    # Leverage
+    current_settings["app_leverage"] = get_user_input(
+        "Leverage (e.g., 20)",
+        current_settings["app_leverage"],
+        int
+    )
+    # Model paths can remain as defaults or from file for now, user can edit JSON if needed.
+    # Force retrain on startup
+    current_settings["app_force_retrain_on_startup"] = get_user_input(
+        "Force retrain models on startup (true/false)?",
+        current_settings["app_force_retrain_on_startup"],
+        bool
+    )
+    # Operational mode after training or if models exist
+    # This will be handled by the main startup logic based on user choice later.
+    # We can add a default "preferred_mode_after_load" if desired.
 
-    # Populate global app_trading_configs
-    app_trading_configs.update(final_configs)
+    # Populate global app_settings
+    app_settings.update(current_settings)
     
-    # Load API keys and Telegram details from keys.py if not overridden by config file
-    # Note: load_app_api_keys exits on failure, so these will be valid or script stops.
-    # The env for API keys should come from app_trading_configs.
-    app_env = app_trading_configs.get("app_trading_environment", "mainnet")
+    # Load API keys and Telegram details from keys.py
+    # These are NOT saved in app_settings.json but are part of the runtime app_settings dict.
+    app_env = app_settings.get("app_trading_environment", "mainnet") # Default to mainnet if somehow missing
     api_k, api_s, tele_token, tele_chat_id = load_app_api_keys(env=app_env)
     
-    # Store actual API keys in a way that they are not directly in app_trading_configs if it's printed/logged broadly
-    # For now, let's add them, but be mindful if app_trading_configs is dumped.
-    # These are needed for initialize_app_binance_client.
-    app_trading_configs["api_key"] = api_k
-    app_trading_configs["api_secret"] = api_s
+    app_settings["api_key"] = api_k # For runtime use by initialize_app_binance_client
+    app_settings["api_secret"] = api_s # For runtime use
+
+    # Only update telegram from keys.py if not set by app_settings.json (though defaults make them None)
+    if app_settings.get("app_telegram_bot_token") is None and tele_token:
+        app_settings["app_telegram_bot_token"] = tele_token
+    if app_settings.get("app_telegram_chat_id") is None and tele_chat_id:
+        app_settings["app_telegram_chat_id"] = tele_chat_id
+
+    print("app.py: Final application settings applied (excluding API keys from print):", 
+          {k:v for k,v in app_settings.items() if k not in ['api_key', 'api_secret']})
     
-    # Only update telegram from keys.py if not set by app_trade_config.csv
-    if app_trading_configs.get("app_telegram_bot_token") is None and tele_token:
-        app_trading_configs["app_telegram_bot_token"] = tele_token
-    if app_trading_configs.get("app_telegram_chat_id") is None and tele_chat_id:
-        app_trading_configs["app_telegram_chat_id"] = tele_chat_id
+    # Save the potentially updated settings (with user inputs) back to file
+    save_app_settings(filepath) # This will save current_settings which includes user inputs
 
-    print("app.py: Final trading configurations applied:", {k:v for k,v in app_trading_configs.items() if k not in ['api_key', 'api_secret']})
-
+def save_app_settings(filepath=APP_CONFIG_FILE):
+    """Saves the current app_settings to a JSON file, excluding sensitive keys."""
+    global app_settings
+    
+    settings_to_save = app_settings.copy()
+    # Remove keys that should not be saved to the file
+    keys_to_exclude = ['api_key', 'api_secret'] # Keep telegram token/chat_id as they might be user-settable
+    
+    for key_ex in keys_to_exclude:
+        if key_ex in settings_to_save:
+            del settings_to_save[key_ex]
+            
+    try:
+        with open(filepath, 'w') as f:
+            json.dump(settings_to_save, f, indent=4)
+        print(f"app.py: Settings saved to '{filepath}'.")
+    except Exception as e:
+        print(f"app.py: Error saving settings to '{filepath}': {e}")
 
 # --- Order Placement and Sizing Functions (Adapted from main.py) ---
 
@@ -1239,6 +1298,210 @@ def get_dynamic_trade_parameters(symbol: str, current_market_data_df: pd.DataFra
 
 # --- End Dynamic Parameter Selection Structure ---
 
+# --- ML Model File Utilities ---
+def check_ml_models_exist():
+    """Checks if the ML model files specified in app_settings exist."""
+    global app_settings
+    pivot_model_path = app_settings.get("app_pivot_model_path", "app_pivot_model.joblib")
+    entry_model_path = app_settings.get("app_entry_model_path", "app_entry_model.joblib")
+    models_params_path = app_settings.get("app_model_params_path", "app_model_params.json")
+
+    pivot_exists = os.path.exists(pivot_model_path)
+    entry_exists = os.path.exists(entry_model_path)
+    params_exist = os.path.exists(models_params_path) # Also check for model params file
+
+    if pivot_exists and entry_exists and params_exist:
+        print(f"ML Models and params found: Pivot='{pivot_model_path}', Entry='{entry_model_path}', Params='{models_params_path}'")
+        return True, pivot_model_path, entry_model_path, models_params_path
+    else:
+        missing_files = []
+        if not pivot_exists: missing_files.append(pivot_model_path)
+        if not entry_exists: missing_files.append(entry_model_path)
+        if not params_exist: missing_files.append(models_params_path)
+        print(f"ML Model(s) or params file NOT found. Missing: {', '.join(missing_files)}")
+        return False, pivot_model_path, entry_model_path, models_params_path
+
+# --- End ML Model File Utilities ---
+
+# --- Main Orchestration & Startup Logic ---
+def start_app_main_flow():
+    """Orchestrates the main application flow based on settings and user input."""
+    global app_settings, universal_pivot_model, universal_entry_model, best_hyperparams # Ensure best_hyperparams is global if modified
+
+    # 1. Load settings
+    load_app_settings() # Loads or prompts for settings and saves them
+
+    # 2. Check for ML Models
+    models_exist, pivot_model_path, entry_model_path, params_path = check_ml_models_exist()
+    
+    force_retrain = app_settings.get("app_force_retrain_on_startup", False)
+
+    # Main application loop / decision tree
+    while True: # Loop to allow retraining and then returning to choices
+        if not models_exist or force_retrain:
+            if force_retrain:
+                print("Configuration set to force retrain models.")
+                force_retrain = False # Reset flag after use
+                app_settings["app_force_retrain_on_startup"] = False # Also reset in runtime settings
+                save_app_settings() # Persist the reset flag state
+            else: # models_exist is False
+                print("ML models not found. Starting training process...")
+            
+            # --- Training Process ---
+            training_symbols_str = app_settings.get("app_training_symbols", "BTCUSDT,ETHUSDT")
+            training_symbols_list = [s.strip().upper() for s in training_symbols_str.split(',')]
+            kline_interval_train = app_settings.get("app_training_kline_interval", Client.KLINE_INTERVAL_15MINUTE)
+            start_date_train = app_settings.get("app_training_start_date", "1 Jan, 2023")
+            end_date_train = app_settings.get("app_training_end_date", "1 May, 2023")
+            optuna_trials_app = app_settings.get("app_optuna_trials", 20)
+
+            print(f"Training with: Symbols={training_symbols_list}, Interval={kline_interval_train}, Start={start_date_train}, End={end_date_train}, Trials={optuna_trials_app}")
+
+            all_symbols_train_data_list_app = []
+            processed_pivot_feature_names_app = None # Initialize for this training run
+            processed_entry_feature_names_base_app = None # Initialize for this training run
+
+
+            for symbol_ticker_app in training_symbols_list:
+                processed_df_app, pivot_feats_app, entry_feats_base_app = get_processed_data_for_symbol(
+                    symbol_ticker_app, kline_interval_train, start_date_train, end_date_train
+                )
+                if processed_df_app is not None and not processed_df_app.empty:
+                    if processed_pivot_feature_names_app is None: # Capture feature names from first successful processing
+                        processed_pivot_feature_names_app = pivot_feats_app
+                    if processed_entry_feature_names_base_app is None: # Capture from first
+                        processed_entry_feature_names_base_app = entry_feats_base_app
+                    all_symbols_train_data_list_app.append(processed_df_app)
+            
+            if not all_symbols_train_data_list_app: print("CRITICAL: No training data. Cannot train models."); sys.exit(1)
+            universal_df_initial_processed_app = pd.concat(all_symbols_train_data_list_app, ignore_index=True)
+            if len(universal_df_initial_processed_app) < 200: print(f"CRITICAL: Combined training data too small ({len(universal_df_initial_processed_app)})."); sys.exit(1)
+
+            # Ensure feature names are available before Optuna if they were determined
+            if processed_pivot_feature_names_app is None or processed_entry_feature_names_base_app is None:
+                print("CRITICAL: Feature names for training not determined (no symbol data processed successfully?). Exiting.")
+                sys.exit(1)
+
+            try:
+                current_best_hyperparams = run_optuna_tuning(
+                    universal_df_initial_processed_app.copy(),
+                    static_entry_features_base_list=processed_entry_feature_names_base_app, # Pass determined base names
+                    n_trials=optuna_trials_app
+                )
+                # Add feature names and model ATR period to params file
+                current_best_hyperparams['pivot_feature_names_used'] = processed_pivot_feature_names_app
+                current_best_hyperparams['entry_feature_names_base_used'] = processed_entry_feature_names_base_app
+                current_best_hyperparams['model_training_atr_period_used'] = current_best_hyperparams.get('atr_period_opt', ATR_PERIOD) # Store ATR period from Optuna
+
+                with open(params_path, 'w') as f: json.dump(current_best_hyperparams, f, indent=4)
+                print(f"Best Optuna parameters (including feature names and ATR period) saved to {params_path}")
+                best_hyperparams = current_best_hyperparams # Update global
+            except Exception as e: print(f"Optuna tuning failed: {e}. Exiting."); sys.exit(1)
+
+            # Use feature names from the saved best_hyperparams for final model training
+            final_pivot_feats_to_use = best_hyperparams.get('pivot_feature_names_used', processed_pivot_feature_names_app)
+            final_entry_base_feats_to_use = best_hyperparams.get('entry_feature_names_base_used', processed_entry_feature_names_base_app)
+
+
+            df_final_train, _, _ = process_dataframe_with_params( # We get refined feature lists from this if needed, but should match
+                universal_df_initial_processed_app.copy(), best_hyperparams, final_entry_base_feats_to_use
+            )
+            if df_final_train is None: print("CRITICAL: Failed to process data with best params. Exiting."); sys.exit(1)
+
+            X_p_train = df_final_train[final_pivot_feats_to_use].fillna(-1) # Use names from params
+            y_p_train = df_final_train['pivot_label']
+            pivot_model_args = {k.replace('pivot_', ''):v for k,v in best_hyperparams.items() if k.startswith('pivot_')}
+            temp_pivot_model = train_pivot_model(X_p_train, y_p_train, X_p_train, y_p_train, **pivot_model_args)
+            save_model(temp_pivot_model, pivot_model_path)
+            universal_pivot_model = temp_pivot_model
+
+            p_swing_train = temp_pivot_model.predict_proba(X_p_train)
+            df_final_train['P_swing'] = np.max(p_swing_train[:,1:], axis=1)
+            entry_candidates = df_final_train[(df_final_train['pivot_label'].isin([1,2])) & (df_final_train['trade_outcome']!=-1) & (df_final_train['P_swing'] >= best_hyperparams['p_swing_threshold'])].copy()
+            
+            if len(entry_candidates) >= 20: # Min candidates for entry model
+                atr_col_final = f"atr_{best_hyperparams.get('atr_period_opt', ATR_PERIOD)}" # ATR period from Optuna
+                entry_candidates['norm_dist_entry_pivot'] = (entry_candidates['entry_price_sim'] - entry_candidates.apply(lambda r: r['low'] if r['is_swing_low'] == 1 else r['high'], axis=1)) / entry_candidates[atr_col_final]
+                entry_candidates['norm_dist_entry_sl'] = (entry_candidates['entry_price_sim'] - entry_candidates['sl_price_sim']).abs() / entry_candidates[atr_col_final]
+                
+                full_entry_feats = final_entry_base_feats_to_use + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl'] # Use names from params
+                X_e_train = entry_candidates[full_entry_feats].fillna(-1)
+                y_e_train = entry_candidates['trade_outcome'].astype(int)
+                
+                if len(X_e_train) > 0 and len(y_e_train.unique()) > 1:
+                    entry_model_args = {k.replace('entry_', ''):v for k,v in best_hyperparams.items() if k.startswith('entry_')}
+                    temp_entry_model = train_entry_model(X_e_train, y_e_train, X_e_train, y_e_train, **entry_model_args)
+                    save_model(temp_entry_model, entry_model_path)
+                    universal_entry_model = temp_entry_model
+                else: print("Entry model training skipped (insufficient data/variance).")
+            else: print("Entry model training skipped (not enough candidates after pivot filter).")
+            
+            print("ML Model training process complete.")
+            models_exist = True # Update status
+
+            if not app_settings.get("app_auto_start_trading_after_train", False):
+                choice_after_train = input("Training complete. Proceed to live market trading? (yes/no) [no]: ").lower()
+                if choice_after_train not in ['yes', 'y']:
+                    print("Exiting after training as per user choice.")
+                    sys.exit(0)
+            # If auto_start or user chose yes, fall through to model loading and trading choice.
+
+        # Models exist (either initially or after training)
+        # Try to load models and params into global vars if they are not already (e.g. after training or on fresh start with existing files)
+        if universal_pivot_model is None or universal_entry_model is None or not best_hyperparams:
+            try:
+                print("Loading trained ML models and parameters...")
+                universal_pivot_model = load_model(pivot_model_path)
+                universal_entry_model = load_model(entry_model_path)
+                with open(params_path, 'r') as f: best_hyperparams = json.load(f) # This loads params like thresholds and feature names
+                print("Models and parameters loaded successfully.")
+            except Exception as e_load:
+                print(f"Error loading models/params: {e_load}. Models may be corrupted or paths incorrect.")
+                retry_train = input("Attempt to retrain models? (yes/no) [yes]: ").lower()
+                if retry_train in ['no', 'n']: sys.exit(1)
+                force_retrain = True 
+                models_exist = False 
+                continue # Restart the while loop to go into training
+
+        # --- User Action Choice ---
+        print("\n--- Application Menu ---")
+        print("1. Start Live Market Trading / Signal Generation")
+        print("2. Retrain ML Models")
+        print("3. Exit")
+        user_action = input("Enter choice (1-3): ")
+
+        if user_action == '1':
+            print("Starting Live Market Trading / Signal Generation mode...")
+            app_settings['app_operational_mode'] = get_user_input(
+                "Set operational mode ('live' or 'signal')",
+                app_settings.get("app_operational_mode", "signal"), 
+                str, choices=['live', 'signal']
+            )
+            save_app_settings() 
+            print(f"Operational mode set to: {app_settings['app_operational_mode']}")
+            
+            if app_binance_client is None: # Initialize client if not done yet
+                if not initialize_app_binance_client(env=app_settings.get("app_trading_environment")):
+                    print("CRITICAL: Failed to initialize Binance client. Exiting.")
+                    sys.exit(1)
+            
+            print("Placeholder: Initiate live trading/signal generation loop here.")
+            # Conceptual: start_app_trading_loop(universal_pivot_model, universal_entry_model, best_hyperparams)
+            print("Application will exit for now as the trading loop is not yet implemented in this step.")
+            sys.exit(0) 
+        
+        elif user_action == '2':
+            print("User chose to retrain models.")
+            force_retrain = True 
+            models_exist = False 
+            universal_pivot_model, universal_entry_model, best_hyperparams = None, None, {} # Clear loaded models
+            continue 
+        
+        elif user_action == '3':
+            print("Exiting application.")
+            sys.exit(0)
+        else:
+            print("Invalid choice. Please try again.")
 
 def calculate_atr(df, period=ATR_PERIOD):
     """Calculates Average True Range."""
