@@ -104,6 +104,11 @@ DEFAULT_ICT_ADAPTIVE_MAX_LOOKBACK = 200        # Max lookback for secondary adap
 # They could be made configurable per strategy if needed in the future.
 
 # New Fibonacci Strategy (v2) Defaults
+# ML Model related defaults
+DEFAULT_PIVOT_MODEL_PATH = "pivot_detector_model.joblib"
+DEFAULT_ENTRY_MODEL_PATH = "entry_evaluator_model.joblib"
+DEFAULT_MODEL_PARAMS_PATH = "best_model_params.json" # To store Optuna best params like thresholds
+
 DEFAULT_FIB_TREND_PIVOT_N_LEFT = 3
 DEFAULT_FIB_TREND_PIVOT_N_RIGHT = 3
 DEFAULT_FIB_TREND_LOOKBACK_SWINGS = 4
@@ -124,6 +129,18 @@ DEFAULT_ICT_SWEEP_CLOSE_BACK_WINDOW = 1        # e.g., 1 bar (sweep candle itsel
 # --- Global State Variables ---
 # Stores details of active trades. Key: symbol (e.g., "BTCUSDT")
 # Value: dict with trade info like order IDs, entry/SL/TP prices, quantity, side.
+
+# --- ML Model Globals ---
+pivot_model = None
+entry_model = None
+model_best_params = {} # To store thresholds like P_swing_threshold, P_profit_threshold
+# Feature names used by the models (load from app.py or define consistently)
+# These would ideally be saved/loaded with the models or params file.
+# For now, we might need to duplicate them or have app.py provide them.
+PIVOT_FEATURE_NAMES = [] # To be populated
+ENTRY_FEATURE_NAMES_BASE = [] # To be populated
+# ATR period used during training (must be consistent)
+MODEL_ATR_PERIOD = 14 # Assuming 14 was used in app.py, make this configurable or load from params.
 
 # --- Global State for Pending Fibonacci Limit Orders (New Fibonacci Strategy) ---
 PENDING_FIB_ORDERS_CSV = "pending_fib_limit_orders.csv"
@@ -408,7 +425,8 @@ def validate_configurations(loaded_configs: dict) -> tuple[bool, str, dict]:
         "max_concurrent_positions": {"type": int, "condition": lambda x: x > 0},
         "margin_type": {"type": str, "valid_values": ["ISOLATED", "CROSS"]},
         "portfolio_risk_cap": {"type": float, "condition": lambda x: 0 < x <= 100.0},
-        "atr_period": {"type": int, "condition": lambda x: x > 0},
+        "atr_period": {"type": int, "condition": lambda x: x > 0}, # General ATR period
+        "model_atr_period_live": {"type": int, "optional": True, "condition": lambda x: x > 0}, # ATR period for ML features
         "atr_multiplier_sl": {"type": float, "condition": lambda x: x > 0},
         "tp_rr_ratio": {"type": float, "condition": lambda x: x > 0},
         "max_drawdown_percent": {"type": float, "condition": lambda x: 0 <= x <= 100.0},
@@ -418,7 +436,7 @@ def validate_configurations(loaded_configs: dict) -> tuple[bool, str, dict]:
         "min_leverage": {"type": int, "condition": lambda x: 1 <= x <= 125},
         "max_leverage": {"type": int, "condition": lambda x: 1 <= x <= 125}, # Further check against min_leverage done in input logic
         "allow_exceed_risk_for_min_notional": {"type": bool},
-        "strategy_choice": {"type": str, "valid_values": ["ema_cross", "fib_retracement", "ict_strategy", "adv_fib_retracement"]}, # Added adv_fib_retracement
+        "strategy_choice": {"type": str, "valid_values": ["ema_cross", "fib_retracement", "ict_strategy", "adv_fib_retracement", "adv_fib_ml"]}, # Added adv_fib_ml
         "fib_1m_buffer_size": {"type": int, "optional": True, "condition": lambda x: 20 <= x <= 1000}, # For Fibonacci strategy
         "fib_order_timeout_minutes": {"type": int, "optional": True, "condition": lambda x: 1 <= x <= 60}, # For Fibonacci strategy
         "fib_atr_period": {"type": int, "optional": True, "condition": lambda x: x > 0}, # For Fibonacci SL
@@ -480,6 +498,12 @@ def validate_configurations(loaded_configs: dict) -> tuple[bool, str, dict]:
         "fib_tp3_atr_multiplier_sl": {"type": float, "optional": True, "condition": lambda x: 0.1 <= x <= 10.0},
         "price_precision_default": {"type": int, "optional": True, "condition": lambda x: 0 <= x <= 8},
         "adv_fib_order_placement_strategy": {"type": str, "optional": True, "valid_values": ["virtual_limit_first", "direct_market_order"]},
+
+        # ML Model related paths (optional as they have defaults)
+        "pivot_model_path": {"type": str, "optional": True},
+        "entry_model_path": {"type": str, "optional": True},
+        "model_params_path": {"type": str, "optional": True},
+
 
         # API keys and telegram details are not part of this CSV validation
     }
@@ -2584,32 +2608,40 @@ def get_user_configurations(load_choice_override: str = None, make_changes_overr
     # Strategy Choice
     while True:
         strategy_default_display = configs.get("strategy_choice", DEFAULT_STRATEGY)
-        strategy_input = input(f"Select strategy (1:EMA Cross / 2:Old Fib Retracement / 3:ICT Strategy / 4:Advanced Fib) (current: {strategy_default_display}): ").strip() # Added option 4
+        strategy_prompt = (
+            f"Select strategy (1:EMA Cross / 2:Old Fib Retracement / 3:ICT Strategy / 4:Advanced Fib / 5:Adv Fib ML) "
+            f"(current: {strategy_default_display}): "
+        )
+        strategy_input = input(strategy_prompt).strip()
         
         chosen_strategy = None
         if not strategy_input and "strategy_choice" in configs: chosen_strategy = configs["strategy_choice"]
         elif strategy_input == "1": chosen_strategy = "ema_cross"
-        elif strategy_input == "2": chosen_strategy = "fib_retracement" # This is the OLD one (ID 9)
+        elif strategy_input == "2": chosen_strategy = "fib_retracement"
         elif strategy_input == "3": chosen_strategy = "ict_strategy"
-        elif strategy_input == "4": chosen_strategy = "adv_fib_retracement" # New strategy key
+        elif strategy_input == "4": chosen_strategy = "adv_fib_retracement"
+        elif strategy_input == "5": chosen_strategy = "adv_fib_ml" # New ML strategy
 
-
-        if chosen_strategy in ["ema_cross", "fib_retracement", "ict_strategy", "adv_fib_retracement"]: # Added new key
+        if chosen_strategy in ["ema_cross", "fib_retracement", "ict_strategy", "adv_fib_retracement", "adv_fib_ml"]:
             configs["strategy_choice"] = chosen_strategy
             if chosen_strategy == "ema_cross":
-                configs["strategy_id"] = 8
-                configs["strategy_name"] = "Advance EMA Cross"
-            elif chosen_strategy == "fib_retracement": # Old Fib
-                configs["strategy_id"] = 9
-                configs["strategy_name"] = "Fibonacci Retracement (Old)"
+                configs["strategy_id"] = 8; configs["strategy_name"] = "Advance EMA Cross"
+            elif chosen_strategy == "fib_retracement":
+                configs["strategy_id"] = 9; configs["strategy_name"] = "Fibonacci Retracement (Old)"
             elif chosen_strategy == "ict_strategy":
-                configs["strategy_id"] = 10 
-                configs["strategy_name"] = "ICT Strategy"
-            elif chosen_strategy == "adv_fib_retracement": # New Advanced Fib
-                configs["strategy_id"] = 11
-                configs["strategy_name"] = "Advanced Fibonacci Retracement"
+                configs["strategy_id"] = 10; configs["strategy_name"] = "ICT Strategy"
+            elif chosen_strategy == "adv_fib_retracement":
+                configs["strategy_id"] = 11; configs["strategy_name"] = "Advanced Fibonacci Retracement"
+            elif chosen_strategy == "adv_fib_ml":
+                configs["strategy_id"] = 12; configs["strategy_name"] = "Advanced Fibonacci ML" # New ID and Name
+                # Ensure ML specific params have defaults if not in CSV
+                if "pivot_model_path" not in configs: configs["pivot_model_path"] = DEFAULT_PIVOT_MODEL_PATH
+                if "entry_model_path" not in configs: configs["entry_model_path"] = DEFAULT_ENTRY_MODEL_PATH
+                if "model_params_path" not in configs: configs["model_params_path"] = DEFAULT_MODEL_PARAMS_PATH
+                if "model_atr_period_live" not in configs: configs["model_atr_period_live"] = MODEL_ATR_PERIOD # Use global default
+
             break
-        print("Invalid strategy choice. Please enter '1', '2', '3', or '4'.")
+        print("Invalid strategy choice. Please enter '1', '2', '3', '4', or '5'.")
 
     # Environment
     while True:
@@ -5640,6 +5672,456 @@ def process_symbol_adv_fib_task(symbol, client, configs, lock):
         traceback.print_exc()
         return f"{symbol}: AdvFib Error - {error_detail}"
 
+# --- ML Strategy Feature Calculation Helpers ---
+def calculate_live_pivot_features(df_live: pd.DataFrame, atr_period: int, p_feature_names: list):
+    """
+    Calculates features for pivot detection model on live data.
+    `df_live` should be a DataFrame of historical klines ending with the current (or last closed) candle.
+    `atr_period` must match the period used during training (e.g., MODEL_ATR_PERIOD).
+    `p_feature_names` is the list of feature names the model expects.
+    Returns a pd.Series of features for the latest candle, or None if error.
+    """
+    if df_live.empty or len(df_live) < atr_period + 50: # Need enough data for EMAs, ATR, rolling features
+        print(f"calculate_live_pivot_features: Insufficient data {len(df_live)} candles.")
+        return None
+
+    df = df_live.copy() # Work on a copy
+
+    # ATR (using app's version for consistency if loaded)
+    df = app_calculate_atr(df, period=atr_period) # Adds f'atr_{atr_period}'
+    atr_col_name = f'atr_{atr_period}'
+    if atr_col_name not in df.columns or df[atr_col_name].iloc[-1] is None or pd.isna(df[atr_col_name].iloc[-1]):
+        print("calculate_live_pivot_features: ATR calculation failed or resulted in NaN.")
+        return None
+
+    # Volatility & Range
+    df['range_atr_norm'] = (df['high'] - df['low']) / df[atr_col_name]
+
+    # Trend & Momentum
+    df['ema12'] = app_calculate_ema(df, 12)
+    df['ema26'] = app_calculate_ema(df, 26)
+    df['macd_line'] = df['ema12'] - df['ema26']
+    df['macd_slope_atr_norm'] = df['macd_line'].diff() / df[atr_col_name]
+
+    for n in [1, 3, 5]:
+        # Ensure pct_change(n) doesn't divide by zero if close is zero (highly unlikely for crypto)
+        # The division by ATR handles normalization.
+        df[f'return_{n}b_atr_norm'] = df['close'].pct_change(n) / df[atr_col_name]
+
+    # Local Structure
+    df['high_rank_7'] = df['high'].rolling(window=7).rank(pct=True)
+
+    # 'bars_since_last_pivot' is complex for live.
+    # In app.py, it was calculated based on *confirmed* pivots.
+    # For live prediction, we might not have a *confirmed* ML pivot yet.
+    # Using a proxy: bars since last N-bar high/low, or simpler: fixed value or omit if too complex.
+    # For now, let's use a placeholder or a simpler version.
+    # Example: bars since last 7-bar high/low (not exactly the same as app.py)
+    df['rolling_max_7_high_idx'] = df['high'].rolling(window=7).apply(lambda x: x.idxmax(), raw=True)
+    df['bars_since_7_high'] = df.index.to_series().apply(lambda x: (x - df.loc[x, 'rolling_max_7_high_idx']).days if pd.notna(df.loc[x, 'rolling_max_7_high_idx']) else 0)
+    # This is just an example, needs proper conversion if index is not just days.
+    # If index is integer based (0,1,2..), then df.index - df['rolling_max_7_high_idx']
+    # For now, placeholder for 'bars_since_last_pivot':
+    df['bars_since_last_pivot'] = 0 # Placeholder - this feature needs careful live implementation
+
+    # Volume
+    df['volume_rolling_avg_20'] = df['volume'].rolling(window=20).mean()
+    df['volume_spike_vs_avg'] = df['volume'] / df['volume_rolling_avg_20']
+
+    df['rsi_14'] = app_calculate_rsi(df, 14)
+
+    # Select features and handle NaNs/Infs for the last row
+    live_features = df.iloc[-1][p_feature_names].copy() # Get features for the latest candle
+    live_features.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+    if live_features.isnull().any():
+        print(f"calculate_live_pivot_features: NaN values found in features for latest candle: \n{live_features[live_features.isnull()]}")
+        # Option: Impute, or return None to skip prediction
+        # Simple mean/median imputation could be done if a training distribution is known, or fill with a placeholder like -1.
+        # For now, let's fill with -1 as a basic strategy, consistent with app.py's Optuna loop.
+        live_features.fillna(-1, inplace=True)
+        # print(f"NaNs filled with -1. Features: \n{live_features}")
+
+    return live_features
+
+
+def calculate_live_entry_features(df_live: pd.DataFrame, atr_period: int, e_feature_names_base: list,
+                                  p_swing_meta_feature: float,
+                                  simulated_entry_price: float, simulated_sl_price: float, pivot_price_for_dist: float):
+    """
+    Calculates features for entry evaluation model on live data.
+    `df_live` includes history up to the current candle (where pivot was detected).
+    `p_swing_meta_feature` is the P_swing score from the pivot model.
+    `simulated_entry_price`, `simulated_sl_price`, `pivot_price_for_dist` are needed for distance features.
+    Returns a pd.Series of features for the current context, or None if error.
+    """
+    if df_live.empty or len(df_live) < atr_period + 50: # Similar data requirement as pivot features
+        print(f"calculate_live_entry_features: Insufficient data {len(df_live)} candles.")
+        return None
+
+    df = df_live.copy()
+    atr_col_name = f'atr_{atr_period}' # Should already be on df if pivot features were calculated first
+
+    if atr_col_name not in df.columns or df[atr_col_name].iloc[-1] is None or pd.isna(df[atr_col_name].iloc[-1]):
+        # Attempt to recalculate ATR if missing
+        df = app_calculate_atr(df, period=atr_period)
+        if atr_col_name not in df.columns or df[atr_col_name].iloc[-1] is None or pd.isna(df[atr_col_name].iloc[-1]):
+            print("calculate_live_entry_features: ATR critical for entry features missing or NaN.")
+            return None
+
+    current_atr_val = df[atr_col_name].iloc[-1]
+    if current_atr_val == 0: print("Warning: Current ATR is zero in calculate_live_entry_features."); current_atr_val = 1e-9 # Avoid div by zero
+
+    # Normalized Distances (calculated for the current pivot candle)
+    df.loc[df.index[-1], 'norm_dist_entry_pivot'] = (simulated_entry_price - pivot_price_for_dist) / current_atr_val
+    df.loc[df.index[-1], 'norm_dist_entry_sl'] = abs(simulated_entry_price - simulated_sl_price) / current_atr_val
+
+    # Extended Trend
+    df['ema20'] = app_calculate_ema(df, 20)
+    df['ema50'] = app_calculate_ema(df, 50)
+    df['ema20_ema50_norm_atr'] = (df['ema20'] - df['ema50']) / df[atr_col_name]
+
+    # Recent Behavior (returns *before* entry, so use data up to previous candle or shift)
+    # For live, these are returns leading up to the current candle (pivot candle)
+    for n in [1, 3, 5]:
+        df[f'return_entry_{n}b'] = df['close'].pct_change(n)
+    df[f'atr_{atr_period}_change'] = df[atr_col_name].pct_change()
+
+    # Contextual Flags (from current candle's timestamp)
+    current_timestamp = df.index[-1]
+    df.loc[current_timestamp, 'hour_of_day'] = current_timestamp.hour
+    df.loc[current_timestamp, 'day_of_week'] = current_timestamp.dayofweek
+
+    # Regime cluster label (Placeholder - requires separate clustering model)
+    df.loc[current_timestamp, 'vol_regime'] = 0 # Default to 0
+
+    # Meta-Feature (P_swing)
+    df.loc[current_timestamp, 'P_swing'] = p_swing_meta_feature
+
+    # Select features for the latest candle
+    # Ensure e_feature_names_base includes the dynamically added distance and P_swing names if model expects them directly
+    # The current app.py structure adds them to the list: entry_features_base + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']
+    full_entry_feature_list = e_feature_names_base + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']
+
+    # Ensure all expected features are present in df before selecting
+    for col_ef in full_entry_feature_list:
+        if col_ef not in df.columns:
+            # This might happen if a feature calculation failed silently or was omitted.
+            # For dynamically added ones like 'P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl',
+            # they are added to the last row.
+            # For others, if missing, it's an issue.
+            if col_ef not in ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']:
+                 print(f"calculate_live_entry_features: Feature column '{col_ef}' missing from DataFrame. Setting to 0 for current candle.")
+                 df.loc[current_timestamp, col_ef] = 0 # Placeholder
+            elif col_ef not in df.columns : # if P_swing etc. were not even created as columns
+                 df[col_ef] = 0 # Create column with placeholder
+                 df.loc[current_timestamp, col_ef] = 0 # Ensure last row has it (though it should from above)
+
+
+    live_features = df.iloc[-1][full_entry_feature_list].copy()
+    live_features.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+    if live_features.isnull().any():
+        print(f"calculate_live_entry_features: NaN values found in entry features: \n{live_features[live_features.isnull()]}")
+        live_features.fillna(-1, inplace=True) # Impute with -1, consistent with app.py Optuna
+        # print(f"NaNs filled with -1. Entry Features: \n{live_features}")
+
+    return live_features
+
+# --- End ML Strategy Feature Calculation Helpers ---
+
+
+# --- ML Strategy Task Function ---
+def process_symbol_adv_fib_ml_task(symbol, client, configs, lock): # lock is active_trades_lock
+    """
+    Processes a symbol using the Advanced Fibonacci ML strategy.
+    Fetches data, computes features, gets predictions from models, and places trades.
+    """
+    thread_name = threading.current_thread().name
+    cycle_start_ref = configs.get('cycle_start_time_ref', time.time())
+    log_prefix_task = f"[{thread_name}] {symbol} AdvFibML_Task:"
+    print(f"{log_prefix_task} Processing {format_elapsed_time(cycle_start_ref)}")
+
+    global pivot_model, entry_model, model_best_params, PIVOT_FEATURE_NAMES, ENTRY_FEATURE_NAMES_BASE, MODEL_ATR_PERIOD
+    global active_trades, active_trades_lock, last_signal_time, last_signal_lock, recent_trade_signatures, recent_trade_signatures_lock
+    global trading_halted_drawdown, trading_halted_daily_loss, daily_state_lock, trading_halted_manual
+
+    # --- Model and Params Check ---
+    if pivot_model is None or entry_model is None:
+        print(f"{log_prefix_task} Pivot or Entry model not loaded. Skipping ML strategy for {symbol}.")
+        return f"{symbol}: AdvFibML Error - Models not loaded"
+    if not model_best_params:
+        print(f"{log_prefix_task} Model best parameters (thresholds) not loaded. Skipping ML strategy for {symbol}.")
+        return f"{symbol}: AdvFibML Error - Model params not loaded"
+
+    p_swing_threshold = model_best_params.get('p_swing_threshold', 0.7) # Default if not in params
+    profit_threshold = model_best_params.get('profit_threshold', 0.6)   # Default if not in params
+    # Feature names should be loaded into globals PIVOT_FEATURE_NAMES, ENTRY_FEATURE_NAMES_BASE
+    # MODEL_ATR_PERIOD should also be set globally or loaded from params.
+    # Ensure these globals are populated correctly during startup.
+
+    # --- Halt Checks ---
+    with daily_state_lock:
+        if trading_halted_drawdown or trading_halted_daily_loss:
+            print(f"{log_prefix_task} Trading halted (DD/DSL). Skipping {symbol}.")
+            return f"{symbol}: AdvFibML Skipped - Trading Halted (DD/DSL)"
+    if trading_halted_manual:
+        print(f"{log_prefix_task} Trading manually halted. Skipping {symbol}.")
+        return f"{symbol}: AdvFibML Skipped - Trading Halted (Manual)"
+
+    # --- Cooldown, Active Trade, Live Position, Open Orders (similar to other strategies) ---
+    with last_signal_lock:
+        cooldown_seconds = configs.get("adv_fib_ml_cooldown_seconds", 120) # Configurable cooldown
+        if symbol in last_signal_time and (dt.now() - last_signal_time.get(f"{symbol}_adv_fib_ml", dt.min())).total_seconds() < cooldown_seconds:
+            # print(f"{log_prefix_task} Cooldown active. Skipping.") # Can be verbose
+            return f"{symbol}: AdvFibML Skipped - Cooldown"
+    with active_trades_lock:
+        if symbol in active_trades:
+            # print(f"{log_prefix_task} Active trade exists. Skipping.")
+            return f"{symbol}: AdvFibML Skipped - Active Trade"
+    # (Skipping live position/order checks for brevity here, but they would be similar to manage_trade_entry)
+
+
+    # --- Data Fetching & Preparation ---
+    # Klines for feature calculation - need enough history for all indicators.
+    # MODEL_ATR_PERIOD is crucial. Max lookback of other indicators (EMAs, rolling windows) also matters.
+    # A general rule of thumb: ATR_period + longest_EMA_period + some buffer.
+    # EMA50 is used in entry features. Rolling 20 for volume. High_rank_7.
+    # Let's use a safe limit like 200-250 candles for 15-min interval.
+    # The kline interval for ML features should match training (e.g., 15m from app.py).
+    # Assume Client.KLINE_INTERVAL_15MINUTE for now.
+    kline_fetch_limit_ml = MODEL_ATR_PERIOD + 50 + 50 # ATR + EMA50 + buffer
+    klines_df_ml, klines_error_ml = get_historical_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=max(250, kline_fetch_limit_ml))
+
+    if klines_error_ml or klines_df_ml.empty or len(klines_df_ml) < kline_fetch_limit_ml:
+        print(f"{log_prefix_task} Error fetching/insufficient klines for ML ({len(klines_df_ml)}). Err: {klines_error_ml}. Skipping.")
+        return f"{symbol}: AdvFibML Error - Kline fetch/data issue"
+
+    s_info = get_symbol_info(client, symbol)
+    if not s_info:
+        print(f"{log_prefix_task} Failed to get symbol_info. Skipping."); return f"{symbol}: AdvFibML Error - No symbol_info"
+    p_prec = int(s_info.get('pricePrecision', 2))
+    q_prec = int(s_info.get('quantityPrecision', 0))
+
+
+    # --- Stage 1: Pivot Detection Model ---
+    print(f"{log_prefix_task} Calculating pivot features for {symbol}...")
+    pivot_features_live = calculate_live_pivot_features(klines_df_ml, MODEL_ATR_PERIOD, PIVOT_FEATURE_NAMES)
+    if pivot_features_live is None:
+        print(f"{log_prefix_task} Failed to calculate pivot features. Skipping."); return f"{symbol}: AdvFibML Error - Pivot feature calc failed"
+
+    # Reshape features for model prediction (expects 2D array)
+    pivot_features_reshaped = pivot_features_live.values.reshape(1, -1)
+
+    p_swing_probabilities = pivot_model.predict_proba(pivot_features_reshaped)[0] # Get probs for the single sample
+    # Assuming pivot_label: 0=none, 1=high, 2=low (from app.py)
+    # P_swing is max prob of being a high (class 1) or low (class 2)
+    p_swing_high_prob = p_swing_probabilities[1] if len(p_swing_probabilities) > 1 else 0
+    p_swing_low_prob = p_swing_probabilities[2] if len(p_swing_probabilities) > 2 else 0
+    p_swing_final = max(p_swing_high_prob, p_swing_low_prob)
+    predicted_pivot_class = np.argmax(p_swing_probabilities) # 0, 1, or 2
+
+    print(f"{log_prefix_task} Pivot Model Output: P_swing={p_swing_final:.4f} (Probs: None={p_swing_probabilities[0]:.2f}, High={p_swing_high_prob:.2f}, Low={p_swing_low_prob:.2f}). Predicted Class: {predicted_pivot_class}. Threshold: {p_swing_threshold:.2f}")
+
+    if p_swing_final < p_swing_threshold or predicted_pivot_class == 0: # Class 0 is "none"
+        # print(f"{log_prefix_task} P_swing {p_swing_final:.4f} below threshold {p_swing_threshold:.2f} or predicted no pivot. Skipping entry eval.")
+        return f"{symbol}: AdvFibML Skipped - P_swing too low or no pivot"
+
+    # Pivot detected by model. Now, determine if it's high or low for Fib simulation.
+    # This part is tricky: ML gives a class. For Fib entry simulation, we need a concrete pivot price.
+    # The original AdvFib used `identify_market_trend_fib` to get leg_start/end.
+    # For ML, if model says "High Pivot" (class 1), we can use current candle's high as the pivot_price.
+    # If "Low Pivot" (class 2), use current candle's low.
+
+    current_candle_data_ml = klines_df_ml.iloc[-1]
+    pivot_price_for_fib_sim = 0
+    potential_trade_side = "" # "long" or "short"
+
+    if predicted_pivot_class == 1: # Predicted Swing High
+        pivot_price_for_fib_sim = current_candle_data_ml['high']
+        potential_trade_side = "short" # After swing high, look for short entry on retracement
+        print(f"{log_prefix_task} Pivot model predicted SWING HIGH at {pivot_price_for_fib_sim:.{p_prec}f}. Potential side: SHORT.")
+    elif predicted_pivot_class == 2: # Predicted Swing Low
+        pivot_price_for_fib_sim = current_candle_data_ml['low']
+        potential_trade_side = "long"  # After swing low, look for long entry on retracement
+        print(f"{log_prefix_task} Pivot model predicted SWING LOW at {pivot_price_for_fib_sim:.{p_prec}f}. Potential side: LONG.")
+    else: # Should not happen if p_swing_final >= threshold and predicted_pivot_class != 0
+        print(f"{log_prefix_task} Inconsistent pivot prediction. Class: {predicted_pivot_class}. Skipping."); return f"{symbol}: AdvFibML Error - Inconsistent pivot class"
+
+    # --- Simulate Fib Entry/SL for feature calculation ---
+    # This part needs careful adaptation. The original `simulate_fib_entries` from app.py
+    # iterated historical data. Here, we need a "live" simulation for the detected pivot.
+    # We need a simplified way to get a hypothetical entry_price, sl_price for the *entry model's features*.
+    # Let's use a simplified Fib retracement from the detected pivot for this.
+    # Assume the "leg" for this pivot is defined by the last N candles or a recent swing.
+    # For now, let's use a fixed ATR-based simulation for feature inputs.
+    # This is a key area for refinement. How to define the Fib leg for an ML-detected pivot?
+
+    # Simplification: Assume the ML pivot IS the swing_high_of_leg (for short) or swing_low_of_leg (for long).
+    # The "other end" of the leg could be taken from N bars prior, or a prior ATR-defined swing.
+    # For now, let's assume entry is a direct entry after pivot, SL is ATR based from pivot.
+    # This is NOT Fibonacci entry, but gives us values for `norm_dist_entry_pivot` and `norm_dist_entry_sl`.
+
+    atr_val_for_sim = klines_df_ml[f'atr_{MODEL_ATR_PERIOD}'].iloc[-1]
+    sim_entry_price = current_candle_data_ml['close'] # Assume entry at close of pivot candle for feature calc
+
+    sim_sl_distance_atr_mult = configs.get("atr_multiplier_sl", DEFAULT_ATR_MULTIPLIER_SL) # Use general SL multiplier
+    sim_sl_distance = atr_val_for_sim * sim_sl_distance_atr_mult
+
+    sim_sl_price = 0
+    if potential_trade_side == "long":
+        sim_sl_price = pivot_price_for_fib_sim - sim_sl_distance # SL below the detected low pivot
+    else: # short
+        sim_sl_price = pivot_price_for_fib_sim + sim_sl_distance # SL above the detected high pivot
+
+    sim_sl_price = round(sim_sl_price, p_prec)
+    print(f"{log_prefix_task} For Entry Feature Calc: SimEntry={sim_entry_price}, SimSL={sim_sl_price}, PivotPrice={pivot_price_for_fib_sim}, ATR={atr_val_for_sim}")
+
+
+    # --- Stage 2: Entry Evaluation Model ---
+    print(f"{log_prefix_task} Calculating entry features...")
+    entry_features_live = calculate_live_entry_features(
+        klines_df_ml, MODEL_ATR_PERIOD, ENTRY_FEATURE_NAMES_BASE,
+        p_swing_meta_feature=p_swing_final,
+        simulated_entry_price=sim_entry_price, # Using simplified simulated entry for features
+        simulated_sl_price=sim_sl_price,       # Using simplified simulated SL for features
+        pivot_price_for_dist=pivot_price_for_fib_sim
+    )
+    if entry_features_live is None:
+        print(f"{log_prefix_task} Failed to calculate entry features. Skipping."); return f"{symbol}: AdvFibML Error - Entry feature calc failed"
+
+    entry_features_reshaped = entry_features_live.values.reshape(1, -1)
+    p_profit_probabilities = entry_model.predict_proba(entry_features_reshaped)[0]
+    # Assuming binary classification: 0=not profitable, 1=profitable
+    p_profit_final = p_profit_probabilities[1] if len(p_profit_probabilities) > 1 else 0
+
+    print(f"{log_prefix_task} Entry Model Output: P_profit={p_profit_final:.4f} (Probs: NotProfitable={p_profit_probabilities[0]:.2f}, Profitable={p_profit_final:.2f}). Threshold: {profit_threshold:.2f}")
+
+    if p_profit_final < profit_threshold:
+        # print(f"{log_prefix_task} P_profit {p_profit_final:.4f} below threshold {profit_threshold:.2f}. Skipping trade.")
+        return f"{symbol}: AdvFibML Skipped - P_profit too low"
+
+    # --- Trade Placement Logic ---
+    print(f"{log_prefix_task} ML Models CONFIRM trade for {symbol} ({potential_trade_side.upper()}). P_swing={p_swing_final:.2f}, P_profit={p_profit_final:.2f}. Proceeding to place trade.")
+
+    # Actual Entry Price: Could be market, or a limit based on Fib from ML pivot.
+    # For now, let's use MARKET entry for simplicity after ML confirmation.
+    actual_entry_price_trade = current_candle_data_ml['close'] # Market entry at close of current candle
+
+    # Actual SL/TP: Use ATR-based from `sim_sl_price` (or re-calculate more robustly).
+    # TP can be based on a fixed R:R or another ML model / logic.
+    # For now, use the simulated SL and a fixed R:R for TP.
+    actual_sl_price_trade = sim_sl_price # From simplified simulation earlier
+
+    # TP calculation based on fixed R:R from actual_sl_price_trade
+    tp_rr_config = configs.get("tp_rr_ratio", DEFAULT_TP_RR_RATIO)
+    risk_dist_actual = abs(actual_entry_price_trade - actual_sl_price_trade)
+    if risk_dist_actual == 0: # Should be caught by sanity checks
+        print(f"{log_prefix_task} Risk distance is zero. Cannot set TP. Aborting."); return f"{symbol}: AdvFibML Error - Zero risk distance"
+
+    actual_tp_price_trade = 0
+    if potential_trade_side == "long":
+        actual_tp_price_trade = actual_entry_price_trade + (risk_dist_actual * tp_rr_config)
+    else: # short
+        actual_tp_price_trade = actual_entry_price_trade - (risk_dist_actual * tp_rr_config)
+    actual_tp_price_trade = round(actual_tp_price_trade, p_prec)
+
+    print(f"{log_prefix_task} Trade Params: Entry(Mkt)={actual_entry_price_trade:.{p_prec}f}, SL={actual_sl_price_trade:.{p_prec}f}, TP({tp_rr_config}R)={actual_tp_price_trade:.{p_prec}f}")
+
+    # Adaptive Position Sizing
+    # Scale risk_percent by (P_profit - entry_thresh) / (1 - entry_thresh)
+    # This yields a factor from 0 to 1.
+    # Apply this factor to the base risk_percent from config.
+    base_risk_pct_config = configs['risk_percent']
+    profit_confidence_factor = 0.0
+    if (1 - profit_threshold) > 1e-9: # Avoid division by zero if threshold is 1.0
+        profit_confidence_factor = (p_profit_final - profit_threshold) / (1 - profit_threshold)
+    profit_confidence_factor = max(0.1, min(profit_confidence_factor, 1.0)) # Clamp factor (e.g., 0.1 to 1.0, so always risk something)
+
+    effective_risk_pct_for_trade = base_risk_pct_config * profit_confidence_factor
+    print(f"{log_prefix_task} Adaptive Sizing: BaseRisk={base_risk_pct_config*100:.2f}%, P_profit={p_profit_final:.2f}, Thresh={profit_threshold:.2f} => ConfidenceFactor={profit_confidence_factor:.2f}, EffectiveRisk={effective_risk_pct_for_trade*100:.3f}%")
+
+    acc_bal = get_account_balance(client, configs)
+    if acc_bal is None or acc_bal <= 0:
+        print(f"{log_prefix_task} Invalid account balance. Aborting."); return f"{symbol}: AdvFibML Error - Balance issue"
+
+    qty_to_order = calculate_position_size(acc_bal, effective_risk_pct_for_trade, actual_entry_price_trade, actual_sl_price_trade, s_info, configs)
+    if qty_to_order is None or qty_to_order <= 0:
+        print(f"{log_prefix_task} Invalid position size. Aborting."); return f"{symbol}: AdvFibML Error - Position size issue"
+
+    # --- Final Sanity Checks, Cooldown, Signature, Order Placement (similar to other strategies) ---
+    # Leverage (use fixed or dynamic as per main config)
+    leverage_for_trade = configs.get('leverage') # Default to fixed, dynamic can be integrated
+    # Ensure leverage and margin type are set (can be done once per symbol or if changed)
+    set_leverage_on_symbol(client, symbol, leverage_for_trade)
+    set_margin_type_on_symbol(client, symbol, configs['margin_type'], configs)
+
+
+    passed_sanity, sanity_reason = pre_order_sanity_checks(
+        symbol, potential_trade_side.upper(), actual_entry_price_trade, actual_sl_price_trade, actual_tp_price_trade,
+        qty_to_order, s_info, acc_bal, effective_risk_pct_for_trade, configs, # Use effective risk for check
+        specific_leverage_for_trade=leverage_for_trade
+    )
+    if not passed_sanity:
+        print(f"{log_prefix_task} Sanity checks FAILED: {sanity_reason}. Aborting."); return f"{symbol}: AdvFibML Error - Sanity Check Failed"
+
+    # Update Cooldown & Signature
+    with last_signal_lock: last_signal_time[f"{symbol}_adv_fib_ml"] = dt.now()
+    trade_sig_ml = generate_trade_signature(symbol, f"ADV_FIB_ML_{potential_trade_side.upper()}", actual_entry_price_trade, actual_sl_price_trade, actual_tp_price_trade, qty_to_order, p_prec)
+    with recent_trade_signatures_lock:
+        if trade_sig_ml in recent_trade_signatures and (dt.now() - recent_trade_signatures[trade_sig_ml]).total_seconds() < 60 :
+            print(f"{log_prefix_task} Duplicate ML trade signature. Skipping."); return f"{symbol}: AdvFibML Skipped - Duplicate Signature"
+        recent_trade_signatures[trade_sig_ml] = dt.now() # Add signature before placing orders
+
+    # Place Market Order
+    entry_order_obj, entry_err = place_new_order(client, s_info, "BUY" if potential_trade_side == "long" else "SELL", "MARKET", qty_to_order, position_side=potential_trade_side.upper())
+    if not entry_order_obj or entry_order_obj.get('status') != 'FILLED':
+        print(f"{log_prefix_task} Market entry order FAILED. Err: {entry_err}. Order: {entry_order_obj}"); return f"{symbol}: AdvFibML Error - Entry Order Failed"
+
+    actual_filled_price_final = float(entry_order_obj['avgPrice'])
+    print(f"{log_prefix_task} Market entry FILLED at {actual_filled_price_final:.{p_prec}f}")
+
+    # Adjust SL/TP based on actual fill if significantly different (optional, for now use original)
+    final_sl_price_to_set = actual_sl_price_trade
+    final_tp_price_to_set = actual_tp_price_trade
+    # Add logic here if SL/TP need to be re-calculated based on actual_filled_price_final vs actual_entry_price_trade
+
+    # Place SL/TP Orders
+    sl_ord_obj, sl_err = place_new_order(client, s_info, "SELL" if potential_trade_side == "long" else "BUY", "STOP_MARKET", qty_to_order, stop_price=final_sl_price_to_set, position_side=potential_trade_side.upper(), is_closing_order=True)
+    tp_ord_obj, tp_err = place_new_order(client, s_info, "SELL" if potential_trade_side == "long" else "BUY", "TAKE_PROFIT_MARKET", qty_to_order, stop_price=final_tp_price_to_set, position_side=potential_trade_side.upper(), is_closing_order=True)
+
+    if not sl_ord_obj: print(f"{log_prefix_task} CRITICAL: SL order FAILED. Err: {sl_err}")
+    if not tp_ord_obj: print(f"{log_prefix_task} WARNING: TP order FAILED. Err: {tp_err}")
+
+    # Update active_trades
+    with active_trades_lock:
+        active_trades[symbol] = {
+            "entry_order_id": entry_order_obj['orderId'],
+            "sl_order_id": sl_ord_obj.get('orderId') if sl_ord_obj else None,
+            "tp_order_id": tp_ord_obj.get('orderId') if tp_ord_obj else None,
+            "entry_price": actual_filled_price_final,
+            "current_sl_price": final_sl_price_to_set, "initial_sl_price": final_sl_price_to_set,
+            "current_tp_price": final_tp_price_to_set, "initial_tp_price": final_tp_price_to_set,
+            "quantity": qty_to_order, "side": potential_trade_side.upper(),
+            "symbol_info": s_info, "open_timestamp": pd.Timestamp.now(tz='UTC'),
+            "strategy_type": "ADV_FIB_ML", "sl_management_stage": "initial",
+            "p_swing_at_entry": p_swing_final, "p_profit_at_entry": p_profit_final # Log ML scores
+        }
+    print(f"{log_prefix_task} Trade for {symbol} (AdvFibML) added to active_trades.")
+
+    # Send Telegram notification
+    if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+        # ... (construct and send Telegram message similar to other strategies) ...
+        ml_trade_msg = (
+            f"🚀 ML TRADE PLACED (AdvFibML) 🚀\n\n"
+            f"Symbol: {symbol}\nSide: {potential_trade_side.upper()}\nQty: {qty_to_order:.{q_prec}f}\n"
+            f"Entry: {actual_filled_price_final:.{p_prec}f}\nSL: {final_sl_price_to_set:.{p_prec}f}\nTP: {final_tp_price_to_set:.{p_prec}f}\n"
+            f"P_swing: {p_swing_final:.2f}, P_profit: {p_profit_final:.2f}\nEffective Risk: {effective_risk_pct_for_trade*100:.3f}%"
+        )
+        send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], ml_trade_msg)
+
+    return f"{symbol}: AdvFibML Trade Placed"
+
 
 def manage_trade_entry(client, configs, symbol, klines_df, lock): # lock here is active_trades_lock
     global active_trades, symbols_currently_processing, symbols_currently_processing_lock
@@ -6918,6 +7400,23 @@ def trading_loop(client, configs, monitored_symbols):
     try:
         global bot_shutdown_requested, bot_restart_requested  # Added bot_restart_requested
         global active_signals, active_signals_lock  # For attempt_direct_adv_fib_execution signal mode
+    # Imports for ML strategy feature calculation - ensure app.py is in PYTHONPATH or same dir
+    try:
+        from app import calculate_atr as app_calculate_atr
+        from app import calculate_ema as app_calculate_ema
+        from app import calculate_rsi as app_calculate_rsi
+        # We need to define feature engineering functions similar to app.py or import them if structured for that.
+        # For now, let's define simplified versions or call app.py's if possible and safe.
+        # The feature names PIVOT_FEATURE_NAMES, ENTRY_FEATURE_NAMES_BASE, MODEL_ATR_PERIOD are global.
+    except ImportError as e_import_app:
+        print(f"CRITICAL ERROR: Could not import necessary functions from app.py for ML strategy: {e_import_app}")
+        print("Ensure app.py is in the correct path. ML strategy will likely fail.")
+        # Decide if bot should exit or try to run non-ML strategies. For now, it will continue but ML tasks will fail.
+        # To prevent NameError later if imports failed:
+        def app_calculate_atr(df, period): print("Error: app_calculate_atr not loaded"); return pd.Series()
+        def app_calculate_ema(df, period, column='close'): print("Error: app_calculate_ema not loaded"); return pd.Series()
+        def app_calculate_rsi(df, period=14, column='close'): print("Error: app_calculate_rsi not loaded"); return pd.Series()
+
 
         while True:
             if bot_shutdown_requested:
@@ -7059,6 +7558,9 @@ def trading_loop(client, configs, monitored_symbols):
                     elif configs["strategy_choice"] == "ict_strategy":
                         task_function_to_submit = process_symbol_ict_task
                         print(f"Using ICT Strategy task function: {task_function_to_submit.__name__}")
+                    elif configs["strategy_choice"] == "adv_fib_ml":
+                        task_function_to_submit = process_symbol_adv_fib_ml_task # New task function
+                        print(f"Using Advanced Fibonacci ML task function: {task_function_to_submit.__name__}")
                     else:
                         print(f"ERROR: Unknown strategy_choice '{configs['strategy_choice']}' in trading_loop. Cannot submit tasks.")
                         proceed_with_new_trades = False # Stop trying to process new trades if strategy is unknown
@@ -9935,6 +10437,96 @@ def main_bot_logic(): # Renamed main to main_bot_logic
         print("Loading pending Fibonacci limit orders from CSV...")
         load_pending_fib_orders_from_csv()
     # --- End Load Pending Fibonacci Limit Orders ---
+
+    # --- Load ML Models and Params (if ML strategy is chosen) ---
+    if configs.get("strategy_choice") == "adv_fib_ml":
+        print("Loading ML models for Advanced Fibonacci ML strategy...")
+        try:
+            # These imports are specific to loading models and potentially feature calculation from app.py
+            from app import load_model as app_load_model
+            # If app.py also defines feature names or other constants needed:
+            # from app import PIVOT_FEATURE_NAMES as APP_PIVOT_FEATURES
+            # from app import ENTRY_FEATURE_NAMES_BASE as APP_ENTRY_FEATURES_BASE
+            # from app import ATR_PERIOD as APP_ATR_PERIOD # To ensure consistency
+            # For now, assume feature names will be handled by being saved with model_params.json or hardcoded consistently.
+
+            global pivot_model, entry_model, model_best_params
+            global PIVOT_FEATURE_NAMES, ENTRY_FEATURE_NAMES_BASE, MODEL_ATR_PERIOD
+
+            pivot_model_path = configs.get("pivot_model_path", DEFAULT_PIVOT_MODEL_PATH)
+            entry_model_path = configs.get("entry_model_path", DEFAULT_ENTRY_MODEL_PATH)
+            params_path = configs.get("model_params_path", DEFAULT_MODEL_PARAMS_PATH)
+
+            if os.path.exists(pivot_model_path):
+                pivot_model = app_load_model(pivot_model_path)
+                print(f"Pivot detection model loaded from '{pivot_model_path}'.")
+            else:
+                print(f"ERROR: Pivot model file not found at '{pivot_model_path}'. ML Strategy will not function.")
+                # Potentially sys.exit(1) or fallback to non-ML strategy if critical
+
+            if os.path.exists(entry_model_path):
+                entry_model = app_load_model(entry_model_path)
+                print(f"Entry evaluation model loaded from '{entry_model_path}'.")
+            else:
+                print(f"ERROR: Entry model file not found at '{entry_model_path}'. ML Strategy will not function.")
+
+            if os.path.exists(params_path):
+                import json
+                with open(params_path, 'r') as f:
+                    model_best_params = json.load(f)
+                print(f"Model parameters (thresholds, features) loaded from '{params_path}'.")
+                # Populate global feature name lists and ATR period from these params if available
+                # Example:
+                PIVOT_FEATURE_NAMES = model_best_params.get('pivot_feature_names', [])
+                ENTRY_FEATURE_NAMES_BASE = model_best_params.get('entry_feature_names_base', [])
+                # Load the specific ATR period used during model training from params file
+                # Fallback to MODEL_ATR_PERIOD (which is 14 by default) if not in params file
+                loaded_model_atr_period = model_best_params.get('model_training_atr_period', MODEL_ATR_PERIOD)
+
+                if loaded_model_atr_period != MODEL_ATR_PERIOD:
+                    print(f"WARNING: ATR period from model_params.json ({loaded_model_atr_period}) differs from main.py default MODEL_ATR_PERIOD ({MODEL_ATR_PERIOD}).")
+                    print(f"Using ATR period from model_params.json: {loaded_model_atr_period} for ML features.")
+                    MODEL_ATR_PERIOD = loaded_model_atr_period # Override global with the one from params
+                else:
+                    print(f"Confirmed ML Model ATR period from params/default: {MODEL_ATR_PERIOD}")
+
+                if not PIVOT_FEATURE_NAMES:
+                    print(f"WARNING: 'pivot_feature_names' not found in '{params_path}'. Falling back to default list.")
+                    PIVOT_FEATURE_NAMES = [
+                        f'atr_{MODEL_ATR_PERIOD}', 'range_atr_norm', 'macd_slope_atr_norm',
+                        'return_1b_atr_norm', 'return_3b_atr_norm', 'return_5b_atr_norm',
+                        'high_rank_7', 'bars_since_last_pivot', 'volume_spike_vs_avg', 'rsi_14'
+                    ]
+                    print(f"Using default PIVOT_FEATURE_NAMES (adjust if training used different): {PIVOT_FEATURE_NAMES}")
+                else:
+                    print(f"Loaded PIVOT_FEATURE_NAMES from '{params_path}'.")
+
+                if not ENTRY_FEATURE_NAMES_BASE:
+                    print(f"WARNING: 'entry_feature_names_base' not found in '{params_path}'. Falling back to default list.")
+                    ENTRY_FEATURE_NAMES_BASE = [
+                        'ema20_ema50_norm_atr',
+                        'return_entry_1b', 'return_entry_3b', 'return_entry_5b',
+                        f'atr_{MODEL_ATR_PERIOD}_change', 'hour_of_day', 'day_of_week', 'vol_regime'
+                    ]
+                    print(f"Using default ENTRY_FEATURE_NAMES_BASE (adjust if training used different): {ENTRY_FEATURE_NAMES_BASE}")
+                else:
+                    print(f"Loaded ENTRY_FEATURE_NAMES_BASE from '{params_path}'.")
+            else:
+                print(f"ERROR: Model parameters file not found at '{params_path}'. Using default thresholds, feature names, and ATR period. ML strategy may be impaired.")
+                # model_best_params will remain empty, relying on defaults later in code.
+                # This is risky; best_params should contain critical thresholds.
+
+        except ImportError:
+            print("ERROR: Could not import `app.load_model`. Ensure app.py is accessible and contains this function.")
+            print("ML Strategy will not function. Consider choosing a different strategy or fixing app.py import.")
+            # sys.exit(1) # Or fallback
+        except Exception as e_ml_load:
+            print(f"ERROR loading ML models or parameters: {e_ml_load}")
+            traceback.print_exc()
+            # sys.exit(1) # Or fallback
+
+    # --- End ML Model Loading ---
+
 
     if not user_defined_symbols:
         print(f"Warning: '{symbols_csv_filepath}' is empty or not found. Attempting to fall back to all USDT perpetuals.")

@@ -1,3 +1,9 @@
 python-binance
 pandas
 numpy
+scikit-learn
+lightgbm
+optuna
+joblib
+requests
+python-telegram-bot
