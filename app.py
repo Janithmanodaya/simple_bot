@@ -36,6 +36,11 @@ import json # For JSON operations
 app_settings = {}
 APP_CONFIG_FILE = "app_settings.json" # Changed from APP_TRADE_CONFIG_FILE and to JSON
 
+# --- Global App Trading Configs ---
+# This will be populated by load_app_trading_configs, likely from app_settings
+app_trading_configs = {}
+# No separate file, will draw from app_settings
+
 # --- Global App Active Trades ---
 # Stores details of trades initiated and managed by app.py
 app_active_trades = {}
@@ -413,9 +418,9 @@ def load_app_settings(filepath=APP_CONFIG_FILE):
         "app_telegram_chat_id": None,
         "app_tp1_qty_pct": 0.25,
         "app_tp2_qty_pct": 0.50,
-        "app_pivot_model_path": "app_pivot_model.joblib",
-        "app_entry_model_path": "app_entry_model.joblib",
-        "app_model_params_path": "app_model_params.json",
+        "app_pivot_model_path": "pivot_detector_model.joblib",
+        "app_entry_model_path": "entry_evaluator_model.joblib",
+        "app_model_params_path": "best_model_params.json",
         "app_auto_start_trading_after_train": False,
         "app_force_retrain_on_startup": False,
         # Add other ML training specific defaults if needed (e.g., Optuna trials)
@@ -497,6 +502,79 @@ def load_app_settings(filepath=APP_CONFIG_FILE):
     
     # Save the potentially updated settings (with user inputs) back to file
     save_app_settings(filepath) # This will save current_settings which includes user inputs
+
+def load_app_trading_configs():
+    """
+    Populates the global `app_trading_configs` dictionary.
+    It sources its values primarily from the already loaded `app_settings`.
+    This function ensures that trading-specific configurations are available
+    under `app_trading_configs` for functions that expect them there.
+    """
+    global app_trading_configs, app_settings
+
+    if not app_settings:
+        print("Warning (load_app_trading_configs): app_settings is empty. Attempting to load them first.")
+        # Note: load_app_settings() might prompt user if file is missing.
+        # This is acceptable as app_settings are fundamental.
+        load_app_settings() 
+        if not app_settings:
+            print("Error (load_app_trading_configs): Failed to load app_settings. Trading configs will be empty or defaults.")
+            # Populate with some very basic defaults if app_settings loading failed entirely
+            app_trading_configs = {
+                "app_operational_mode": "signal",
+                "app_risk_percent": 0.01,
+                "app_leverage": 20,
+                "app_allow_exceed_risk_for_min_notional": False,
+                "app_tp1_qty_pct": 0.25,
+                "app_tp2_qty_pct": 0.50,
+                # Add any other essential trading defaults here if app_settings might fail
+            }
+            return
+
+    # Default values that might not be in app_settings or need a specific default for trading context
+    default_trading_specific_configs = {
+        "app_allow_exceed_risk_for_min_notional": False, # Default for this specific trading config
+        # Add other trading-specific defaults here if they are not typically in app_settings.json
+    }
+
+    # Start with trading-specific defaults
+    temp_trading_configs = default_trading_specific_configs.copy()
+
+    # Override with values from app_settings if they exist
+    # These are keys expected to be in app_settings and relevant for app_trading_configs
+    shared_keys_from_app_settings = [
+        "app_operational_mode",
+        "app_risk_percent",
+        "app_leverage",
+        "app_telegram_bot_token", # For sending messages from trade execution logic
+        "app_telegram_chat_id",   # For sending messages from trade execution logic
+        "app_tp1_qty_pct",
+        "app_tp2_qty_pct",
+        # "app_trading_environment" is also in app_settings and used by initialize_app_binance_client
+        # No need to explicitly copy if functions using app_trading_configs can also access app_settings for it.
+        # Or copy it if preferred for consolidation:
+        "app_trading_environment",
+    ]
+
+    for key in shared_keys_from_app_settings:
+        if key in app_settings:
+            temp_trading_configs[key] = app_settings[key]
+        elif key not in temp_trading_configs: # If not in app_settings and no default set yet
+            print(f"Warning (load_app_trading_configs): Key '{key}' not found in app_settings and no default in trading_specific_configs. It will be missing from app_trading_configs.")
+            # Optionally set a fallback default here if critical
+            # e.g., if key == "app_operational_mode": temp_trading_configs[key] = "signal"
+
+    # Ensure essential keys have fallbacks if still missing (though load_app_settings should have handled most)
+    if "app_operational_mode" not in temp_trading_configs: temp_trading_configs["app_operational_mode"] = "signal"
+    if "app_risk_percent" not in temp_trading_configs: temp_trading_configs["app_risk_percent"] = 0.01
+    if "app_leverage" not in temp_trading_configs: temp_trading_configs["app_leverage"] = 20
+    if "app_tp1_qty_pct" not in temp_trading_configs: temp_trading_configs["app_tp1_qty_pct"] = 0.25
+    if "app_tp2_qty_pct" not in temp_trading_configs: temp_trading_configs["app_tp2_qty_pct"] = 0.50
+
+
+    app_trading_configs.update(temp_trading_configs)
+    print(f"app.py: Trading configurations populated in app_trading_configs (sourced from app_settings).")
+    # No saving back to a separate file, as app_settings.json is the source of truth.
 
 def save_app_settings(filepath=APP_CONFIG_FILE):
     """Saves the current app_settings to a JSON file, excluding sensitive keys."""
