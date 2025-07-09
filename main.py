@@ -7186,7 +7186,7 @@ def trading_loop(client, configs, monitored_symbols):
                 # --- Loop Delay ---
                 # Determine appropriate sleep time
                 # If any halt is active, or max positions, might use a shorter delay to check for new day or slot availability sooner.
-                current_loop_delay_seconds = configs['loop_delay_minutes'] # Default delay
+                current_loop_delay_seconds = configs['loop_delay_minutes'] * 20 # Default delay
                 if halt_dd_flag or halt_dsl_flag or (num_active_trades >= max_pos_limit and proceed_with_new_trades == False) :
                     # Using a shorter delay if halted or at max positions, to check for day reset or position closure sooner
                     current_loop_delay_seconds = 25 
