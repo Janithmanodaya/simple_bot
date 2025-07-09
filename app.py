@@ -97,13 +97,13 @@ def load_app_api_keys(env="mainnet"): # Default to mainnet for app.py trading
         print(f"An unexpected error occurred while loading keys in app.py: {e}")
         sys.exit(1)
 
-def initialize_app_binance_client(env="mainnet", app_configs=None):
+def initialize_app_binance_client(env="mainnet"): # Removed app_configs parameter
     """
     Initializes the Binance client for app.py.
     Stores it in the global `app_binance_client`.
-    `app_configs` can be used to pass general configuration if needed (e.g., for Telegram alerts on init failure).
+    If Telegram alerts on init failure are needed, it will use global `app_trading_configs`.
     """
-    global app_binance_client
+    global app_binance_client, app_trading_configs # Ensure app_trading_configs is accessible if needed for alerts
     api_key, api_secret, _, _ = load_app_api_keys(env) # Telegram keys not used directly in init
 
     try:
@@ -315,10 +315,10 @@ def load_app_trading_configs(filepath=APP_TRADE_CONFIG_FILE):
 
 # --- Order Placement and Sizing Functions (Adapted from main.py) ---
 
-def calculate_app_position_size(balance, risk_pct, entry_price, sl_price, symbol_info_app, app_configs_param=None): # Changed app_configs to app_configs_param
+def calculate_app_position_size(balance, risk_pct, entry_price, sl_price, symbol_info_app, app_configs_local=None): # Renamed parameter
     """
     Calculates position size for app.py. Adapted from main.py's calculate_position_size.
-    `app_configs` should contain risk management settings like 'allow_exceed_risk_for_min_notional'.
+    `app_configs_local` (if provided) or global `app_trading_configs` should contain risk management settings like 'allow_exceed_risk_for_min_notional'.
     """
     if not symbol_info_app or balance <= 0 or entry_price <= 0 or sl_price <= 0 or abs(entry_price - sl_price) < 1e-9:
         print("app.py pos_size: Invalid inputs.")
@@ -346,9 +346,9 @@ def calculate_app_position_size(balance, risk_pct, entry_price, sl_price, symbol
         print(f"app.py pos_size: Initial calc {adj_size} for {symbol_info_app.get('symbol')} < min_qty {min_qty}.")
         risk_for_min_qty = (min_qty * abs(entry_price - sl_price)) / balance
         
-        allow_exceed = False # Default behavior: do not exceed risk for min_qty unless configured
-        if app_configs: # Check if app_configs is provided
-            allow_exceed = app_configs.get('allow_exceed_risk_for_min_notional', False) 
+        # Use local parameter if available, else global app_trading_configs
+        current_configs_to_use = app_configs_local if app_configs_local is not None else app_trading_configs
+        allow_exceed = current_configs_to_use.get('allow_exceed_risk_for_min_notional', False)
 
         if risk_for_min_qty > risk_pct:
             if allow_exceed:
@@ -382,9 +382,8 @@ def calculate_app_position_size(balance, risk_pct, entry_price, sl_price, symbol
             risk_for_min_notional_qty = (qty_for_min_notional * abs(entry_price - sl_price)) / balance
             print(f"app.py pos_size: Qty for MIN_NOTIONAL: {qty_for_min_notional}. Implied risk: {risk_for_min_notional_qty*100:.2f}%. Target: {risk_pct*100:.2f}%.")
 
-            allow_exceed_mn = False
-            if app_configs:
-                allow_exceed_mn = app_configs.get('allow_exceed_risk_for_min_notional', False)
+            # Use local parameter if available, else global app_trading_configs (already defined as current_configs_to_use)
+            allow_exceed_mn = current_configs_to_use.get('allow_exceed_risk_for_min_notional', False)
 
             if risk_for_min_notional_qty > risk_pct:
                 if allow_exceed_mn:
@@ -538,9 +537,9 @@ def execute_app_trade_signal(symbol: str, side: str,
             
     risk_percentage = app_trading_configs.get("app_risk_percent", 0.01) # Default 1%
     
-    quantity = calculate_app_position_size(balance, risk_percentage, 
-                                           effective_entry_price_for_sizing, sl_price, 
-                                           symbol_info_app, app_trading_configs)
+    quantity = calculate_app_position_size(balance, risk_percentage,
+                                           effective_entry_price_for_sizing, sl_price,
+                                           symbol_info_app, app_configs_local=app_trading_configs) # Pass global app_trading_configs
     if quantity is None or quantity <= 0:
         print(f"{log_prefix} Position size calculation failed or resulted in zero/negative quantity ({quantity}). Cannot execute trade.")
         return False
@@ -1146,7 +1145,7 @@ def generate_candidate_pivots(df, n_left=PIVOT_N_LEFT, n_right=PIVOT_N_RIGHT):
             df.loc[df.index[i], 'is_candidate_low'] = True
     return df
 
-def prune_and_label_pivots(df, atr_distance_factor=MIN_ATR_DISTANCE, min_bar_gap=MIN_BAR_GAP):
+def prune_and_label_pivots(df, atr_col_name, atr_distance_factor=MIN_ATR_DISTANCE, min_bar_gap=MIN_BAR_GAP): # Added atr_col_name
     """
     Prunes candidate pivots and labels them.
     - Enforce ATR-distance >= 1 * ATR14 from the previous pivot.
@@ -1243,7 +1242,7 @@ def prune_and_label_pivots(df, atr_distance_factor=MIN_ATR_DISTANCE, min_bar_gap
     return df
 
 
-def simulate_fib_entries(df):
+def simulate_fib_entries(df, atr_col_name): # Added atr_col_name
     """
     For each confirmed pivot, simulate entry at chosen Fib level, SL, and TPs.
     Records outcome classes: 0=stopped-out, 1=hit TP1 only, 2=hit TP2+, 3=hit TP3.
@@ -1371,7 +1370,7 @@ def calculate_rsi(df, period=14, column='close'):
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
-def engineer_pivot_features(df):
+def engineer_pivot_features(df, atr_col_name): # Added atr_col_name
     """
     Engineers features for the pivot detection model.
     `atr_col_name` should be the name of the ATR column to use (e.g., 'atr_14').
@@ -1597,6 +1596,8 @@ def objective_optuna(trial, df_processed, pivot_features, entry_features_base):
     current_min_atr_distance = trial.suggest_float('min_atr_distance_opt', 0.5, 2.5) # Factor for ATR distance
     current_min_bar_gap = trial.suggest_int('min_bar_gap_opt', 5, 15) # Min bars between pivots
 
+    atr_col_name_optuna = f'atr_{current_atr_period}'
+
     # --- Data Prep for Optuna Trial ---
     # The crucial part for the *next* step is that df_processed would be re-processed here
     # using current_atr_period, current_pivot_n_left, etc.
@@ -1655,8 +1656,8 @@ def objective_optuna(trial, df_processed, pivot_features, entry_features_base):
         return -1.0 # Bad score if no trades
 
     # Add specific entry features for these candidates
-    entry_train_candidates['norm_dist_entry_pivot'] = (entry_train_candidates['entry_price_sim'] - entry_train_candidates.apply(lambda r: r['low'] if r['is_swing_low'] else r['high'], axis=1)) / entry_train_candidates[f'atr_{ATR_PERIOD}']
-    entry_train_candidates['norm_dist_entry_sl'] = (entry_train_candidates['entry_price_sim'] - entry_train_candidates['sl_price_sim']).abs() / entry_train_candidates[f'atr_{ATR_PERIOD}']
+    entry_train_candidates['norm_dist_entry_pivot'] = (entry_train_candidates['entry_price_sim'] - entry_train_candidates.apply(lambda r: r['low'] if r['is_swing_low'] else r['high'], axis=1)) / entry_train_candidates[atr_col_name_optuna]
+    entry_train_candidates['norm_dist_entry_sl'] = (entry_train_candidates['entry_price_sim'] - entry_train_candidates['sl_price_sim']).abs() / entry_train_candidates[atr_col_name_optuna]
 
 
     X_entry_train = entry_train_candidates[entry_features_base + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']].fillna(-1)
@@ -1694,8 +1695,8 @@ def objective_optuna(trial, df_processed, pivot_features, entry_features_base):
         return -0.5 # No trades triggered by pivot model
 
     # 2. For these pivots, compute entry features (including the P_swing from pivot_model)
-    potential_pivots_val['norm_dist_entry_pivot'] = (potential_pivots_val['entry_price_sim'] - potential_pivots_val.apply(lambda r: r['low'] if r['is_swing_low'] else r['high'], axis=1)) / potential_pivots_val[f'atr_{ATR_PERIOD}']
-    potential_pivots_val['norm_dist_entry_sl'] = (potential_pivots_val['entry_price_sim'] - potential_pivots_val['sl_price_sim']).abs() / potential_pivots_val[f'atr_{ATR_PERIOD}']
+    potential_pivots_val['norm_dist_entry_pivot'] = (potential_pivots_val['entry_price_sim'] - potential_pivots_val.apply(lambda r: r['low'] if r['is_swing_low'] else r['high'], axis=1)) / potential_pivots_val[atr_col_name_optuna]
+    potential_pivots_val['norm_dist_entry_sl'] = (potential_pivots_val['entry_price_sim'] - potential_pivots_val['sl_price_sim']).abs() / potential_pivots_val[atr_col_name_optuna]
 
     X_entry_eval = potential_pivots_val[entry_features_base + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']].fillna(-1)
 
@@ -1742,10 +1743,191 @@ def objective_optuna(trial, df_processed, pivot_features, entry_features_base):
     return profit_factor if profit_factor > 0 else -1.0 * (1/ (profit_factor -0.001)) # Penalize negative PFs heavily
 
 
-def run_optuna_tuning(df_processed, pivot_features, entry_features_base, n_trials=50):
+# Modified to accept df_raw (less processed) and static_entry_features_base
+def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot_features, entry_features_base
+    """Optuna objective function. Performs data processing per trial."""
+    # Hyperparameters to tune for models
+    pivot_model_type = trial.suggest_categorical('pivot_model_type', ['lgbm'])
+    pivot_num_leaves = trial.suggest_int('pivot_num_leaves', 20, 50) if pivot_model_type == 'lgbm' else None
+    pivot_learning_rate = trial.suggest_float('pivot_learning_rate', 0.01, 0.1) if pivot_model_type == 'lgbm' else None
+    pivot_max_depth = trial.suggest_int('pivot_max_depth', 5, 10)
+    entry_model_type = trial.suggest_categorical('entry_model_type', ['lgbm'])
+    entry_num_leaves = trial.suggest_int('entry_num_leaves', 20, 50) if entry_model_type == 'lgbm' else None
+    entry_learning_rate = trial.suggest_float('entry_learning_rate', 0.01, 0.1) if entry_model_type == 'lgbm' else None
+    entry_max_depth = trial.suggest_int('entry_max_depth', 5, 10)
+    # Thresholds
+    p_swing_threshold = trial.suggest_float('p_swing_threshold', 0.5, 0.9)
+    profit_threshold = trial.suggest_float('profit_threshold', 0.5, 0.9)
+
+    # --- Strategy/Data Processing Parameters to Tune ---
+    current_atr_period = trial.suggest_int('atr_period_opt', 10, 24)
+    current_pivot_n_left = trial.suggest_int('pivot_n_left_opt', 2, 7)
+    current_pivot_n_right = trial.suggest_int('pivot_n_right_opt', 2, 7)
+    current_min_atr_distance = trial.suggest_float('min_atr_distance_opt', 0.5, 2.5)
+    current_min_bar_gap = trial.suggest_int('min_bar_gap_opt', 5, 15)
+
+    atr_col_name_optuna = f'atr_{current_atr_period}'
+    print(f"Optuna Trial - Params: ATR_P={current_atr_period}, Pivot_L={current_pivot_n_left}, Pivot_R={current_pivot_n_right}, MinATR_D={current_min_atr_distance:.2f}, MinBar_G={current_min_bar_gap}")
+
+    # --- Per-Trial Data Processing ---
+    df_trial_processed = df_raw.copy() # Start with a fresh copy of the raw data for each trial
+
+    # 1. Calculate ATR for the current trial's period
+    df_trial_processed = calculate_atr(df_trial_processed, period=current_atr_period)
+    if atr_col_name_optuna not in df_trial_processed.columns:
+        print(f"Error: ATR column '{atr_col_name_optuna}' not created in trial. Skipping trial.")
+        return -100.0 # Penalize heavily
+
+    # 2. Generate candidate pivots
+    df_trial_processed = generate_candidate_pivots(df_trial_processed, n_left=current_pivot_n_left, n_right=current_pivot_n_right)
+
+    # 3. Prune and label pivots
+    df_trial_processed = prune_and_label_pivots(df_trial_processed, atr_col_name=atr_col_name_optuna, 
+                                                atr_distance_factor=current_min_atr_distance, 
+                                                min_bar_gap=current_min_bar_gap)
+
+    # 4. Simulate Fibonacci entries
+    df_trial_processed = simulate_fib_entries(df_trial_processed, atr_col_name=atr_col_name_optuna)
+    
+    # Drop rows with NaN in critical columns that might have been introduced or not handled by ATR/simulation
+    # This is important before feature engineering
+    df_trial_processed.dropna(subset=[atr_col_name_optuna, 'low', 'high', 'close'], inplace=True) # Add other critical columns if necessary
+    df_trial_processed.reset_index(drop=True, inplace=True)
+
+    if len(df_trial_processed) < 100: # Check if enough data remains after initial processing
+        print(f"Warning: Not enough data ({len(df_trial_processed)} rows) after initial trial processing. Skipping trial.")
+        return -99.0
+
+
+    # 5. Engineer pivot features (returns DataFrame and pivot_feature_names for this trial)
+    df_trial_processed, trial_pivot_features = engineer_pivot_features(df_trial_processed, atr_col_name=atr_col_name_optuna)
+
+    # 6. Engineer entry features (returns DataFrame and entry_feature_names_base for this trial)
+    # Pass the static_entry_features_base list which engineer_entry_features will use and potentially extend
+    # with atr_col_name_optuna related features.
+    df_trial_processed, trial_entry_features_base = engineer_entry_features(df_trial_processed, atr_col_name=atr_col_name_optuna, 
+                                                                          entry_features_base_list_arg=static_entry_features_base)
+
+    df_trial_processed.replace([np.inf, -np.inf], np.nan, inplace=True)
+    # It's crucial to handle NaNs from feature engineering before splitting
+    df_trial_processed.dropna(subset=trial_pivot_features, inplace=True) # Drop rows where pivot features are NaN
+    # For entry features, NaNs are typically handled on the subset of data used for entry model training.
+    df_trial_processed.reset_index(drop=True, inplace=True)
+    
+    if len(df_trial_processed) < 100: # Check if enough data remains after feature engineering
+        print(f"Warning: Not enough data ({len(df_trial_processed)} rows) after trial feature engineering. Skipping trial.")
+        return -98.0
+
+    # --- Data Splitting ---
+    # The rest of the function (splitting, training, eval) remains largely the same,
+    # but uses df_trial_processed and trial_pivot_features / trial_entry_features_base.
+    train_size = int(0.7 * len(df_trial_processed))
+    val_size = int(0.15 * len(df_trial_processed))
+
+    df_train = df_trial_processed.iloc[:train_size].copy()
+    df_val = df_trial_processed.iloc[train_size:train_size + val_size].copy()
+
+    if len(df_train) < 50 or len(df_val) < 20: # Ensure enough data for train/val
+        print(f"Warning: Not enough data for training/validation sets in trial. Train: {len(df_train)}, Val: {len(df_val)}. Skipping.")
+        return -97.0
+
+    # Prepare data for pivot model
+    X_pivot_train = df_train[trial_pivot_features].fillna(-1) 
+    y_pivot_train = df_train['pivot_label']
+    X_pivot_val = df_val[trial_pivot_features].fillna(-1)
+    y_pivot_val = df_val['pivot_label']
+
+    if X_pivot_train.empty or X_pivot_val.empty:
+        print("Warning: Pivot training or validation features are empty. Skipping trial.")
+        return -96.0
+
+    # Train Pivot Model
+    if pivot_model_type == 'lgbm':
+        pivot_model = lgb.LGBMClassifier(num_leaves=pivot_num_leaves, learning_rate=pivot_learning_rate,
+                                         max_depth=pivot_max_depth, class_weight='balanced', random_state=42, n_estimators=100, verbosity=-1)
+        pivot_model.fit(X_pivot_train, y_pivot_train, eval_set=[(X_pivot_val, y_pivot_val)], callbacks=[early_stopping(stopping_rounds=5, verbose=False)])
+    else: # rf
+        pivot_model = RandomForestClassifier(n_estimators=100, max_depth=pivot_max_depth, class_weight='balanced', random_state=42)
+        pivot_model.fit(X_pivot_train, y_pivot_train)
+
+    p_swing_train_all_classes = pivot_model.predict_proba(X_pivot_train)
+    p_swing_val_all_classes = pivot_model.predict_proba(X_pivot_val)
+    df_train['P_swing'] = np.max(p_swing_train_all_classes[:, 1:], axis=1)
+    df_val['P_swing'] = np.max(p_swing_val_all_classes[:, 1:], axis=1)
+
+    entry_train_candidates = df_train[
+        (df_train['pivot_label'].isin([1, 2])) &
+        (df_train['trade_outcome'] != -1) &
+        (df_train['P_swing'] >= p_swing_threshold)
+    ].copy()
+
+    if len(entry_train_candidates) < 50:
+        return -1.0 
+
+    entry_train_candidates['norm_dist_entry_pivot'] = (entry_train_candidates['entry_price_sim'] - entry_train_candidates.apply(lambda r: r['low'] if r['is_swing_low'] == 1 else r['high'], axis=1)) / entry_train_candidates[atr_col_name_optuna]
+    entry_train_candidates['norm_dist_entry_sl'] = (entry_train_candidates['entry_price_sim'] - entry_train_candidates['sl_price_sim']).abs() / entry_train_candidates[atr_col_name_optuna]
+    
+    # Construct the full list of entry features for this trial
+    current_trial_full_entry_features = trial_entry_features_base + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']
+    
+    X_entry_train = entry_train_candidates[current_trial_full_entry_features].fillna(-1)
+    y_entry_train = (entry_train_candidates['trade_outcome'] > 0).astype(int)
+
+    if len(X_entry_train['P_swing'].unique()) < 2 or len(y_entry_train.unique()) < 2 or X_entry_train.empty:
+        return -1.0
+
+    if entry_model_type == 'lgbm':
+        entry_model = lgb.LGBMClassifier(num_leaves=entry_num_leaves, learning_rate=entry_learning_rate,
+                                         max_depth=entry_max_depth, class_weight='balanced', random_state=42, n_estimators=100, verbosity=-1)
+        if len(entry_train_candidates) > 20:
+             X_entry_train_sub, X_entry_val_sub, y_entry_train_sub, y_entry_val_sub = train_test_split(X_entry_train, y_entry_train, test_size=0.2, stratify=y_entry_train if len(y_entry_train.unique()) > 1 else None, random_state=42)
+             if len(X_entry_val_sub) > 0 and len(y_entry_val_sub.unique()) > 1:
+                entry_model.fit(X_entry_train_sub, y_entry_train_sub, eval_set=[(X_entry_val_sub, y_entry_val_sub)], callbacks=[early_stopping(stopping_rounds=5, verbose=False)])
+             else:
+                entry_model.fit(X_entry_train, y_entry_train) 
+        else:
+            entry_model.fit(X_entry_train, y_entry_train)
+    else: # rf
+        entry_model = RandomForestClassifier(n_estimators=100, max_depth=entry_max_depth, class_weight='balanced', random_state=42)
+        entry_model.fit(X_entry_train, y_entry_train)
+
+    potential_pivots_val = df_val[df_val['P_swing'] >= p_swing_threshold].copy()
+    potential_pivots_val = potential_pivots_val[potential_pivots_val['trade_outcome'] != -1]
+
+    if len(potential_pivots_val) == 0:
+        return -0.5
+
+    potential_pivots_val['norm_dist_entry_pivot'] = (potential_pivots_val['entry_price_sim'] - potential_pivots_val.apply(lambda r: r['low'] if r['is_swing_low'] == 1 else r['high'], axis=1)) / potential_pivots_val[atr_col_name_optuna]
+    potential_pivots_val['norm_dist_entry_sl'] = (potential_pivots_val['entry_price_sim'] - potential_pivots_val['sl_price_sim']).abs() / potential_pivots_val[atr_col_name_optuna]
+
+    X_entry_eval = potential_pivots_val[current_trial_full_entry_features].fillna(-1)
+
+    if len(X_entry_eval) == 0: return -0.5
+
+    p_profit_val = entry_model.predict_proba(X_entry_eval)[:, 1]
+    final_trades_val = potential_pivots_val[p_profit_val >= profit_threshold]
+
+    if len(final_trades_val) == 0:
+        return 0.0
+
+    profit_sum = 0; loss_sum = 0
+    for idx, trade in final_trades_val.iterrows():
+        outcome = trade['trade_outcome']
+        if outcome == 0: loss_sum += 1
+        elif outcome == 1: profit_sum += 1
+        elif outcome == 2: profit_sum += 2
+        elif outcome == 3: profit_sum += 3
+    if loss_sum == 0 and profit_sum > 0: return profit_sum
+    if loss_sum == 0 and profit_sum == 0: return 0.0
+    profit_factor = profit_sum / loss_sum
+    return profit_factor if profit_factor > 0 else -1.0 * (1/ (profit_factor -0.001))
+
+
+def run_optuna_tuning(df_universal_raw, static_entry_features_base_list, n_trials=50): # Renamed df_processed to df_universal_raw, changed features params
     """Runs Optuna hyperparameter tuning."""
     study = optuna.create_study(direction='maximize')
-    study.optimize(lambda trial: objective_optuna(trial, df_processed, pivot_features, entry_features_base),
+    # Pass the raw DataFrame and the list of static base entry features to objective_optuna
+    study.optimize(lambda trial: objective_optuna(trial, df_universal_raw, static_entry_features_base_list),
                    n_trials=n_trials,
                    # Consider using a time-series aware sampler/pruner if available and suitable
                    # For now, default sampler.
@@ -1775,6 +1957,68 @@ def run_optuna_tuning(df_processed, pivot_features, entry_features_base, n_trial
     return study.best_trial.params
 
 
+def process_dataframe_with_params(df_initial, params, static_entry_features_base_list_arg=None):
+    """
+    Processes a DataFrame using a given set of parameters (typically best_hyperparams from Optuna).
+    This function mirrors the per-trial processing logic in objective_optuna.
+    """
+    print(f"Processing DataFrame with params: {params}")
+    df_processed = df_initial.copy()
+
+    # Extract parameters, providing defaults if not all are in 'params' (e.g. if Optuna didn't tune some)
+    atr_period = params.get('atr_period_opt', ATR_PERIOD)
+    pivot_n_left = params.get('pivot_n_left_opt', PIVOT_N_LEFT)
+    pivot_n_right = params.get('pivot_n_right_opt', PIVOT_N_RIGHT)
+    min_atr_distance = params.get('min_atr_distance_opt', MIN_ATR_DISTANCE)
+    min_bar_gap = params.get('min_bar_gap_opt', MIN_BAR_GAP)
+    
+    atr_col_name = f'atr_{atr_period}'
+
+    # 1. Calculate ATR
+    df_processed = calculate_atr(df_processed, period=atr_period)
+    if atr_col_name not in df_processed.columns:
+        print(f"Error processing with params: ATR column '{atr_col_name}' not created.")
+        return None, None, None # Or raise an error
+
+    # 2. Generate candidate pivots
+    df_processed = generate_candidate_pivots(df_processed, n_left=pivot_n_left, n_right=pivot_n_right)
+
+    # 3. Prune and label pivots
+    df_processed = prune_and_label_pivots(df_processed, atr_col_name=atr_col_name, 
+                                          atr_distance_factor=min_atr_distance, 
+                                          min_bar_gap=min_bar_gap)
+
+    # 4. Simulate Fibonacci entries
+    df_processed = simulate_fib_entries(df_processed, atr_col_name=atr_col_name)
+    
+    df_processed.dropna(subset=[atr_col_name, 'low', 'high', 'close'], inplace=True)
+    df_processed.reset_index(drop=True, inplace=True)
+
+    if len(df_processed) < 30: # Min data check
+        print(f"Warning: Not enough data ({len(df_processed)} rows) after initial processing with best_params.")
+        return None, None, None
+
+    # 5. Engineer pivot features
+    df_processed, final_pivot_features = engineer_pivot_features(df_processed, atr_col_name=atr_col_name)
+
+    # 6. Engineer entry features
+    df_processed, final_entry_features_base = engineer_entry_features(
+        df_processed, 
+        atr_col_name=atr_col_name, 
+        entry_features_base_list_arg=static_entry_features_base_list_arg # This should be the static list
+    )
+
+    df_processed.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df_processed.dropna(subset=final_pivot_features, inplace=True)
+    df_processed.reset_index(drop=True, inplace=True)
+    
+    if len(df_processed) < 30:
+        print(f"Warning: Not enough data ({len(df_processed)} rows) after feature engineering with best_params.")
+        return None, None, None
+        
+    return df_processed, final_pivot_features, final_entry_features_base
+
+
 # --- Model Artifacts & Backtesting ---
 def save_model(model, filename="model.joblib"):
     """Saves a model to disk."""
@@ -1793,6 +2037,11 @@ def full_backtest(df_processed, pivot_model, entry_model, best_params, pivot_fea
     Uses the best models and thresholds found by Optuna.
     """
     print("\n--- Starting Full Backtest ---")
+    # Determine ATR column name for backtest based on best_params or default
+    backtest_atr_period = best_params.get('atr_period_opt', ATR_PERIOD) # Get tuned ATR period or default
+    atr_col_name_backtest = f'atr_{backtest_atr_period}'
+    print(f"Full Backtest using ATR column: {atr_col_name_backtest}")
+
     # Split: e.g., last 15% for test
     train_val_size = int(0.85 * len(df_processed))
     df_test = df_processed.iloc[train_val_size:].copy()
@@ -1820,8 +2069,8 @@ def full_backtest(df_processed, pivot_model, entry_model, best_params, pivot_fea
         return None, None, None, None
 
     # 3. Entry Features for these pivots
-    potential_pivots_test['norm_dist_entry_pivot'] = (potential_pivots_test['entry_price_sim'] - potential_pivots_test.apply(lambda r: r['low'] if r['predicted_pivot_class'] == 2 else r['high'], axis=1)) / potential_pivots_test[f'atr_{ATR_PERIOD}']
-    potential_pivots_test['norm_dist_entry_sl'] = (potential_pivots_test['entry_price_sim'] - potential_pivots_test['sl_price_sim']).abs() / potential_pivots_test[f'atr_{ATR_PERIOD}']
+    potential_pivots_test['norm_dist_entry_pivot'] = (potential_pivots_test['entry_price_sim'] - potential_pivots_test.apply(lambda r: r['low'] if r['predicted_pivot_class'] == 2 else r['high'], axis=1)) / potential_pivots_test[atr_col_name_backtest]
+    potential_pivots_test['norm_dist_entry_sl'] = (potential_pivots_test['entry_price_sim'] - potential_pivots_test['sl_price_sim']).abs() / potential_pivots_test[atr_col_name_backtest]
 
     X_entry_test = potential_pivots_test[entry_features_base + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']].fillna(-1)
 
@@ -2102,10 +2351,11 @@ def get_processed_data_for_symbol(symbol_ticker, kline_interval, start_date, end
     historical_df['symbol'] = symbol_ticker # Add symbol identifier
 
     # 2. Preprocessing & Labeling
-    historical_df = calculate_atr(historical_df)
+    historical_df = calculate_atr(historical_df, period=ATR_PERIOD) # Ensure ATR_PERIOD is used
+    atr_col_name_dynamic = f'atr_{ATR_PERIOD}'
     historical_df = generate_candidate_pivots(historical_df)
-    historical_df = prune_and_label_pivots(historical_df)
-    historical_df = simulate_fib_entries(historical_df)
+    historical_df = prune_and_label_pivots(historical_df, atr_col_name=atr_col_name_dynamic)
+    historical_df = simulate_fib_entries(historical_df, atr_col_name=atr_col_name_dynamic)
     
     if 'timestamp' not in historical_df.columns:
         if pd.api.types.is_datetime64_any_dtype(historical_df.index):
@@ -2117,8 +2367,9 @@ def get_processed_data_for_symbol(symbol_ticker, kline_interval, start_date, end
     historical_df.reset_index(drop=True, inplace=True)
 
     # 3. Feature Engineering
-    historical_df, pivot_feature_names = engineer_pivot_features(historical_df)
-    historical_df, entry_feature_names_base = engineer_entry_features(historical_df, None)
+    # atr_col_name_dynamic was defined above
+    historical_df, pivot_feature_names = engineer_pivot_features(historical_df, atr_col_name=atr_col_name_dynamic)
+    historical_df, entry_feature_names_base = engineer_entry_features(historical_df, atr_col_name=atr_col_name_dynamic, entry_features_base_list_arg=None)
 
     historical_df.replace([np.inf, -np.inf], np.nan, inplace=True)
     min_required_data_for_features = 30
@@ -2183,29 +2434,26 @@ if __name__ == '__main__':
         print("No training data collected from any symbol. Exiting.")
         exit()
 
-    # Combine all training data
-    universal_train_df = pd.concat(all_symbols_train_data_list, ignore_index=True)
-    universal_train_df.reset_index(drop=True, inplace=True) # Ensure clean index
+    # Combine all training data (these are initially processed with default params)
+    universal_df_initial_processed = pd.concat(all_symbols_train_data_list, ignore_index=True)
+    universal_df_initial_processed.reset_index(drop=True, inplace=True)
 
-    if len(universal_train_df) < 200: # Arbitrary minimum for training a universal model
-        print(f"Combined training data is too small ({len(universal_train_df)} rows). Exiting.")
+    if len(universal_df_initial_processed) < 200:
+        print(f"Combined initial training data is too small ({len(universal_df_initial_processed)} rows). Exiting.")
         exit()
     
-    print(f"\n--- Universal Model Training using {len(universal_train_df)} total rows ---")
-
-    # Ensure feature names are consistent (they should be from get_processed_data_for_symbol)
-    if processed_pivot_feature_names is None or processed_entry_feature_names_base is None:
-        print("ERROR: Feature names not captured during data processing. Exiting.")
-        exit()
+    # The processed_pivot_feature_names and processed_entry_feature_names_base from initial default processing
+    # are no longer strictly needed for Optuna or final model training's feature lists, as those are
+    # dynamically generated or determined by process_dataframe_with_params using best_hyperparams.
+    # The variable static_base_entry_features_for_final is removed.
 
     # 4. Optuna Hyperparameter Tuning for Universal Model
     print("Running Optuna for universal model...")
     try:
         best_hyperparams = run_optuna_tuning(
-            universal_train_df.copy(), # Pass a copy
-            processed_pivot_feature_names,
-            processed_entry_feature_names_base,
-            n_trials=20 # Adjust n_trials as needed, e.g., 20-50 for reasonable search
+            universal_df_initial_processed.copy(), 
+            static_entry_features_base_list=None, # Pass None, objective_optuna will handle it
+            n_trials=20 
         )
         print("Best Universal Hyperparameters from Optuna:", best_hyperparams)
     except Exception as e:
@@ -2247,23 +2495,36 @@ if __name__ == '__main__':
     save_model(universal_pivot_model, "pivot_detector_model.joblib")
 
     # --- Universal Entry Model ---
-    p_swing_universal_train_all_classes = universal_pivot_model.predict_proba(X_p_universal_train)
-    universal_train_df['P_swing'] = np.max(p_swing_universal_train_all_classes[:,1:], axis=1)
+    # Use the final processed DataFrame for P_swing calculation and candidate selection
+    p_swing_universal_train_all_classes = universal_pivot_model.predict_proba(X_p_universal_train) # X_p_universal_train is from df_final_processed_for_training
+    df_final_processed_for_training['P_swing'] = np.max(p_swing_universal_train_all_classes[:,1:], axis=1)
 
-    entry_universal_train_candidates = universal_train_df[
-        (universal_train_df['pivot_label'].isin([1, 2])) &
-        (universal_train_df['trade_outcome'] != -1) &
-        (universal_train_df['P_swing'] >= best_hyperparams['p_swing_threshold'])
+    entry_universal_train_candidates = df_final_processed_for_training[
+        (df_final_processed_for_training['pivot_label'].isin([1, 2])) &
+        (df_final_processed_for_training['trade_outcome'] != -1) &
+        (df_final_processed_for_training['P_swing'] >= best_hyperparams['p_swing_threshold'])
     ].copy()
 
     universal_entry_model = None
     if len(entry_universal_train_candidates) < 50:
         print("Not enough candidates for universal entry model training. Skipping entry model.")
     else:
-        entry_universal_train_candidates['norm_dist_entry_pivot'] = (entry_universal_train_candidates['entry_price_sim'] - entry_universal_train_candidates.apply(lambda r: r['low'] if r['is_swing_low'] else r['high'], axis=1)) / entry_universal_train_candidates[f'atr_{ATR_PERIOD}']
-        entry_universal_train_candidates['norm_dist_entry_sl'] = (entry_universal_train_candidates['entry_price_sim'] - entry_universal_train_candidates['sl_price_sim']).abs() / entry_universal_train_candidates[f'atr_{ATR_PERIOD}']
-        X_e_universal_train = entry_universal_train_candidates[processed_entry_feature_names_base + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']].fillna(-1)
-        y_e_universal_train = (entry_universal_train_candidates['trade_outcome'] > 0).astype(int)
+        # ATR column name based on best_hyperparams
+        final_model_atr_period = best_hyperparams.get('atr_period_opt', ATR_PERIOD)
+        atr_col_name_final_model_train = f'atr_{final_model_atr_period}'
+        print(f"Universal Entry Model training features using ATR column: {atr_col_name_final_model_train}")
+
+        # Ensure the ATR column exists in entry_universal_train_candidates (it should, from df_final_processed_for_training)
+        if atr_col_name_final_model_train not in entry_universal_train_candidates.columns:
+            print(f"ERROR: ATR column {atr_col_name_final_model_train} missing in entry_universal_train_candidates. Skipping entry model.")
+        else:
+            entry_universal_train_candidates['norm_dist_entry_pivot'] = (entry_universal_train_candidates['entry_price_sim'] - entry_universal_train_candidates.apply(lambda r: r['low'] if r['is_swing_low'] == 1 else r['high'], axis=1)) / entry_universal_train_candidates[atr_col_name_final_model_train]
+            entry_universal_train_candidates['norm_dist_entry_sl'] = (entry_universal_train_candidates['entry_price_sim'] - entry_universal_train_candidates['sl_price_sim']).abs() / entry_universal_train_candidates[atr_col_name_final_model_train]
+            
+            # Use final_entry_features_base from the re-processing step
+            current_final_full_entry_features = final_entry_features_base + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']
+            X_e_universal_train = entry_universal_train_candidates[current_final_full_entry_features].fillna(-1)
+            y_e_universal_train = (entry_universal_train_candidates['trade_outcome'] > 0).astype(int)
 
         if len(X_e_universal_train) > 0 and len(y_e_universal_train.unique()) > 1:
             if best_hyperparams['entry_model_type'] == 'lgbm':
@@ -2286,36 +2547,39 @@ if __name__ == '__main__':
     
     # 6. Backtesting each symbol with Universal Models
     all_symbols_backtest_results = []
-    print("\n--- Backtesting Symbols with Universal Models ---")
-    for symbol_ticker, symbol_test_df in all_symbols_test_data_map.items():
+    print("\n--- Backtesting Symbols with Universal Models (using best_hyperparams) ---")
+    for symbol_ticker, symbol_test_df_initial_processed in all_symbols_test_data_map.items():
         print(f"\nBacktesting for symbol: {symbol_ticker}")
-        if symbol_test_df.empty:
-            print(f"No test data for {symbol_ticker}, skipping backtest.")
+        if symbol_test_df_initial_processed.empty:
+            print(f"No initial test data for {symbol_ticker}, skipping backtest.")
             continue
 
-        # `run_backtest_scenario` expects the full df_processed for its internal splitting logic.
-        # We need to pass the specific test set for *this* symbol to it,
-        # or adapt `run_backtest_scenario` to accept pre-split test data.
-        # For now, let's adapt its usage by passing the test_df as if it's the 'full' df for that symbol's backtest.
-        # This means run_backtest_scenario will take its last 15% of this test_df, which is okay if test_df is large enough.
-        # A cleaner way would be to modify run_backtest_scenario to accept a df_test directly.
-        # Given the current structure of run_backtest_scenario, we pass symbol_test_df as df_processed.
-        # It will then take the last 15% of THIS for its "test", which is effectively a subset of the symbol's original test set.
-        # This is a slight misuse but avoids rewriting run_backtest_scenario extensively for now.
-        # A better approach: modify run_backtest_scenario to take an optional df_test.
-        # For simplicity, we'll assume the symbol_test_df is what run_backtest_scenario operates on.
-        # The "test set" within run_backtest_scenario will be the last 15% of symbol_test_df.
-        # This is not ideal. Let's assume we will use the *whole* symbol_test_df for backtesting.
-        # We need a way to tell run_backtest_scenario to use all of the passed df.
-        # The current run_backtest_scenario splits df_processed (train_val_size = 0.85 * len(df_processed))
-        # To use the whole symbol_test_df, we can just pass it.
+        # Re-process this symbol's test data using best_hyperparams
+        print(f"Re-processing test data for {symbol_ticker} with best_hyperparams...")
+        symbol_test_df_final_processed, symbol_final_pivot_features, symbol_final_entry_features_base = process_dataframe_with_params(
+            symbol_test_df_initial_processed.copy(), # Important: use the initial version for reprocessing
+            best_hyperparams,
+            static_entry_features_base_list_arg=static_base_entry_features_for_final # from initial processing
+        )
+
+        if symbol_test_df_final_processed is None or symbol_test_df_final_processed.empty:
+            print(f"Failed to re-process test data for {symbol_ticker} or data became empty. Skipping backtest.")
+            continue
         
+        # Determine the ATR column name used for this backtest (from best_hyperparams)
+        backtest_atr_period_for_symbol = best_hyperparams.get('atr_period_opt', ATR_PERIOD)
+        atr_col_name_for_symbol_backtest = f'atr_{backtest_atr_period_for_symbol}'
+        print(f"Symbol {symbol_ticker} backtest using ATR column: {atr_col_name_for_symbol_backtest} and re-processed data.")
+
         symbol_backtest_summary = []
-        # Scenario 1: Rule-Based Baseline (on this symbol's test data)
+        # Scenario 1: Rule-Based Baseline (on re-processed test data)
         baseline_res = run_backtest_scenario(
-            scenario_name="Rule-Based Baseline", df_processed=symbol_test_df.copy(), 
+            scenario_name="Rule-Based Baseline", 
+            df_processed=symbol_test_df_final_processed.copy(), # Use re-processed data
             pivot_model=None, entry_model=None, best_params=best_hyperparams, 
-            pivot_features=processed_pivot_feature_names, entry_features_base=processed_entry_feature_names_base,
+            pivot_features=symbol_final_pivot_features, # Use features from re-processing
+            entry_features_base=symbol_final_entry_features_base, # Use features from re-processing
+            atr_col_name=atr_col_name_for_symbol_backtest,
             use_full_df_as_test=True 
         )
         if baseline_res: symbol_backtest_summary.append(baseline_res)
@@ -2323,9 +2587,12 @@ if __name__ == '__main__':
         # Scenario 2: Stage 1 ML Only (Universal Pivot Filter)
         if universal_pivot_model:
             stage1_res = run_backtest_scenario(
-                scenario_name="ML Stage 1 (Pivot Filter)", df_processed=symbol_test_df.copy(),
+                scenario_name="ML Stage 1 (Pivot Filter)", 
+                df_processed=symbol_test_df_final_processed.copy(), # Use re-processed data
                 pivot_model=universal_pivot_model, entry_model=None, best_params=best_hyperparams,
-                pivot_features=processed_pivot_feature_names, entry_features_base=processed_entry_feature_names_base,
+                pivot_features=symbol_final_pivot_features, # Use features from re-processing
+                entry_features_base=symbol_final_entry_features_base, # Use features from re-processing
+                atr_col_name=atr_col_name_for_symbol_backtest,
                 use_full_df_as_test=True
             )
             if stage1_res: symbol_backtest_summary.append(stage1_res)
@@ -2333,9 +2600,12 @@ if __name__ == '__main__':
         # Scenario 3: Full ML Pipeline (Universal Models)
         if universal_pivot_model and universal_entry_model:
             full_ml_res = run_backtest_scenario(
-                scenario_name="Full ML Pipeline", df_processed=symbol_test_df.copy(),
+                scenario_name="Full ML Pipeline", 
+                df_processed=symbol_test_df_final_processed.copy(), # Use re-processed data
                 pivot_model=universal_pivot_model, entry_model=universal_entry_model, best_params=best_hyperparams,
-                pivot_features=processed_pivot_feature_names, entry_features_base=processed_entry_feature_names_base,
+                pivot_features=symbol_final_pivot_features, # Use features from re-processing
+                entry_features_base=symbol_final_entry_features_base, # Use features from re-processing
+                atr_col_name=atr_col_name_for_symbol_backtest,
                 use_full_df_as_test=True
             )
             if full_ml_res: symbol_backtest_summary.append(full_ml_res)
