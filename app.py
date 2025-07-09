@@ -5,15 +5,22 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import precision_score, recall_score, confusion_matrix
 import lightgbm as lgb
+from lightgbm.callback import early_stopping
 import optuna
 import joblib
 from binance.client import Client # Assuming you'll use python-binance
+from binance.exceptions import BinanceAPIException, BinanceRequestException
 import time
+try:
+    from keys import api_mainnet, secret_mainnet
+except ImportError:
+    print("Warning: keys.py not found or API keys not set. Using placeholders.")
+    api_mainnet = "api_mainnet "
+    secret_mainnet = "secret_mainnet"
+
 
 # --- Configuration ---
-# TODO: Move to a config file or pass as arguments
-API_KEY = "YOUR_API_KEY"  # Replace with your Binance API key
-API_SECRET = "YOUR_API_SECRET"  # Replace with your Binance API secret
+# API_KEY and API_SECRET will be sourced from keys.py
 PIVOT_N_LEFT = 3
 PIVOT_N_RIGHT = 3
 ATR_PERIOD = 14
@@ -30,7 +37,7 @@ def get_historical_bars(symbol, interval, start_str, end_str=None):
     """
     Pull historical OHLCV bars from Binance.
     """
-    client = Client(API_KEY, API_SECRET)
+    client = Client(api_mainnet, secret_mainnet)
     klines = client.get_historical_klines(symbol, interval, start_str, end_str)
     df = pd.DataFrame(klines, columns=[
         'timestamp', 'open', 'high', 'low', 'close', 'volume',
@@ -416,7 +423,7 @@ def train_pivot_model(X_train, y_train, X_val, y_val, model_type='lgbm'):
         # Target: multiclass {none, high, low}
         # pivot_label: 0=none, 1=high, 2=low
         model = lgb.LGBMClassifier(num_leaves=31, learning_rate=0.05, class_weight='balanced', random_state=42)
-        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], early_stopping_rounds=10, verbose=False)
+        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[early_stopping(stopping_rounds=10, verbose=-1)])
     elif model_type == 'rf':
         model = RandomForestClassifier(n_estimators=100, max_depth=7, class_weight='balanced', random_state=42)
         model.fit(X_train, y_train)
@@ -448,7 +455,7 @@ def train_entry_model(X_train, y_train, X_val, y_val, model_type='lgbm'):
 
     if model_type == 'lgbm':
         model = lgb.LGBMClassifier(num_leaves=31, learning_rate=0.05, class_weight='balanced', random_state=42)
-        model.fit(X_train, y_train_binary, eval_set=[(X_val, y_val_binary)], early_stopping_rounds=10, verbose=False)
+        model.fit(X_train, y_train_binary, eval_set=[(X_val, y_val_binary)], callbacks=[early_stopping(stopping_rounds=10, verbose=-1)])
     elif model_type == 'rf':
         model = RandomForestClassifier(n_estimators=100, max_depth=7, class_weight='balanced', random_state=42)
         model.fit(X_train, y_train_binary)
@@ -503,7 +510,7 @@ def objective_optuna(trial, df_processed, pivot_features, entry_features_base):
     if pivot_model_type == 'lgbm':
         pivot_model = lgb.LGBMClassifier(num_leaves=pivot_num_leaves, learning_rate=pivot_learning_rate,
                                          max_depth=pivot_max_depth, class_weight='balanced', random_state=42, n_estimators=100)
-        pivot_model.fit(X_pivot_train, y_pivot_train, eval_set=[(X_pivot_val, y_pivot_val)], early_stopping_rounds=5, verbose=False)
+        pivot_model.fit(X_pivot_train, y_pivot_train, eval_set=[(X_pivot_val, y_pivot_val)], callbacks=[early_stopping(stopping_rounds=5, verbose=-1)])
     else: # rf
         pivot_model = RandomForestClassifier(n_estimators=100, max_depth=pivot_max_depth, class_weight='balanced', random_state=42)
         pivot_model.fit(X_pivot_train, y_pivot_train)
@@ -555,7 +562,7 @@ def objective_optuna(trial, df_processed, pivot_features, entry_features_base):
         if len(entry_train_candidates) > 20:
              X_entry_train_sub, X_entry_val_sub, y_entry_train_sub, y_entry_val_sub = train_test_split(X_entry_train, y_entry_train, test_size=0.2, stratify=y_entry_train if len(y_entry_train.unique()) > 1 else None, random_state=42)
              if len(X_entry_val_sub) > 0 and len(y_entry_val_sub.unique()) > 1:
-                entry_model.fit(X_entry_train_sub, y_entry_train_sub, eval_set=[(X_entry_val_sub, y_entry_val_sub)], early_stopping_rounds=5, verbose=False)
+                entry_model.fit(X_entry_train_sub, y_entry_train_sub, eval_set=[(X_entry_val_sub, y_entry_val_sub)], callbacks=[early_stopping(stopping_rounds=5, verbose=-1)])
              else:
                 entry_model.fit(X_entry_train, y_entry_train) # No early stopping
         else:
@@ -765,19 +772,36 @@ def full_backtest(df_processed, pivot_model, entry_model, best_params, pivot_fea
 def run_backtest_scenario(scenario_name: str, df_processed: pd.DataFrame,
                           pivot_model, entry_model, best_params,
                           pivot_features, entry_features_base,
-                          atr_col_name=f'atr_{ATR_PERIOD}'):
+                          atr_col_name=f'atr_{ATR_PERIOD}',
+                          use_full_df_as_test: bool = False):
     """
     Runs a backtest for a specific scenario (Rule-based, ML Stage 1, Full ML).
+    If use_full_df_as_test is True, df_processed is considered the entire test set.
     """
     print(f"\n--- Starting Backtest Scenario: {scenario_name} ---")
 
-    # Determine test set (e.g., last 15% of data)
-    train_val_size = int(0.85 * len(df_processed))
-    df_test = df_processed.iloc[train_val_size:].copy()
+    if use_full_df_as_test:
+        df_test = df_processed.copy()
+        print(f"Using full provided DataFrame ({len(df_test)} rows) as test set for {scenario_name}.")
+    else:
+        # Determine test set (e.g., last 15% of data from df_processed)
+        train_val_size = int(0.85 * len(df_processed))
+        df_test = df_processed.iloc[train_val_size:].copy()
+        print(f"Using last 15% of provided DataFrame ({len(df_test)} rows) as test set for {scenario_name}.")
+
 
     if df_test.empty:
-        print(f"No data in test set for {scenario_name} backtest.")
+        print(f"No data in (derived) test set for {scenario_name} backtest.")
         return {"scenario": scenario_name, "trades": 0, "win_rate": 0, "avg_r": 0, "profit_factor": 0, "max_dd_r": 0, "trade_frequency":0}
+
+    # Ensure df_test has a DatetimeIndex from 'timestamp' column for period calculation
+    if 'timestamp' in df_test.columns:
+        df_test['timestamp'] = pd.to_datetime(df_test['timestamp'])
+        df_test.set_index('timestamp', inplace=True)
+    else:
+        print(f"Warning: 'timestamp' column not found in df_test for scenario {scenario_name}. Cannot accurately calculate test_period_days based on dates.")
+        # Fallback or alternative calculation might be needed if 'timestamp' is missing.
+        # For now, this might lead to 'days' attribute error if not handled before calculation.
 
     final_trades_for_metrics = pd.DataFrame()
 
@@ -897,7 +921,24 @@ def run_backtest_scenario(scenario_name: str, df_processed: pd.DataFrame,
     profit_factor = profit_sum_r / loss_sum_r_abs if loss_sum_r_abs > 0 else (profit_sum_r if profit_sum_r > 0 else 0)
 
     # Trade frequency: trades per day. Test period duration needed.
-    test_period_days = (df_test.index.max() - df_test.index.min()).days +1 if not df_test.empty else 1
+    if not df_test.empty and isinstance(df_test.index, pd.DatetimeIndex):
+        test_period_days = (df_test.index.max() - df_test.index.min()).days + 1
+    elif not df_test.empty:
+        # Fallback if not a DatetimeIndex (e.g., 'timestamp' was missing)
+        # Estimate based on number of data points and an assumed interval (e.g., 15min)
+        # This is less accurate but prevents a crash.
+        # Assuming KLINE_INTERVAL_15MINUTE -> 96 intervals per day.
+        # This requires KLINE_INTERVAL to be known here or passed. For now, a rough estimate.
+        print(f"Warning: Could not determine test period in days accurately for {scenario_name} due to non-DatetimeIndex. Estimating based on row count.")
+        # A more robust solution would be to pass the interval to this function.
+        # For now, if we know the interval is 15min:
+        # num_intervals_per_day = 24 * (60 / 15)
+        # test_period_days = len(df_test) / num_intervals_per_day
+        # Simplified: assume at least 1 day if there's data.
+        test_period_days = max(1, len(df_test) / 96) # Rough estimate for 15min interval
+    else:
+        test_period_days = 1
+    
     trade_frequency = num_trades / test_period_days if test_period_days > 0 else 0
 
 
@@ -915,72 +956,150 @@ def run_backtest_scenario(scenario_name: str, df_processed: pd.DataFrame,
     }
 
 # --- Main Orchestration ---
-if __name__ == '__main__':
+def get_processed_data_for_symbol(symbol_ticker, kline_interval, start_date, end_date):
+    """
+    Fetches, preprocesses, and engineers features for a single symbol.
+    Returns a processed DataFrame, pivot feature names, and entry feature names.
+    """
+    print(f"\n--- Initial Data Processing for Symbol: {symbol_ticker} ---")
     # 1. Data Collection
-    print("Fetching historical data...")
-    # Use a longer period for real training, e.g., "1 Jan, 2022" to "1 Jan, 2023" for train
-    # and "1 Jan, 2023" to "1 Apr, 2023" for validation/test like behavior initially
-    # For quick test:
-    historical_df = get_historical_bars("BTCUSDT", Client.KLINE_INTERVAL_15MINUTE, "1 Jan, 2023", "1 May, 2023")
-    if historical_df.empty:
-        print("No data fetched. Exiting.")
-        exit()
+    print(f"Fetching historical data for {symbol_ticker}...")
+    try:
+        historical_df = get_historical_bars(symbol_ticker, kline_interval, start_date, end_date)
+        if historical_df.empty:
+            print(f"No data fetched for {symbol_ticker} (empty DataFrame). Skipping.")
+            return None, None, None
+    except BinanceAPIException as e:
+        print(f"Binance API Exception for {symbol_ticker}: {e}. Skipping symbol.")
+        return None, None, None
+    except BinanceRequestException as e:
+        print(f"Binance Request Exception for {symbol_ticker}: {e}. Skipping symbol.")
+        return None, None, None
+    except Exception as e: # Catch any other unforeseen errors during data fetching
+        print(f"An unexpected error occurred fetching data for {symbol_ticker}: {e}. Skipping symbol.")
+        import traceback
+        traceback.print_exc()
+        return None, None, None
 
-    print(f"Data fetched: {len(historical_df)} bars")
+    print(f"Data fetched for {symbol_ticker}: {len(historical_df)} bars")
+    if 'timestamp' not in historical_df.columns:
+         historical_df.reset_index(inplace=True)
+    if 'timestamp' not in historical_df.columns and 'index' in historical_df.columns and pd.api.types.is_datetime64_any_dtype(historical_df['index']):
+        historical_df.rename(columns={'index':'timestamp'}, inplace=True)
+    
+    historical_df['symbol'] = symbol_ticker # Add symbol identifier
 
     # 2. Preprocessing & Labeling
-    print("Calculating ATR...")
     historical_df = calculate_atr(historical_df)
-    print("Generating candidate pivots...")
     historical_df = generate_candidate_pivots(historical_df)
-    print("Pruning and labeling pivots...")
     historical_df = prune_and_label_pivots(historical_df)
-    print("Simulating Fib entries and outcomes...")
-    historical_df = simulate_fib_entries(historical_df) # This creates 'trade_outcome'
-    historical_df.dropna(subset=[f'atr_{ATR_PERIOD}'], inplace=True) # Drop rows where ATR is NaN
+    historical_df = simulate_fib_entries(historical_df)
+    
+    if 'timestamp' not in historical_df.columns:
+        if pd.api.types.is_datetime64_any_dtype(historical_df.index):
+            historical_df.reset_index(inplace=True)
+            if 'index' in historical_df.columns and 'timestamp' not in historical_df.columns:
+                 historical_df.rename(columns={'index':'timestamp'}, inplace=True)
+
+    historical_df.dropna(subset=[f'atr_{ATR_PERIOD}'], inplace=True)
     historical_df.reset_index(drop=True, inplace=True)
 
-    print(f"Confirmed Swing Highs: {historical_df['is_swing_high'].sum()}")
-    print(f"Confirmed Swing Lows: {historical_df['is_swing_low'].sum()}")
-    print(f"Simulated Trade Outcomes:\n{historical_df['trade_outcome'].value_counts()}")
-
-
     # 3. Feature Engineering
-    print("Engineering pivot features...")
     historical_df, pivot_feature_names = engineer_pivot_features(historical_df)
-    print("Engineering entry features (base)...")
-    # Entry features are engineered on the whole df, then selected for pivot rows
-    historical_df, entry_feature_names_base = engineer_entry_features(historical_df, None) # P_swing added later
+    historical_df, entry_feature_names_base = engineer_entry_features(historical_df, None)
 
-    # Drop rows with NaNs created by feature engineering (especially lookbacks)
-    # A more robust approach would be to ensure enough data before feature engineering window
-    # Or handle NaNs by imputation strategically.
     historical_df.replace([np.inf, -np.inf], np.nan, inplace=True)
-    # print("NaNs per column after feature eng:")
-    # print(historical_df[pivot_feature_names + entry_feature_names_base].isnull().sum())
-    min_required_data_for_features = 30 # Example, depends on longest lookback
+    min_required_data_for_features = 30
+    if len(historical_df) < min_required_data_for_features:
+        print(f"Not enough data after initial processing for {symbol_ticker} ({len(historical_df)} rows). Skipping.")
+        return None, None, None
+
     df_processed = historical_df.iloc[min_required_data_for_features:].copy()
-    df_processed.dropna(subset=pivot_feature_names, inplace=True) # Drop if any core pivot features are NaN
-    # For entry features, NaNs are also problematic, handle during model prep.
+    
+    if 'timestamp' not in df_processed.columns:
+        print(f"CRITICAL: 'timestamp' column lost for {symbol_ticker} during processing.")
+        return None, None, None # Cannot proceed without timestamp
+
+    df_processed.dropna(subset=pivot_feature_names, inplace=True) # Ensure core features are present
     df_processed.reset_index(drop=True, inplace=True)
 
-    if len(df_processed) < 100: # Arbitrary minimum
-        print(f"Not enough processed data to proceed: {len(df_processed)} rows. Exiting.")
+    if len(df_processed) < 100: # Minimum data for meaningful processing/splitting
+        print(f"Not enough final processed data for {symbol_ticker} ({len(df_processed)} rows). Skipping.")
+        return None, None, None
+        
+    print(f"Initial data processing complete for {symbol_ticker}: {len(df_processed)} rows")
+    return df_processed, pivot_feature_names, entry_feature_names_base
+
+
+if __name__ == '__main__':
+    symbols_df = pd.read_csv("symbols.csv")
+    KLINE_INTERVAL = Client.KLINE_INTERVAL_15MINUTE
+    START_DATE = "1 Jan, 2023" # Adjust as needed
+    END_DATE = "1 May, 2023"   # Adjust as needed, ensure enough data
+
+    all_symbols_train_data_list = []
+    all_symbols_test_data_map = {} # Store test data per symbol
+    processed_pivot_feature_names = None
+    processed_entry_feature_names_base = None
+
+    for index, row in symbols_df.iterrows():
+        symbol_ticker = row['symbol']
+        processed_df, pivot_feats, entry_feats_base = get_processed_data_for_symbol(
+            symbol_ticker, KLINE_INTERVAL, START_DATE, END_DATE
+        )
+
+        if processed_df is not None and not processed_df.empty:
+            if processed_pivot_feature_names is None: # Store feature names from the first successful processing
+                processed_pivot_feature_names = pivot_feats
+                processed_entry_feature_names_base = entry_feats_base
+
+            # Split data for this symbol: 85% train (for universal model), 15% test (for symbol-specific backtest)
+            # Ensure 'timestamp' is available for splitting if needed, or use frac.
+            # Since data is time-series, chronological split is important.
+            train_size = int(0.85 * len(processed_df))
+            symbol_train_df = processed_df.iloc[:train_size].copy()
+            symbol_test_df = processed_df.iloc[train_size:].copy()
+
+            if not symbol_train_df.empty:
+                all_symbols_train_data_list.append(symbol_train_df)
+            if not symbol_test_df.empty:
+                all_symbols_test_data_map[symbol_ticker] = symbol_test_df
+        else:
+            print(f"No processed data for {symbol_ticker}, skipping.")
+
+    if not all_symbols_train_data_list:
+        print("No training data collected from any symbol. Exiting.")
         exit()
 
-    print(f"Processed data for modeling: {len(df_processed)} rows")
+    # Combine all training data
+    universal_train_df = pd.concat(all_symbols_train_data_list, ignore_index=True)
+    universal_train_df.reset_index(drop=True, inplace=True) # Ensure clean index
 
-    # 4. Optuna Hyperparameter Tuning (Optional, can run separately or load best_params)
-    print("Running Optuna for hyperparameter tuning...")
-    # This can take time. For a quick run, reduce n_trials or use pre-defined params.
-    # Ensure 'trade_outcome' and pivot labels are present in df_processed.
-    # Ensure simulated entry/sl/tp prices are there for 'norm_dist' features in objective.
+    if len(universal_train_df) < 200: # Arbitrary minimum for training a universal model
+        print(f"Combined training data is too small ({len(universal_train_df)} rows). Exiting.")
+        exit()
+    
+    print(f"\n--- Universal Model Training using {len(universal_train_df)} total rows ---")
+
+    # Ensure feature names are consistent (they should be from get_processed_data_for_symbol)
+    if processed_pivot_feature_names is None or processed_entry_feature_names_base is None:
+        print("ERROR: Feature names not captured during data processing. Exiting.")
+        exit()
+
+    # 4. Optuna Hyperparameter Tuning for Universal Model
+    print("Running Optuna for universal model...")
     try:
-        best_hyperparams = run_optuna_tuning(df_processed.copy(), pivot_feature_names, entry_feature_names_base, n_trials=10) # Reduced for speed
-        print("Best Hyperparameters from Optuna:", best_hyperparams)
+        best_hyperparams = run_optuna_tuning(
+            universal_train_df.copy(), # Pass a copy
+            processed_pivot_feature_names,
+            processed_entry_feature_names_base,
+            n_trials=20 # Adjust n_trials as needed, e.g., 20-50 for reasonable search
+        )
+        print("Best Universal Hyperparameters from Optuna:", best_hyperparams)
     except Exception as e:
-        print(f"Optuna tuning failed: {e}. Using default parameters.")
-        # Define some default best_params if Optuna fails or is skipped
+        print(f"Universal Optuna tuning failed: {e}. Using default parameters.")
+        import traceback
+        traceback.print_exc()
         best_hyperparams = {
             'pivot_model_type': 'lgbm', 'pivot_num_leaves': 30, 'pivot_learning_rate': 0.05,
             'pivot_max_depth': 7, 'entry_model_type': 'lgbm', 'entry_num_leaves': 30,
@@ -988,133 +1107,141 @@ if __name__ == '__main__':
             'p_swing_threshold': 0.6, 'profit_threshold': 0.6
         }
 
+    # 5. Train Universal Final Models
+    # For final models, usually train on the whole available dataset (here, universal_train_df)
+    # or a large portion if a final validation set is held out from it.
+    # The objective_optuna already does a train/val split internally for evaluation during tuning.
+    # So, we can use the full universal_train_df for training the final model.
+    print("Training universal final models...")
 
-    # 5. Train Final Models with Best Hyperparameters on Train+Val data
-    print("Training final models with best hyperparameters...")
-    # Split: 70% train, 15% val, 15% test. For final models, train on Train+Val (85%)
-    final_train_size = int(0.85 * len(df_processed))
-    df_final_train = df_processed.iloc[:final_train_size].copy()
-    # df_final_test = df_processed.iloc[final_train_size:].copy() # Used in full_backtest
-
-    # --- Pivot Model ---
-    X_p_final_train = df_final_train[pivot_feature_names].fillna(-1)
-    y_p_final_train = df_final_train['pivot_label']
+    # --- Universal Pivot Model ---
+    X_p_universal_train = universal_train_df[processed_pivot_feature_names].fillna(-1)
+    y_p_universal_train = universal_train_df['pivot_label']
 
     if best_hyperparams['pivot_model_type'] == 'lgbm':
-        final_pivot_model = lgb.LGBMClassifier(
+        universal_pivot_model = lgb.LGBMClassifier(
             num_leaves=best_hyperparams['pivot_num_leaves'],
             learning_rate=best_hyperparams['pivot_learning_rate'],
             max_depth=best_hyperparams['pivot_max_depth'],
-            class_weight='balanced', random_state=42, n_estimators=150 # More estimators for final model
+            class_weight='balanced', random_state=42, n_estimators=150
         )
     else: # rf
-        final_pivot_model = RandomForestClassifier(
+        universal_pivot_model = RandomForestClassifier(
             n_estimators=150, max_depth=best_hyperparams['pivot_max_depth'],
             class_weight='balanced', random_state=42
         )
-    final_pivot_model.fit(X_p_final_train, y_p_final_train)
-    print("Final Pivot Model trained.")
-    save_model(final_pivot_model, "pivot_detector_model.joblib")
+    universal_pivot_model.fit(X_p_universal_train, y_p_universal_train)
+    print("Universal Pivot Model trained.")
+    save_model(universal_pivot_model, "universal_pivot_detector_model.joblib")
 
-    # --- Entry Model ---
-    # Predict P_swing on the final_train_data to use as meta-feature
-    p_swing_final_train_all_classes = final_pivot_model.predict_proba(X_p_final_train)
-    df_final_train['P_swing'] = np.max(p_swing_final_train_all_classes[:,1:], axis=1)
+    # --- Universal Entry Model ---
+    p_swing_universal_train_all_classes = universal_pivot_model.predict_proba(X_p_universal_train)
+    universal_train_df['P_swing'] = np.max(p_swing_universal_train_all_classes[:,1:], axis=1)
 
-    # Filter for actual pivots that had a simulated trade and would pass the P_swing threshold
-    entry_final_train_candidates = df_final_train[
-        (df_final_train['pivot_label'].isin([1, 2])) &
-        (df_final_train['trade_outcome'] != -1) &
-        (df_final_train['P_swing'] >= best_hyperparams['p_swing_threshold'])
+    entry_universal_train_candidates = universal_train_df[
+        (universal_train_df['pivot_label'].isin([1, 2])) &
+        (universal_train_df['trade_outcome'] != -1) &
+        (universal_train_df['P_swing'] >= best_hyperparams['p_swing_threshold'])
     ].copy()
 
-    if len(entry_final_train_candidates) < 50:
-        print("Not enough candidates for final entry model training. Skipping entry model.")
-        final_entry_model = None
+    universal_entry_model = None
+    if len(entry_universal_train_candidates) < 50:
+        print("Not enough candidates for universal entry model training. Skipping entry model.")
     else:
-        entry_final_train_candidates['norm_dist_entry_pivot'] = (entry_final_train_candidates['entry_price_sim'] - entry_final_train_candidates.apply(lambda r: r['low'] if r['is_swing_low'] else r['high'], axis=1)) / entry_final_train_candidates[f'atr_{ATR_PERIOD}']
-        entry_final_train_candidates['norm_dist_entry_sl'] = (entry_final_train_candidates['entry_price_sim'] - entry_final_train_candidates['sl_price_sim']).abs() / entry_final_train_candidates[f'atr_{ATR_PERIOD}']
+        entry_universal_train_candidates['norm_dist_entry_pivot'] = (entry_universal_train_candidates['entry_price_sim'] - entry_universal_train_candidates.apply(lambda r: r['low'] if r['is_swing_low'] else r['high'], axis=1)) / entry_universal_train_candidates[f'atr_{ATR_PERIOD}']
+        entry_universal_train_candidates['norm_dist_entry_sl'] = (entry_universal_train_candidates['entry_price_sim'] - entry_universal_train_candidates['sl_price_sim']).abs() / entry_universal_train_candidates[f'atr_{ATR_PERIOD}']
+        X_e_universal_train = entry_universal_train_candidates[processed_entry_feature_names_base + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']].fillna(-1)
+        y_e_universal_train = (entry_universal_train_candidates['trade_outcome'] > 0).astype(int)
 
-        X_e_final_train = entry_final_train_candidates[entry_feature_names_base + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']].fillna(-1)
-        y_e_final_train = (entry_final_train_candidates['trade_outcome'] > 0).astype(int) # Binary profitable
-
-        if len(X_e_final_train) > 0 and len(y_e_final_train.unique()) > 1:
+        if len(X_e_universal_train) > 0 and len(y_e_universal_train.unique()) > 1:
             if best_hyperparams['entry_model_type'] == 'lgbm':
-                final_entry_model = lgb.LGBMClassifier(
+                universal_entry_model = lgb.LGBMClassifier(
                     num_leaves=best_hyperparams['entry_num_leaves'],
                     learning_rate=best_hyperparams['entry_learning_rate'],
                     max_depth=best_hyperparams['entry_max_depth'],
                     class_weight='balanced', random_state=42, n_estimators=150
                 )
             else: # rf
-                final_entry_model = RandomForestClassifier(
+                universal_entry_model = RandomForestClassifier(
                     n_estimators=150, max_depth=best_hyperparams['entry_max_depth'],
                     class_weight='balanced', random_state=42
                 )
-            final_entry_model.fit(X_e_final_train, y_e_final_train)
-            print("Final Entry Model trained.")
-            save_model(final_entry_model, "entry_evaluator_model.joblib")
+            universal_entry_model.fit(X_e_universal_train, y_e_universal_train)
+            print("Universal Entry Model trained.")
+            save_model(universal_entry_model, "universal_entry_evaluator_model.joblib")
         else:
-            print("Not enough data or variance to train final entry model.")
-            final_entry_model = None
+            print("Not enough data or variance to train universal entry model.")
+    
+    # 6. Backtesting each symbol with Universal Models
+    all_symbols_backtest_results = []
+    print("\n--- Backtesting Symbols with Universal Models ---")
+    for symbol_ticker, symbol_test_df in all_symbols_test_data_map.items():
+        print(f"\nBacktesting for symbol: {symbol_ticker}")
+        if symbol_test_df.empty:
+            print(f"No test data for {symbol_ticker}, skipping backtest.")
+            continue
 
-
-    # 6. Full Backtest on Test Set (using models trained on Train+Val)
-    # This section is now expanded to run multiple scenarios for comparison.
-
-    backtest_results_summary = []
-
-    # Scenario 1: Pure Rule-Based Baseline
-    # For this, we don't need ML models. We need a way to simulate rule-based pivot trades.
-    # The `run_backtest_scenario` is designed to handle this if `pivot_model` and `entry_model` are None.
-    # However, it currently relies on `trade_outcome` which is from `simulate_fib_entries`.
-    # This is acceptable for a conceptual backtest as `simulate_fib_entries` IS the rule-based simulation.
-    print("\n--- Running Backtest Scenarios ---")
-    baseline_results = run_backtest_scenario(
-        scenario_name="Rule-Based Baseline",
-        df_processed=df_processed.copy(), # Pass a copy
-        pivot_model=None, # No ML model for baseline
-        entry_model=None, # No ML model for baseline
-        best_params=best_hyperparams, # Thresholds not used, but pass for consistency
-        pivot_features=pivot_feature_names,
-        entry_features_base=entry_feature_names_base
-    )
-    backtest_results_summary.append(baseline_results)
-
-    # Scenario 2: Stage 1 ML Only (Pivot Filter)
-    if final_pivot_model:
-        stage1_ml_results = run_backtest_scenario(
-            scenario_name="ML Stage 1 (Pivot Filter)",
-            df_processed=df_processed.copy(),
-            pivot_model=final_pivot_model, # Use trained pivot model
-            entry_model=None, # No entry model for stage 1
-            best_params=best_hyperparams, # Uses p_swing_threshold
-            pivot_features=pivot_feature_names,
-            entry_features_base=entry_feature_names_base
+        # `run_backtest_scenario` expects the full df_processed for its internal splitting logic.
+        # We need to pass the specific test set for *this* symbol to it,
+        # or adapt `run_backtest_scenario` to accept pre-split test data.
+        # For now, let's adapt its usage by passing the test_df as if it's the 'full' df for that symbol's backtest.
+        # This means run_backtest_scenario will take its last 15% of this test_df, which is okay if test_df is large enough.
+        # A cleaner way would be to modify run_backtest_scenario to accept a df_test directly.
+        # Given the current structure of run_backtest_scenario, we pass symbol_test_df as df_processed.
+        # It will then take the last 15% of THIS for its "test", which is effectively a subset of the symbol's original test set.
+        # This is a slight misuse but avoids rewriting run_backtest_scenario extensively for now.
+        # A better approach: modify run_backtest_scenario to take an optional df_test.
+        # For simplicity, we'll assume the symbol_test_df is what run_backtest_scenario operates on.
+        # The "test set" within run_backtest_scenario will be the last 15% of symbol_test_df.
+        # This is not ideal. Let's assume we will use the *whole* symbol_test_df for backtesting.
+        # We need a way to tell run_backtest_scenario to use all of the passed df.
+        # The current run_backtest_scenario splits df_processed (train_val_size = 0.85 * len(df_processed))
+        # To use the whole symbol_test_df, we can just pass it.
+        
+        symbol_backtest_summary = []
+        # Scenario 1: Rule-Based Baseline (on this symbol's test data)
+        baseline_res = run_backtest_scenario(
+            scenario_name="Rule-Based Baseline", df_processed=symbol_test_df.copy(), 
+            pivot_model=None, entry_model=None, best_params=best_hyperparams, 
+            pivot_features=processed_pivot_feature_names, entry_features_base=processed_entry_feature_names_base,
+            use_full_df_as_test=True 
         )
-        backtest_results_summary.append(stage1_ml_results)
+        if baseline_res: symbol_backtest_summary.append(baseline_res)
+
+        # Scenario 2: Stage 1 ML Only (Universal Pivot Filter)
+        if universal_pivot_model:
+            stage1_res = run_backtest_scenario(
+                scenario_name="ML Stage 1 (Pivot Filter)", df_processed=symbol_test_df.copy(),
+                pivot_model=universal_pivot_model, entry_model=None, best_params=best_hyperparams,
+                pivot_features=processed_pivot_feature_names, entry_features_base=processed_entry_feature_names_base,
+                use_full_df_as_test=True
+            )
+            if stage1_res: symbol_backtest_summary.append(stage1_res)
+        
+        # Scenario 3: Full ML Pipeline (Universal Models)
+        if universal_pivot_model and universal_entry_model:
+            full_ml_res = run_backtest_scenario(
+                scenario_name="Full ML Pipeline", df_processed=symbol_test_df.copy(),
+                pivot_model=universal_pivot_model, entry_model=universal_entry_model, best_params=best_hyperparams,
+                pivot_features=processed_pivot_feature_names, entry_features_base=processed_entry_feature_names_base,
+                use_full_df_as_test=True
+            )
+            if full_ml_res: symbol_backtest_summary.append(full_ml_res)
+
+        for res_dict in symbol_backtest_summary:
+            combined_data = {'symbol': symbol_ticker, **res_dict, **best_hyperparams}
+            all_symbols_backtest_results.append(combined_data)
+
+    if all_symbols_backtest_results:
+        results_df = pd.DataFrame(all_symbols_backtest_results)
+        cols_ordered = ['symbol', 'scenario', 'trades', 'win_rate', 'avg_r', 'profit_factor', 'max_dd_r', 'trade_frequency']
+        hyperparam_cols = [col for col in results_df.columns if col not in cols_ordered]
+        final_cols = cols_ordered + sorted(list(set(hyperparam_cols)))
+        final_cols_existing = [col for col in final_cols if col in results_df.columns]
+        results_df = results_df[final_cols_existing]
+        results_df.to_csv("universal_model_backtest_summary.csv", index=False)
+        print("\nConsolidated universal model backtest summary saved to universal_model_backtest_summary.csv")
     else:
-        print("Skipping ML Stage 1 backtest as pivot model was not trained.")
+        print("\nNo universal model backtest results were aggregated to save to CSV.")
 
-    # Scenario 3: Full ML Pipeline
-    if final_pivot_model and final_entry_model:
-        full_ml_results = run_backtest_scenario(
-            scenario_name="Full ML Pipeline",
-            df_processed=df_processed.copy(),
-            pivot_model=final_pivot_model,
-            entry_model=final_entry_model,
-            best_params=best_hyperparams, # Uses p_swing_threshold and profit_threshold
-            pivot_features=pivot_feature_names,
-            entry_features_base=entry_feature_names_base
-        )
-        backtest_results_summary.append(full_ml_results)
-    else:
-        print("Skipping Full ML Pipeline backtest as one or both models were not trained.")
-
-    print("\n--- Backtest Scenarios Summary ---")
-    for result in backtest_results_summary:
-        print(f"\nScenario: {result['scenario']}")
-        print(f"  Trades: {result['trades']}, Win Rate: {result['win_rate']:.3f}, Avg R: {result['avg_r']:.3f}")
-        print(f"  Profit Factor: {result['profit_factor']:.3f}, Max Drawdown (R): {result['max_dd_r']:.3f}R, Trade Freq: {result['trade_frequency']:.2f} trades/day")
-
-    print("\napp.py script finished.")
+    print("\nAll symbols processed with universal models. app.py script finished.")
