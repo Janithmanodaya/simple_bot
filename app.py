@@ -1132,7 +1132,7 @@ if __name__ == '__main__':
         )
     universal_pivot_model.fit(X_p_universal_train, y_p_universal_train)
     print("Universal Pivot Model trained.")
-    save_model(universal_pivot_model, "universal_pivot_detector_model.joblib")
+    save_model(universal_pivot_model, "pivot_detector_model.joblib")
 
     # --- Universal Entry Model ---
     p_swing_universal_train_all_classes = universal_pivot_model.predict_proba(X_p_universal_train)
@@ -1168,7 +1168,7 @@ if __name__ == '__main__':
                 )
             universal_entry_model.fit(X_e_universal_train, y_e_universal_train)
             print("Universal Entry Model trained.")
-            save_model(universal_entry_model, "universal_entry_evaluator_model.joblib")
+            save_model(universal_entry_model, "entry_evaluator_model.joblib")
         else:
             print("Not enough data or variance to train universal entry model.")
     
