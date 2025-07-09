@@ -103,7 +103,7 @@ def initialize_app_binance_client(env="mainnet"): # Removed app_configs paramete
     Stores it in the global `app_binance_client`.
     If Telegram alerts on init failure are needed, it will use global `app_trading_configs`.
     """
-    global app_binance_client, app_trading_configs # Ensure app_trading_configs is accessible if needed for alerts
+    #global app_binance_client, app_trading_configs # Ensure app_trading_configs is accessible if needed for alerts
     api_key, api_secret, _, _ = load_app_api_keys(env) # Telegram keys not used directly in init
 
     try:
@@ -317,7 +317,7 @@ def get_or_download_historical_data(symbol: str, interval: str,
         print(f"Fetching new data for {symbol} since {pd.to_datetime(last_timestamp_ms, unit='ms')} (exclusive)...")
         
         # Ensure client is available
-        global app_binance_client
+        #global app_binance_client
         if app_binance_client is None:
             print("Warning (get_or_download_historical_data - update): app_binance_client not initialized. Attempting default init.")
             if not initialize_app_binance_client():
@@ -1728,206 +1728,6 @@ def train_entry_model(X_train, y_train, X_val, y_val, model_type='lgbm'):
     return model
 
 
-def objective_optuna(trial, df_processed, pivot_features, entry_features_base):
-    """Optuna objective function."""
-    # Hyperparameters to tune
-    # Swing model
-    pivot_model_type = trial.suggest_categorical('pivot_model_type', ['lgbm']) # Could add 'rf'
-    pivot_num_leaves = trial.suggest_int('pivot_num_leaves', 20, 50) if pivot_model_type == 'lgbm' else None
-    pivot_learning_rate = trial.suggest_float('pivot_learning_rate', 0.01, 0.1) if pivot_model_type == 'lgbm' else None
-    pivot_max_depth = trial.suggest_int('pivot_max_depth', 5, 10) # Also for RF
-    # Entry model
-    entry_model_type = trial.suggest_categorical('entry_model_type', ['lgbm'])
-    entry_num_leaves = trial.suggest_int('entry_num_leaves', 20, 50) if entry_model_type == 'lgbm' else None
-    entry_learning_rate = trial.suggest_float('entry_learning_rate', 0.01, 0.1) if entry_model_type == 'lgbm' else None
-    entry_max_depth = trial.suggest_int('entry_max_depth', 5, 10)
-    # Thresholds
-    p_swing_threshold = trial.suggest_float('p_swing_threshold', 0.5, 0.9)
-    profit_threshold = trial.suggest_float('profit_threshold', 0.5, 0.9) # For P_profit
-
-    # --- NEW: Strategy/Data Processing Parameters to Tune ---
-    current_atr_period = trial.suggest_int('atr_period_opt', 10, 24) # Example range for ATR period
-    current_pivot_n_left = trial.suggest_int('pivot_n_left_opt', 2, 7)
-    current_pivot_n_right = trial.suggest_int('pivot_n_right_opt', 2, 7)
-    current_min_atr_distance = trial.suggest_float('min_atr_distance_opt', 0.5, 2.5) # Factor for ATR distance
-    current_min_bar_gap = trial.suggest_int('min_bar_gap_opt', 5, 15) # Min bars between pivots
-
-    atr_col_name_optuna = f'atr_{current_atr_period}'
-
-    # --- Data Prep for Optuna Trial ---
-    # The crucial part for the *next* step is that df_processed would be re-processed here
-    # using current_atr_period, current_pivot_n_left, etc.
-    # For *this* step, we acknowledge these parameters are suggested, but the functions
-    # below still use the globally defined ATR_PERIOD for feature names, etc.
-    # This will be rectified in the "Refactor Data Processing" step.
-    print(f"Optuna Trial Suggests: ATR_P={current_atr_period}, Pivot_L={current_pivot_n_left}, Pivot_R={current_pivot_n_right}, MinATR_D={current_min_atr_distance:.2f}, MinBar_G={current_min_bar_gap}")
-
-    train_size = int(0.7 * len(df_processed))
-    val_size = int(0.15 * len(df_processed))
-    # test_size = len(df_processed) - train_size - val_size
-
-    df_train = df_processed.iloc[:train_size].copy()
-    df_val = df_processed.iloc[train_size:train_size + val_size].copy()
-
-    # Prepare data for pivot model
-    X_pivot_train = df_train[pivot_features].fillna(-1) # Simple imputation
-    y_pivot_train = df_train['pivot_label']
-    X_pivot_val = df_val[pivot_features].fillna(-1)
-    y_pivot_val = df_val['pivot_label']
-
-    # Train Pivot Model
-    if pivot_model_type == 'lgbm':
-        pivot_model = lgb.LGBMClassifier(num_leaves=pivot_num_leaves, learning_rate=pivot_learning_rate,
-                                         max_depth=pivot_max_depth, class_weight='balanced', random_state=42, n_estimators=100)
-        pivot_model.fit(X_pivot_train, y_pivot_train, eval_set=[(X_pivot_val, y_pivot_val)], callbacks=[early_stopping(stopping_rounds=5, verbose=-1)])
-    else: # rf
-        pivot_model = RandomForestClassifier(n_estimators=100, max_depth=pivot_max_depth, class_weight='balanced', random_state=42)
-        pivot_model.fit(X_pivot_train, y_pivot_train)
-
-    # Predict P_swing on validation set (and train for entry model training)
-    # We need probabilities for high (1) and low (2)
-    p_swing_train_all_classes = pivot_model.predict_proba(X_pivot_train)
-    p_swing_val_all_classes = pivot_model.predict_proba(X_pivot_val)
-
-    # P_swing is max prob of being a high or low pivot
-    df_train['P_swing'] = np.max(p_swing_train_all_classes[:, 1:], axis=1) # Prob of class 1 (high) or 2 (low)
-    df_val['P_swing'] = np.max(p_swing_val_all_classes[:, 1:], axis=1)
-
-
-    # Filter validation data based on P_swing_threshold for entry model evaluation
-    # Entry model is trained on *actual* pivots from training data that would have passed the threshold
-    # This is a bit tricky: for training entry model, we should use actual pivots.
-    # For evaluating the *pipeline*, we use predicted pivots.
-
-    # Let's train entry model on actual pivots from df_train that *also* have a high P_swing
-    # This ensures the entry model learns from reasonably good pivot candidates.
-    entry_train_candidates = df_train[
-        (df_train['pivot_label'].isin([1, 2])) & # Is an actual pivot
-        (df_train['trade_outcome'] != -1) &      # Trade was simulated (outcome is not -1)
-        (df_train['P_swing'] >= p_swing_threshold) # Pivot model would have picked it
-    ].copy()
-
-    if len(entry_train_candidates) < 50: # Not enough samples to train entry model
-        return -1.0 # Bad score if no trades
-
-    # Add specific entry features for these candidates
-    # Ensure 'is_swing_low' is correctly referenced (e.g., from pivot_label or a dedicated column if exists)
-    # Assuming 'pivot_label' 1 is high, 2 is low.
-    entry_train_candidates['norm_dist_entry_pivot'] = (entry_train_candidates['entry_price_sim'] - entry_train_candidates.apply(lambda r: r['low'] if r['pivot_label'] == 2 else r['high'], axis=1)) / entry_train_candidates[atr_col_name_optuna]
-    entry_train_candidates['norm_dist_entry_sl'] = (entry_train_candidates['entry_price_sim'] - entry_train_candidates['sl_price_sim']).abs() / entry_train_candidates[atr_col_name_optuna]
-    
-    # Construct the full list of entry features for this trial
-    # trial_entry_features_base was passed into objective_optuna or derived within it
-    current_trial_full_entry_features = trial_entry_features_base + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']
-
-    X_entry_train = entry_train_candidates[current_trial_full_entry_features].fillna(-1)
-    y_entry_train = entry_train_candidates['trade_outcome'].astype(int) # Use direct multiclass trade_outcome
-
-    # Ensure y_entry_train has more than one class for stratification and meaningful training
-    if len(X_entry_train) < 20 or len(y_entry_train.unique()) < 2 : # Check for variance and minimum samples
-        print(f"Optuna: Insufficient data or variance for entry model training. Samples: {len(X_entry_train)}, Unique outcomes: {y_entry_train.unique()}")
-        return -1.0
-
-
-    # Train Entry Model (Multiclass)
-    if entry_model_type == 'lgbm':
-        entry_model = lgb.LGBMClassifier(num_leaves=entry_num_leaves, learning_rate=entry_learning_rate,
-                                         max_depth=entry_max_depth, class_weight='balanced', random_state=42, n_estimators=100, verbosity=-1)
-        if len(entry_train_candidates) > 20: # Ensure enough data for a split
-             # Stratify by y_entry_train if it has multiple classes
-             stratify_opt = y_entry_train if len(y_entry_train.unique()) > 1 else None
-             X_entry_train_sub, X_entry_val_sub, y_entry_train_sub, y_entry_val_sub = train_test_split(
-                 X_entry_train, y_entry_train, test_size=0.2, stratify=stratify_opt, random_state=42
-             )
-             if len(X_entry_val_sub) > 0 and len(y_entry_val_sub.unique()) > 1: # Check if val subset is valid
-                entry_model.fit(X_entry_train_sub, y_entry_train_sub, eval_set=[(X_entry_val_sub, y_entry_val_sub)], callbacks=[early_stopping(stopping_rounds=5, verbose=False)])
-             else: # Not enough for a valid validation set for early stopping
-                entry_model.fit(X_entry_train, y_entry_train) 
-        else: # Too few samples overall for a split
-            entry_model.fit(X_entry_train, y_entry_train)
-    else: # rf
-        entry_model = RandomForestClassifier(n_estimators=100, max_depth=entry_max_depth, class_weight='balanced', random_state=42)
-        entry_model.fit(X_entry_train, y_entry_train)
-
-
-    # --- Mini Backtest on df_val ---
-    # 1. Identify pivots in df_val using the trained pivot_model and p_swing_threshold
-    potential_pivots_val = df_val[df_val['P_swing'] >= p_swing_threshold].copy()
-    # Ensure these are rows where a trade could happen (valid simulated outcome, not -1)
-    potential_pivots_val = potential_pivots_val[potential_pivots_val['trade_outcome'] != -1] 
-
-    if len(potential_pivots_val) == 0:
-        return -0.5 # No trades triggered by pivot model
-
-    # 2. For these pivots, compute entry features (including the P_swing from pivot_model)
-    # Assuming 'is_swing_low' column exists and is 1 for low pivots, 0 otherwise.
-    # If not, derive from 'pivot_label' (1 for high, 2 for low)
-    # For this example, let's assume predicted_pivot_class from pivot model is available on df_val
-    # If not, we might need to predict it first if it's different from df_val['pivot_label']
-    # For simplicity, using actual pivot_label for norm_dist for now.
-    # This should ideally use the *predicted* class from the pivot model if available and reliable.
-    potential_pivots_val['norm_dist_entry_pivot'] = (potential_pivots_val['entry_price_sim'] - potential_pivots_val.apply(lambda r: r['low'] if r['pivot_label'] == 2 else r['high'], axis=1)) / potential_pivots_val[atr_col_name_optuna]
-    potential_pivots_val['norm_dist_entry_sl'] = (potential_pivots_val['entry_price_sim'] - potential_pivots_val['sl_price_sim']).abs() / potential_pivots_val[atr_col_name_optuna]
-
-    X_entry_eval = potential_pivots_val[current_trial_full_entry_features].fillna(-1)
-
-    if len(X_entry_eval) == 0: return -0.5
-
-    # 3. Predict multiclass probabilities using the trained entry_model
-    p_all_classes_val = entry_model.predict_proba(X_entry_eval) # Shape: (num_samples, num_classes)
-
-    # 4. Calculate Expected R
-    # R-values: Class 0 (SL): -1R, Class 1 (TP1): +1R, Class 2 (TP2): +2R, Class 3 (TP3): +3R
-    # Class 4 (Time Exit) might be added later with its own R-value (e.g., 0R)
-    r_values_by_class = [-1, 1, 2, 3] # R-value for class 0, 1, 2, 3
-    num_predicted_classes = p_all_classes_val.shape[1]
-    
-    expected_r_val = np.zeros(p_all_classes_val.shape[0])
-    for k_class_idx in range(num_predicted_classes):
-        if k_class_idx < len(r_values_by_class):
-            expected_r_val += p_all_classes_val[:, k_class_idx] * r_values_by_class[k_class_idx]
-        # else: a class was predicted for which we don't have an R-value (e.g. if model predicts class 4 but r_values_by_class isn't updated)
-
-    # 5. Filter trades based on expected_r_val and profit_threshold (now an Expected R threshold)
-    # profit_threshold is the Optuna hyperparameter, now used for Expected R
-    final_trades_val = potential_pivots_val[expected_r_val > profit_threshold]
-
-    if len(final_trades_val) == 0:
-        return 0.0 # No trades made it through the full pipeline
-
-    # 5. Calculate backtest metric (e.g., Sharpe, Profit Factor)
-    # Using a simplified profit factor: sum of profits / sum of losses
-    # Assuming 1R loss for SL, and R for TPs (e.g. TP1=1R, TP2=2R, TP3=3R approx)
-    # This is a simplification; actual R would depend on SL placement relative to entry.
-    # For now, use outcome: 0=loss (-1R), 1=TP1 (1R), 2=TP2 (2R), 3=TP3 (3R)
-    # This needs to be linked to the actual Fib structure for R values.
-    # Simplified:
-    profit_sum = 0
-    loss_sum = 0
-    for idx, trade in final_trades_val.iterrows():
-        outcome = trade['trade_outcome']
-        if outcome == 0: # SL
-            loss_sum += 1
-        elif outcome == 1: # TP1
-            profit_sum += 1 # Simplified R value
-        elif outcome == 2: # TP2
-            profit_sum += 2
-        elif outcome == 3: # TP3
-            profit_sum += 3
-
-    if loss_sum == 0 and profit_sum > 0:
-        return profit_sum # High score for no losses
-    if loss_sum == 0 and profit_sum == 0: # No trades or all scratch
-        return 0.0
-    profit_factor = profit_sum / loss_sum
-
-    # Objective: Maximize profit factor (or Sharpe)
-    # Number of trades penalty could be added if too few trades.
-    # return profit_factor * np.log1p(len(final_trades_val)) # Penalize if too few trades
-    return profit_factor if profit_factor > 0 else -1.0 * (1/ (profit_factor -0.001)) # Penalize negative PFs heavily
-
-
-# Modified to accept df_raw (less processed) and static_entry_features_base
 def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot_features, entry_features_base
     """Optuna objective function. Performs data processing per trial."""
     # Hyperparameters to tune for models
