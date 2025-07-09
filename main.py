@@ -121,6 +121,13 @@ DEFAULT_FIB_TP3_ATR_MULTIPLIER_SL = 1.0
 DEFAULT_PRICE_PRECISION_DEFAULT = 2 # General default for price precision formatting
 DEFAULT_ADV_FIB_ORDER_PLACEMENT_STRATEGY = "virtual_limit_first" # New Default
 
+# AdvFib ML Strategy Defaults
+DEFAULT_ADV_FIB_ML_COOLDOWN_SECONDS = 120 # Cooldown for ML signals
+DEFAULT_ADV_FIB_ML_P_SWING_THRESHOLD = 0.65 # Default probability threshold for pivot model
+DEFAULT_ADV_FIB_ML_PROFIT_THRESHOLD = 0.60  # Default probability threshold for entry model
+DEFAULT_ADV_FIB_ML_ADAPTIVE_RISK_MIN_FACTOR = 0.5 # Min factor for adaptive risk based on P_profit
+DEFAULT_ADV_FIB_ML_ADAPTIVE_RISK_MAX_FACTOR = 1.2 # Max factor for adaptive risk
+
 # ICT Sweep Detection Enhancement Defaults
 DEFAULT_ICT_SWEEP_PENETRATION_PERCENT = 0.25   # e.g., 0.25 for 25% penetration of virtual zone width
 DEFAULT_ICT_SWEEP_ZONE_WIDTH_ATR_FACTOR = 0.1  # e.g., 0.1 * ATR for virtual zone width
@@ -504,6 +511,13 @@ def validate_configurations(loaded_configs: dict) -> tuple[bool, str, dict]:
         "entry_model_path": {"type": str, "optional": True},
         "model_params_path": {"type": str, "optional": True},
 
+        # AdvFib ML Strategy Params
+        "adv_fib_ml_cooldown_seconds": {"type": int, "optional": True, "condition": lambda x: 0 <= x <= 3600},
+        "adv_fib_ml_p_swing_threshold": {"type": float, "optional": True, "condition": lambda x: 0.0 <= x <= 1.0},
+        "adv_fib_ml_profit_threshold": {"type": float, "optional": True, "condition": lambda x: 0.0 <= x <= 1.0},
+        "adv_fib_ml_adaptive_risk_min_factor": {"type": float, "optional": True, "condition": lambda x: 0.1 <= x <= 1.0},
+        "adv_fib_ml_adaptive_risk_max_factor": {"type": float, "optional": True, "condition": lambda x: 1.0 <= x <= 2.0},
+
 
         # API keys and telegram details are not part of this CSV validation
     }
@@ -599,7 +613,11 @@ def get_current_market_price(client, symbol: str) -> float | None:
 
 def calculate_unrealized_pnl(trade_details: dict, current_market_price: float) -> float:
     """Calculates unrealized P&L for a single active trade."""
-    if not all(k in trade_details for k in ['entry_price', 'quantity', 'side']) or current_market_price is None:
+    if current_market_price is None: # Explicit check first
+        # print(f"calculate_unrealized_pnl: current_market_price is None for trade: {trade_details.get('symbol', 'UnknownSymbol')}")
+        return 0.0
+    if not all(k in trade_details for k in ['entry_price', 'quantity', 'side']):
+        # print(f"calculate_unrealized_pnl: Missing required keys in trade_details: {trade_details}")
         return 0.0
     
     entry_price = trade_details['entry_price']
@@ -619,14 +637,12 @@ def get_current_equity(client, configs: dict, current_balance: float, active_tra
     Calculates the current total equity (balance + total unrealized P&L).
     Returns None if balance cannot be fetched or a critical error occurs.
     """
-    if current_balance is None: # Ensure balance is valid first
-        print("Cannot calculate current equity because current_balance is None.")
-        # Attempt to fetch balance again as a fallback, though it might indicate a larger issue
-        fetched_balance = get_account_balance(client, configs)
-        if fetched_balance is None:
-            print("Critical: Failed to fetch balance for equity calculation. Returning None for equity.")
-            return None
-        current_balance = fetched_balance
+    if current_balance is None:
+        print("get_current_equity: current_balance is None. Attempting to re-fetch.")
+        current_balance = get_account_balance(client, configs) # Attempt re-fetch
+        if current_balance is None: # If still None after re-fetch
+            print("get_current_equity: CRITICAL - Failed to fetch balance even after retry. Equity cannot be calculated.")
+            return None # Critical failure
 
     total_unrealized_pnl = 0.0
     
@@ -640,9 +656,10 @@ def get_current_equity(client, configs: dict, current_balance: float, active_tra
         if market_price is not None:
             total_unrealized_pnl += calculate_unrealized_pnl(trade_details, market_price)
         else:
-            print(f"Warning: Could not fetch market price for {symbol} to calculate its UPNL. Assuming 0 UPNL for this trade in equity calculation.")
-            # Optionally, could return None here to indicate equity is uncertain,
-            # or proceed with known UPNL. For now, proceeding with 0 for this symbol.
+            print(f"get_current_equity: WARNING - Could not fetch market price for {symbol}. Its UPNL will be excluded from equity calculation this cycle.")
+            # Consider if this should make equity calculation fail (return None)
+            # For now, it proceeds but equity will be less accurate.
+            # If many such errors, equity could be significantly off.
 
     return current_balance + total_unrealized_pnl
 
@@ -659,12 +676,12 @@ def manage_daily_state(client, configs: dict, active_trades_dict_ref: dict, acti
     today = datetime.date.today()
     current_balance = get_account_balance(client, configs) # Fetch fresh balance
 
-    if current_balance is None:
-        print("CRITICAL: Could not fetch account balance in manage_daily_state. Daily state cannot be reliably updated.")
-        # Potentially return a special value or raise an exception if this is critical for operation
-        # For now, it will try to use the last known equity values if it's not a new day,
-        # or might fail to initialize properly on a new day.
-        # Let get_current_equity handle the None balance and return None for equity.
+    if current_balance is None: # This means get_account_balance failed (e.g. -2015 IP error or other)
+        print("CRITICAL: manage_daily_state - Could not fetch account balance. Daily state cannot be reliably updated. Equity will be None.")
+        # If balance fetch fails, equity calculation will also fail.
+        # The calling function (trading_loop) should handle a None equity return appropriately (e.g. skip cycle, alert).
+        # We should not proceed with stale daily_high_equity if we can't get current equity.
+        return None # Propagate the failure
         
     # Calculate current equity *before* acquiring the daily_state_lock for new day check,
     # as get_current_equity might take time (API calls) and uses active_trades_lock.
@@ -679,9 +696,9 @@ def manage_daily_state(client, configs: dict, active_trades_dict_ref: dict, acti
 
     with daily_state_lock:
         if last_trading_day != today:
-            print(f"New trading day ({today}). Resetting daily limits and P&L tracking.")
+            print(f"manage_daily_state: New trading day ({today}). Resetting daily limits and P&L tracking.")
             day_start_equity = calculated_current_equity
-            daily_high_equity = calculated_current_equity
+            daily_high_equity = calculated_current_equity # Initial high is the start equity
             daily_realized_pnl = 0.0
             trading_halted_drawdown = False
             trading_halted_daily_loss = False
@@ -692,16 +709,24 @@ def manage_daily_state(client, configs: dict, active_trades_dict_ref: dict, acti
                     configs["telegram_bot_token"], 
                     configs["telegram_chat_id"],
                     f"☀️ New Trading Day ({today}) Started.\n"
-                    f"Start Equity: {day_start_equity:.2f} USDT.\n"
+                    f"Start Equity: {day_start_equity:.2f} USDT.\n" # Use the just-set day_start_equity
                     f"Daily limits reset."
                 )
-        else:
-            # Same day, just update daily_high_equity
-            daily_high_equity = max(daily_high_equity, calculated_current_equity)
+        else: # Same day
+            # Update daily_high_equity if current equity is higher
+            if calculated_current_equity > daily_high_equity:
+                daily_high_equity = calculated_current_equity
+                # print(f"manage_daily_state: Daily high equity updated to {daily_high_equity:.2f}") # Optional: more verbose logging
         
-        # For logging current state regardless of new day or not
-        print(f"Daily State Update: Start Equity: {day_start_equity:.2f}, High Equity: {daily_high_equity:.2f}, Current Equity: {calculated_current_equity:.2f}, Realized PNL: {daily_realized_pnl:.2f}")
-        print(f"Halt Status: Drawdown: {trading_halted_drawdown}, Daily Loss: {trading_halted_daily_loss}")
+        # For logging current state regardless of new day or not (ensure values used are current)
+        log_day_start_equity = day_start_equity # Value from this cycle's logic (new day or previous day's start)
+        log_daily_high_equity = daily_high_equity # Updated high for today
+        log_daily_realized_pnl = daily_realized_pnl # Cumulative realized PNL for today
+        log_trading_halted_drawdown = trading_halted_drawdown # Current halt status
+        log_trading_halted_daily_loss = trading_halted_daily_loss
+
+        print(f"manage_daily_state: Update - Start Equity: {log_day_start_equity:.2f}, High Equity: {log_daily_high_equity:.2f}, Current Equity: {calculated_current_equity:.2f}, Realized PNL: {log_daily_realized_pnl:.2f}")
+        print(f"manage_daily_state: Halt Status - Drawdown: {log_trading_halted_drawdown}, Daily Loss: {log_trading_halted_daily_loss}")
 
     return calculated_current_equity
 
@@ -717,23 +742,31 @@ def close_all_open_positions(client, configs: dict, active_trades_dict_ref: dict
         print(f"{log_prefix} No active trades to close.")
         return
 
-    # Iterate over a copy of items because we might modify the dict later (though clearing happens at the end)
-    # The primary reason for copy is if active_trades_dict_ref could be modified by another thread during this,
-    # but the lock passed should be active_trades_lock, which protects it.
-    # However, operations inside loop (API calls) are outside the lock.
+    # Iterate over a copy of items because the dictionary might be modified by other threads if lock is not held throughout.
+    # However, the critical part is getting the list of trades to close under lock.
+    # API calls (cancel, place order) should happen outside the lock to avoid holding it for long.
     
-    # It's safer to get a list of trades to close first, then operate.
     trades_to_close_info = []
-    with lock: # Use the passed lock (active_trades_lock)
-        for symbol, details in active_trades_dict_ref.items():
+    with lock: # Use the passed lock (should be active_trades_lock)
+        # Create a list of trade details to process. This minimizes time lock is held if dict is large.
+        for symbol, details in list(active_trades_dict_ref.items()): # Use list() for safe iteration if needed, though items() is fine with lock
             trades_to_close_info.append({
                 "symbol": symbol,
                 "sl_order_id": details.get('sl_order_id'),
-                "tp_order_id": details.get('tp_order_id'),
+                "tp_order_id": details.get('tp_order_id'), # For single TP strategies
+                "tp_orders": details.get('tp_orders', []), # For multi-TP strategies (like Fib Multi-TP)
                 "quantity": details.get('quantity'),
-                "side": details.get('side'), # "LONG" or "SHORT"
-                "symbol_info": details.get('symbol_info')
+                "side": details.get('side'), 
+                "symbol_info": details.get('symbol_info'),
+                "strategy_type": details.get('strategy_type', 'UNKNOWN') # For logging/handling multi-TP
             })
+
+    if not trades_to_close_info and active_trades_dict_ref: # If list is empty but dict was not (should not happen with current logic)
+        print(f"{log_prefix} Warning: trades_to_close_info is empty but active_trades_dict_ref was not. State inconsistency?")
+        # Fallback: attempt to clear active_trades_dict_ref if it's somehow non-empty but yielded no trades to close.
+        with lock: active_trades_dict_ref.clear()
+        return
+
 
     closed_successfully_count = 0
     closed_with_errors_count = 0
@@ -761,19 +794,29 @@ def close_all_open_positions(client, configs: dict, active_trades_dict_ref: dict
             except Exception as e:
                 print(f"{log_prefix} Unexpected error cancelling SL order {trade_info['sl_order_id']} for {symbol}: {e}")
         
-        # 2. Cancel TP order
-        if trade_info['tp_order_id']:
+        # 2. Cancel TP order(s)
+        # Handle single TP from older strategies and multi-TP from newer ones
+        tp_ids_to_cancel = []
+        if trade_info.get('tp_order_id'): # Single TP
+            tp_ids_to_cancel.append(trade_info['tp_order_id'])
+        if trade_info.get('tp_orders'): # Multi-TP (list of dicts)
+            for tp_o_detail in trade_info['tp_orders']:
+                if tp_o_detail.get('id') and tp_o_detail.get('status', '').upper() == 'OPEN': # Check status if available
+                    tp_ids_to_cancel.append(tp_o_detail['id'])
+        
+        for tp_id_cancel in list(set(tp_ids_to_cancel)): # Use set to avoid duplicates if any overlap
+            if not tp_id_cancel: continue
             try:
-                print(f"{log_prefix} Cancelling TP order {trade_info['tp_order_id']} for {symbol}...")
-                client.futures_cancel_order(symbol=symbol, orderId=trade_info['tp_order_id'])
-                print(f"{log_prefix} TP order {trade_info['tp_order_id']} for {symbol} cancelled.")
+                print(f"{log_prefix} Cancelling TP order {tp_id_cancel} for {symbol}...")
+                client.futures_cancel_order(symbol=symbol, orderId=tp_id_cancel)
+                print(f"{log_prefix} TP order {tp_id_cancel} for {symbol} cancelled.")
             except BinanceAPIException as e:
-                if e.code == -2011: # Order filled or cancelled / Does not exist
-                    print(f"{log_prefix} TP order {trade_info['tp_order_id']} for {symbol} already filled/cancelled or does not exist (Code: {e.code}).")
+                if e.code == -2011: 
+                    print(f"{log_prefix} TP order {tp_id_cancel} for {symbol} already filled/cancelled or does not exist (Code: {e.code}).")
                 else:
-                    print(f"{log_prefix} API Error cancelling TP order {trade_info['tp_order_id']} for {symbol}: {e}")
+                    print(f"{log_prefix} API Error cancelling TP order {tp_id_cancel} for {symbol}: {e}")
             except Exception as e:
-                print(f"{log_prefix} Unexpected error cancelling TP order {trade_info['tp_order_id']} for {symbol}: {e}")
+                print(f"{log_prefix} Unexpected error cancelling TP order {tp_id_cancel} for {symbol}: {e}")
 
         # 3. Place Market Close Order
         close_side = "SELL" if original_side == "LONG" else "BUY"
@@ -2638,8 +2681,13 @@ def get_user_configurations(load_choice_override: str = None, make_changes_overr
                 if "pivot_model_path" not in configs: configs["pivot_model_path"] = DEFAULT_PIVOT_MODEL_PATH
                 if "entry_model_path" not in configs: configs["entry_model_path"] = DEFAULT_ENTRY_MODEL_PATH
                 if "model_params_path" not in configs: configs["model_params_path"] = DEFAULT_MODEL_PARAMS_PATH
-                if "model_atr_period_live" not in configs: configs["model_atr_period_live"] = MODEL_ATR_PERIOD # Use global default
-
+                if "model_atr_period_live" not in configs: configs["model_atr_period_live"] = MODEL_ATR_PERIOD 
+                # Add new ML strategy specific defaults if not in CSV
+                if "adv_fib_ml_cooldown_seconds" not in configs: configs["adv_fib_ml_cooldown_seconds"] = DEFAULT_ADV_FIB_ML_COOLDOWN_SECONDS
+                if "adv_fib_ml_p_swing_threshold" not in configs: configs["adv_fib_ml_p_swing_threshold"] = DEFAULT_ADV_FIB_ML_P_SWING_THRESHOLD
+                if "adv_fib_ml_profit_threshold" not in configs: configs["adv_fib_ml_profit_threshold"] = DEFAULT_ADV_FIB_ML_PROFIT_THRESHOLD
+                if "adv_fib_ml_adaptive_risk_min_factor" not in configs: configs["adv_fib_ml_adaptive_risk_min_factor"] = DEFAULT_ADV_FIB_ML_ADAPTIVE_RISK_MIN_FACTOR
+                if "adv_fib_ml_adaptive_risk_max_factor" not in configs: configs["adv_fib_ml_adaptive_risk_max_factor"] = DEFAULT_ADV_FIB_ML_ADAPTIVE_RISK_MAX_FACTOR
             break
         print("Invalid strategy choice. Please enter '1', '2', '3', '4', or '5'.")
 
@@ -3163,7 +3211,67 @@ def get_user_configurations(load_choice_override: str = None, make_changes_overr
         configs.pop("fib_tp3_atr_multiplier_tp", None)
         configs.pop("fib_tp3_atr_multiplier_sl", None)
         configs.pop("price_precision_default", None)
-        configs.pop("adv_fib_order_placement_strategy", None) # Also remove the new strategy choice if AdvFib not selected
+        configs.pop("adv_fib_order_placement_strategy", None)
+    else: # Not new Advanced Fib strategy, remove these specific keys if they were in loaded CSV
+        configs.pop("fib_trend_pivot_n_left", None); configs.pop("fib_trend_pivot_n_right", None)
+        configs.pop("fib_trend_lookback_swings", None); configs.pop("fib_rsi_period", None)
+        configs.pop("fib_sl_atr_period_exec", None); configs.pop("fib_sl_atr_multiplier_exec", None)
+        configs.pop("fib_tp3_atr_period", None); configs.pop("fib_tp3_atr_multiplier_tp", None)
+        configs.pop("fib_tp3_atr_multiplier_sl", None); configs.pop("price_precision_default", None)
+        configs.pop("adv_fib_order_placement_strategy", None)
+
+    # Advanced Fibonacci ML Strategy Specific Configs
+    if configs.get("strategy_choice") == "adv_fib_ml":
+        print("\n--- Advanced Fibonacci ML Strategy Specific Configurations ---")
+        # Model Paths (already handled by general strategy choice, but can be listed here for clarity)
+        get_input_with_default("Pivot Model Path", "pivot_model_path", DEFAULT_PIVOT_MODEL_PATH, str)
+        get_input_with_default("Entry Model Path", "entry_model_path", DEFAULT_ENTRY_MODEL_PATH, str)
+        get_input_with_default("Model Params Path (JSON)", "model_params_path", DEFAULT_MODEL_PARAMS_PATH, str)
+        
+        while True:
+            try:
+                val = get_input_with_default("AdvFibML Cooldown (seconds)", "adv_fib_ml_cooldown_seconds", DEFAULT_ADV_FIB_ML_COOLDOWN_SECONDS, int)
+                if 0 <= val <= 3600: configs["adv_fib_ml_cooldown_seconds"] = val; break
+                print("Must be between 0 and 3600.")
+            except ValueError: print("Invalid input.")
+        while True:
+            try:
+                val = get_input_with_default("AdvFibML P_Swing Threshold (0.0-1.0)", "adv_fib_ml_p_swing_threshold", DEFAULT_ADV_FIB_ML_P_SWING_THRESHOLD, float)
+                if 0.0 <= val <= 1.0: configs["adv_fib_ml_p_swing_threshold"] = val; break
+                print("Must be between 0.0 and 1.0.")
+            except ValueError: print("Invalid input.")
+        while True:
+            try:
+                val = get_input_with_default("AdvFibML Profit Threshold (0.0-1.0)", "adv_fib_ml_profit_threshold", DEFAULT_ADV_FIB_ML_PROFIT_THRESHOLD, float)
+                if 0.0 <= val <= 1.0: configs["adv_fib_ml_profit_threshold"] = val; break
+                print("Must be between 0.0 and 1.0.")
+            except ValueError: print("Invalid input.")
+        while True:
+            try:
+                val = get_input_with_default("AdvFibML Adaptive Risk Min Factor (0.1-1.0)", "adv_fib_ml_adaptive_risk_min_factor", DEFAULT_ADV_FIB_ML_ADAPTIVE_RISK_MIN_FACTOR, float)
+                if 0.1 <= val <= 1.0: configs["adv_fib_ml_adaptive_risk_min_factor"] = val; break
+                print("Must be between 0.1 and 1.0.")
+            except ValueError: print("Invalid input.")
+        while True:
+            try:
+                val = get_input_with_default("AdvFibML Adaptive Risk Max Factor (1.0-2.0)", "adv_fib_ml_adaptive_risk_max_factor", DEFAULT_ADV_FIB_ML_ADAPTIVE_RISK_MAX_FACTOR, float)
+                if 1.0 <= val <= 2.0: configs["adv_fib_ml_adaptive_risk_max_factor"] = val; break
+                print("Must be between 1.0 and 2.0.")
+            except ValueError: print("Invalid input.")
+        # ATR period for ML features (model_atr_period_live)
+        while True:
+            try:
+                val = get_input_with_default("ATR Period for ML Model Features", "model_atr_period_live", MODEL_ATR_PERIOD, int)
+                if val > 0 : configs["model_atr_period_live"] = val; break
+                print("ML ATR Period must be a positive integer.")
+            except ValueError: print("Invalid input.")
+
+    else: # Not AdvFibML strategy, remove these specific keys if they were in loaded CSV
+        configs.pop("pivot_model_path", None); configs.pop("entry_model_path", None); configs.pop("model_params_path", None)
+        configs.pop("model_atr_period_live", None)
+        configs.pop("adv_fib_ml_cooldown_seconds", None); configs.pop("adv_fib_ml_p_swing_threshold", None)
+        configs.pop("adv_fib_ml_profit_threshold", None); configs.pop("adv_fib_ml_adaptive_risk_min_factor", None)
+        configs.pop("adv_fib_ml_adaptive_risk_max_factor", None)
 
 
     # Micro-Pivot Trailing SL Configurations (Applicable to any strategy if enabled)
@@ -5346,15 +5454,25 @@ def monitor_active_trades(client, configs): # Needs lock for active_trades acces
                         qty_precision_msg = int(closed_trade_details_for_msg.get('symbol_info',{}).get('quantityPrecision',0))
                         price_precision_msg = int(closed_trade_details_for_msg.get('symbol_info',{}).get('pricePrecision',2))
                         
-                        msg_tg_closed = (
-                            f"✅ TRADE CLOSED (via Monitor) ✅\n\n"
+                        base_close_msg = (
                             f"Symbol: `{closed_trade_details_for_msg['symbol']}`\n"
                             f"Side: `{closed_trade_details_for_msg['side']}`\n"
+                            f"Strategy: `{closed_trade_details_for_msg.get('strategy_type', 'N/A')}`\n"
                             f"Quantity: `{closed_trade_details_for_msg['quantity']:.{qty_precision_msg}f}`\n"
                             f"Entry Price: `{closed_trade_details_for_msg['entry_price']:.{price_precision_msg}f}`\n"
                             f"Reason: _{escape_markdown_v1(closed_trade_details_for_msg['closure_reason_monitor'])}_\n"
                             f"Realized PNL for trade: {closed_trade_details_for_msg['realized_pnl_on_closure']:.2f} USDT"
                         )
+                        
+                        # Add ML scores if it was an ML trade
+                        if closed_trade_details_for_msg.get('strategy_type') == "ADV_FIB_ML":
+                            p_swing = closed_trade_details_for_msg.get('p_swing_at_entry', 'N/A')
+                            p_profit = closed_trade_details_for_msg.get('p_profit_at_entry', 'N/A')
+                            p_swing_str = f"{p_swing:.2f}" if isinstance(p_swing, float) else str(p_swing)
+                            p_profit_str = f"{p_profit:.2f}" if isinstance(p_profit, float) else str(p_profit)
+                            base_close_msg += f"\nML Scores at Entry: P_Swing=`{p_swing_str}`, P_Profit=`{p_profit_str}`"
+
+                        msg_tg_closed = f"✅ TRADE CLOSED (via Monitor) ✅\n\n{base_close_msg}"
                         send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], msg_tg_closed)
                     
                     del active_trades[sym_del]
@@ -5673,6 +5791,48 @@ def process_symbol_adv_fib_task(symbol, client, configs, lock):
         return f"{symbol}: AdvFib Error - {error_detail}"
 
 # --- ML Strategy Feature Calculation Helpers ---
+
+# Consistent ATR calculation as potentially used in app.py (simple rolling mean for TR)
+def app_calculate_atr(df_input: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+    """Calculates Average True Range based on app.py's method (rolling mean of TR)."""
+    df = df_input.copy()
+    df['high_low'] = df['high'] - df['low']
+    df['high_close_prev'] = np.abs(df['high'] - df['close'].shift(1))
+    df['low_close_prev'] = np.abs(df['low'] - df['close'].shift(1))
+    df['tr'] = df[['high_low', 'high_close_prev', 'low_close_prev']].max(axis=1)
+    atr_col_name = f'atr_{period}'
+    df[atr_col_name] = df['tr'].rolling(window=period).mean()
+    # df.drop(columns=['high_low', 'high_close_prev', 'low_close_prev', 'tr'], inplace=True, errors='ignore')
+    return df
+
+# Consistent EMA calculation (standard, likely compatible with main.py's existing)
+# For now, we'll use main.py's calculate_ema. If issues arise, we can use this:
+# def app_calculate_ema(df_input: pd.DataFrame, period: int, column: str = 'close') -> pd.Series:
+#     """Calculates Exponential Moving Average."""
+#     return df_input[column].ewm(span=period, adjust=False).mean()
+
+# Consistent RSI calculation as potentially used in app.py (rolling mean for avg_gain/loss)
+def app_calculate_rsi(df_input: pd.DataFrame, period: int = 14, column: str = 'close') -> pd.Series:
+    """Calculates Relative Strength Index based on app.py's method."""
+    df = df_input.copy()
+    delta = df[column].diff(1)
+    gain = delta.where(delta > 0, 0.0) # Ensure 0.0 for float context
+    loss = -delta.where(delta < 0, 0.0) # Ensure 0.0 for float context
+    
+    # Ensure min_periods=1 for rolling mean to avoid many NaNs at the start if data is short,
+    # though for feature calculation we expect enough data.
+    avg_gain = gain.rolling(window=period, min_periods=period).mean() # app.py used min_periods=1
+    avg_loss = loss.rolling(window=period, min_periods=period).mean() # Use period for min_periods for stability
+
+    rs = avg_gain / avg_loss
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    
+    # Handle cases where avg_loss is zero (RSI is 100), or both are zero (RSI is neutral, e.g. 50)
+    rsi[avg_loss == 0] = 100.0
+    rsi[(avg_gain == 0) & (avg_loss == 0)] = 50.0 # Or another neutral value like 0 or np.nan then fill
+    return rsi
+
+
 def calculate_live_pivot_features(df_live: pd.DataFrame, atr_period: int, p_feature_names: list):
     """
     Calculates features for pivot detection model on live data.
@@ -5832,6 +5992,293 @@ def calculate_live_entry_features(df_live: pd.DataFrame, atr_period: int, e_feat
 
 
 # --- ML Strategy Task Function ---
+def process_symbol_adv_fib_ml_task(symbol, client, configs, lock): # lock is active_trades_lock
+    """
+    Processes a symbol using the Advanced Fibonacci ML strategy.
+    Fetches data, computes features, gets predictions from models, and places trades.
+    """
+    thread_name = threading.current_thread().name
+    cycle_start_ref = configs.get('cycle_start_time_ref', time.time())
+    log_prefix_task = f"[{thread_name}] {symbol} AdvFibML_Task:"
+    # print(f"{log_prefix_task} Processing {format_elapsed_time(cycle_start_ref)}") # Can be too verbose
+
+    global pivot_model, entry_model, model_best_params, PIVOT_FEATURE_NAMES, ENTRY_FEATURE_NAMES_BASE, MODEL_ATR_PERIOD
+    global active_trades, active_trades_lock, last_signal_time, last_signal_lock, recent_trade_signatures, recent_trade_signatures_lock
+    global trading_halted_drawdown, trading_halted_daily_loss, daily_state_lock, trading_halted_manual
+
+    # --- Model and Params Check ---
+    if pivot_model is None or entry_model is None:
+        # print(f"{log_prefix_task} Pivot or Entry model not loaded. Skipping ML strategy for {symbol}.")
+        return f"{symbol}: AdvFibML Error - Models not loaded"
+    if not model_best_params or not PIVOT_FEATURE_NAMES or not ENTRY_FEATURE_NAMES_BASE:
+        # print(f"{log_prefix_task} Model params or feature names not loaded. Skipping ML strategy for {symbol}.")
+        return f"{symbol}: AdvFibML Error - Model params/features not loaded"
+    
+    p_swing_threshold = model_best_params.get('p_swing_threshold', DEFAULT_ADV_FIB_ML_P_SWING_THRESHOLD)
+    profit_threshold = model_best_params.get('profit_threshold', DEFAULT_ADV_FIB_ML_PROFIT_THRESHOLD)
+    
+    # --- Halt Checks ---
+    with daily_state_lock:
+        if trading_halted_drawdown or trading_halted_daily_loss:
+            # print(f"{log_prefix_task} Trading halted (DD/DSL). Skipping {symbol}.")
+            return f"{symbol}: AdvFibML Skipped - Trading Halted (DD/DSL)"
+    if trading_halted_manual:
+        # print(f"{log_prefix_task} Trading manually halted. Skipping {symbol}.")
+        return f"{symbol}: AdvFibML Skipped - Trading Halted (Manual)"
+    
+    # --- Cooldown, Active Trade, etc. (Standard pre-trade checks) ---
+    with last_signal_lock:
+        cooldown_seconds = configs.get("adv_fib_ml_cooldown_seconds", DEFAULT_ADV_FIB_ML_COOLDOWN_SECONDS)
+        if symbol in last_signal_time and (dt.now() - last_signal_time.get(f"{symbol}_adv_fib_ml", dt.min())).total_seconds() < cooldown_seconds:
+            return f"{symbol}: AdvFibML Skipped - Cooldown"
+    with active_trades_lock:
+        if symbol in active_trades:
+            return f"{symbol}: AdvFibML Skipped - Active Trade"
+    # (Live position/order checks could be added here if strictness is needed beyond active_trades)
+
+    # --- Data Fetching & Preparation ---
+    # Kline interval for ML features should match training (e.g., 15m). MODEL_ATR_PERIOD is key.
+    # Fetch enough history for all indicators (e.g., EMA50, rolling windows).
+    kline_fetch_limit_ml = max(250, MODEL_ATR_PERIOD + 100) # Safe buffer
+    klines_df_ml_raw, klines_error_ml = get_historical_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=kline_fetch_limit_ml)
+
+    if klines_error_ml or klines_df_ml_raw.empty or len(klines_df_ml_raw) < (MODEL_ATR_PERIOD + 50): # Min for feature calc
+        # print(f"{log_prefix_task} Error fetching/insufficient klines for ML ({len(klines_df_ml_raw)}). Err: {klines_error_ml}. Skipping.")
+        return f"{symbol}: AdvFibML Error - Kline fetch/data issue"
+
+    s_info = get_symbol_info(client, symbol)
+    if not s_info:
+        # print(f"{log_prefix_task} Failed to get symbol_info. Skipping."); 
+        return f"{symbol}: AdvFibML Error - No symbol_info"
+    p_prec = int(s_info.get('pricePrecision', configs.get("price_precision_default", 2)))
+    q_prec = int(s_info.get('quantityPrecision', 0))
+
+    # --- Stage 1: Pivot Detection Model ---
+    pivot_features_live = calculate_live_pivot_features(klines_df_ml_raw, MODEL_ATR_PERIOD, PIVOT_FEATURE_NAMES)
+    if pivot_features_live is None:
+        # print(f"{log_prefix_task} Failed to calculate pivot features. Skipping."); 
+        return f"{symbol}: AdvFibML Error - Pivot feature calc failed"
+
+    pivot_features_reshaped = pivot_features_live.values.reshape(1, -1)
+    try:
+        p_swing_probabilities = pivot_model.predict_proba(pivot_features_reshaped)[0]
+    except Exception as e_pivot_predict:
+        print(f"{log_prefix_task} ERROR during pivot model prediction: {e_pivot_predict}"); return f"{symbol}: AdvFibML Error - Pivot predict fail"
+        
+    p_swing_high_prob = p_swing_probabilities[1] if len(p_swing_probabilities) > 1 else 0
+    p_swing_low_prob = p_swing_probabilities[2] if len(p_swing_probabilities) > 2 else 0
+    p_swing_final = max(p_swing_high_prob, p_swing_low_prob)
+    predicted_pivot_class = np.argmax(p_swing_probabilities) # 0:none, 1:high, 2:low
+
+    # print(f"{log_prefix_task} Pivot Model: P_swing={p_swing_final:.3f} (H:{p_swing_high_prob:.2f},L:{p_swing_low_prob:.2f}), Class:{predicted_pivot_class}, Thresh:{p_swing_threshold:.2f}")
+
+    if p_swing_final < p_swing_threshold or predicted_pivot_class == 0:
+        return f"{symbol}: AdvFibML Skipped - P_swing low or no pivot"
+
+    current_candle_data_ml = klines_df_ml_raw.iloc[-1]
+    pivot_price_for_sim = current_candle_data_ml['high'] if predicted_pivot_class == 1 else current_candle_data_ml['low']
+    potential_trade_side_ml = "short" if predicted_pivot_class == 1 else "long"
+    print(f"{log_prefix_task} Pivot DETECTED: {potential_trade_side_ml.upper()} setup. PivotPrice: {pivot_price_for_sim:.{p_prec}f}, P_swing: {p_swing_final:.3f}")
+
+    # --- Simulate Entry/SL for Entry Feature Calculation ---
+    atr_val_for_sim_features = klines_df_ml_raw[f'atr_{MODEL_ATR_PERIOD}'].iloc[-1]
+    if pd.isna(atr_val_for_sim_features) or atr_val_for_sim_features == 0: 
+        print(f"{log_prefix_task} Invalid ATR for feature simulation. Skipping."); return f"{symbol}: AdvFibML Error - ATR for features invalid"
+        
+    sim_entry_feat = current_candle_data_ml['close'] # Entry at close of pivot candle for feature inputs
+    sl_mult_feat = configs.get("fib_sl_atr_multiplier_exec", DEFAULT_FIB_SL_ATR_MULTIPLIER_EXEC) # Use AdvFib exec SL settings
+    sim_sl_dist_feat = atr_val_for_sim_features * sl_mult_feat
+    sim_sl_feat = (pivot_price_for_sim - sim_sl_dist_feat) if potential_trade_side_ml == "long" else (pivot_price_for_sim + sim_sl_dist_feat)
+    sim_sl_feat = round(sim_sl_feat, p_prec)
+
+    # --- Stage 2: Entry Evaluation Model ---
+    entry_features_live = calculate_live_entry_features(
+        klines_df_ml_raw, MODEL_ATR_PERIOD, ENTRY_FEATURE_NAMES_BASE,
+        p_swing_score=p_swing_final,
+        sim_entry_price=sim_entry_feat, sim_sl_price=sim_sl_feat,
+        pivot_price_for_dist_calc=pivot_price_for_sim
+    )
+    if entry_features_live is None:
+        # print(f"{log_prefix_task} Failed to calculate entry features. Skipping."); 
+        return f"{symbol}: AdvFibML Error - Entry feature calc failed"
+
+    entry_features_reshaped = entry_features_live.values.reshape(1, -1)
+    try:
+        p_profit_probabilities = entry_model.predict_proba(entry_features_reshaped)[0]
+    except Exception as e_entry_predict:
+        print(f"{log_prefix_task} ERROR during entry model prediction: {e_entry_predict}"); return f"{symbol}: AdvFibML Error - Entry predict fail"
+        
+    p_profit_final = p_profit_probabilities[1] if len(p_profit_probabilities) > 1 else 0 # Prob of class 1 (profitable)
+    # print(f"{log_prefix_task} Entry Model: P_profit={p_profit_final:.3f}, Thresh:{profit_threshold:.2f}")
+
+    if p_profit_final < profit_threshold:
+        return f"{symbol}: AdvFibML Skipped - P_profit low ({p_profit_final:.3f} < {profit_threshold:.2f})"
+
+    # --- Trade Execution Logic (ML Confirmed) ---
+    print(f"{log_prefix_task} ML CONFIRMED: {potential_trade_side_ml.upper()} for {symbol}. P_swing={p_swing_final:.2f}, P_profit={p_profit_final:.2f}")
+
+    # Actual Trade Parameters:
+    # Entry: Could be market, or a Fib limit based on the ML pivot.
+    # For simplicity, let's use MARKET entry at current close after confirmation.
+    # This is a deviation from "Fibonacci" if no Fib level is used for entry.
+    # The "Fibonacci" part might be more in how the SL is derived from the ML pivot (as a swing point).
+    
+    # Option 1: Market Entry (Simpler)
+    actual_entry_price = current_candle_data_ml['close']
+    entry_method_desc = "Market at Current Close"
+
+    # Option 2: Fib Retracement Limit Entry (More Complex, needs leg definition)
+    # To do this, we need to define the "leg" using the ML pivot.
+    # E.g., if ML pivot is a low, find a recent high to form the leg.
+    # For now, sticking to Option 1 (Market Entry) for initial implementation.
+    # If `process_symbol_adv_fib_task` is to be strictly "Fibonacci", this needs refinement.
+    # The name "AdvFibML" implies some Fib element. Let's use the ML pivot as one end of a Fib leg.
+    
+    # Define Fib Leg using ML Pivot:
+    # If long (ML pivot was a low): Leg is from ML_pivot_low to a recent_high_before_pivot.
+    # If short (ML pivot was a high): Leg is from ML_pivot_high to a recent_low_before_pivot.
+    # This requires looking back in `klines_df_ml_raw` before the pivot candle.
+    
+    # For now, SL is based on the ML pivot price. TP is R:R.
+    actual_sl_price = sim_sl_feat # Use the SL simulated for feature calculation as the actual SL.
+    
+    tp_rr_trade = configs.get("tp_rr_ratio", DEFAULT_TP_RR_RATIO) # Use general R:R
+    risk_dist_trade = abs(actual_entry_price - actual_sl_price)
+    if risk_dist_trade == 0:
+        print(f"{log_prefix_task} Risk distance is zero for actual trade. Aborting."); return f"{symbol}: AdvFibML Error - Zero risk distance"
+    
+    actual_tp_price = round(actual_entry_price + (risk_dist_trade * tp_rr_trade) if potential_trade_side_ml == "long" else \
+                            actual_entry_price - (risk_dist_trade * tp_rr_trade), p_prec)
+
+    print(f"{log_prefix_task} Final Trade Params: Entry({entry_method_desc})={actual_entry_price:.{p_prec}f}, SL={actual_sl_price:.{p_prec}f}, TP({tp_rr_trade}R)={actual_tp_price:.{p_prec}f}")
+
+    # Adaptive Risk Position Sizing
+    base_risk_pct = configs['risk_percent']
+    min_risk_factor = configs.get("adv_fib_ml_adaptive_risk_min_factor", DEFAULT_ADV_FIB_ML_ADAPTIVE_RISK_MIN_FACTOR)
+    max_risk_factor = configs.get("adv_fib_ml_adaptive_risk_max_factor", DEFAULT_ADV_FIB_ML_ADAPTIVE_RISK_MAX_FACTOR)
+    
+    confidence_factor = 1.0 # Default if profit_threshold is 1.0 or 0.0
+    if 0.0 < profit_threshold < 1.0: # Ensure valid range for mapping
+        # Map P_profit from [profit_threshold, 1.0] to [min_risk_factor, max_risk_factor]
+        if p_profit_final <= profit_threshold: # Should not happen due to earlier check, but safety
+            confidence_factor = min_risk_factor
+        elif p_profit_final >= 1.0:
+            confidence_factor = max_risk_factor
+        else: # Linear interpolation
+            confidence_factor = min_risk_factor + (p_profit_final - profit_threshold) * \
+                                (max_risk_factor - min_risk_factor) / (1.0 - profit_threshold)
+    
+    effective_risk_pct = base_risk_pct * confidence_factor
+    effective_risk_pct = max(base_risk_pct * 0.1, min(effective_risk_pct, base_risk_pct * 2.0)) # Overall sanity clamp on effective risk
+
+    print(f"{log_prefix_task} Adaptive Sizing: BaseRisk={base_risk_pct*100:.2f}%, Pprof={p_profit_final:.2f} => ConfFactor={confidence_factor:.2f}, EffRisk={effective_risk_pct*100:.3f}%")
+
+    acc_bal = get_account_balance(client, configs)
+    if acc_bal is None or acc_bal <= 0:
+        print(f"{log_prefix_task} Invalid account balance. Aborting."); return f"{symbol}: AdvFibML Error - Balance"
+
+    qty_to_order = calculate_position_size(acc_bal, effective_risk_pct, actual_entry_price, actual_sl_price, s_info, configs)
+    if qty_to_order is None or qty_to_order <= 0:
+        print(f"{log_prefix_task} Invalid position size. Aborting."); return f"{symbol}: AdvFibML Error - Pos Size"
+
+    # Final Pre-Order Sanity Checks (using effective risk for check)
+    leverage_for_ml_trade = configs.get('leverage') # Or dynamic leverage if implemented for ML
+    set_leverage_on_symbol(client, symbol, leverage_for_ml_trade) # Ensure leverage is set
+    set_margin_type_on_symbol(client, symbol, configs['margin_type'], configs) # Ensure margin type
+
+    passed_sanity, sanity_reason = pre_order_sanity_checks(
+        symbol, potential_trade_side_ml.upper(), actual_entry_price, actual_sl_price, actual_tp_price,
+        qty_to_order, s_info, acc_bal, effective_risk_pct, configs,
+        specific_leverage_for_trade=leverage_for_ml_trade
+    )
+    if not passed_sanity:
+        print(f"{log_prefix_task} Sanity checks FAILED: {sanity_reason}. Aborting."); return f"{symbol}: AdvFibML Error - Sanity Fail"
+    
+    # Update Cooldown & Signature
+    with last_signal_lock: last_signal_time[f"{symbol}_adv_fib_ml"] = dt.now()
+    trade_sig_ml_final = generate_trade_signature(symbol, f"ADV_FIB_ML_{potential_trade_side_ml.upper()}", actual_entry_price, actual_sl_price, actual_tp_price, qty_to_order, p_prec)
+    with recent_trade_signatures_lock:
+        if trade_sig_ml_final in recent_trade_signatures and (dt.now() - recent_trade_signatures[trade_sig_ml_final]).total_seconds() < 60 :
+            print(f"{log_prefix_task} Duplicate ML trade signature. Skipping."); return f"{symbol}: AdvFibML Skipped - Duplicate Sig"
+        recent_trade_signatures[trade_sig_ml_final] = dt.now()
+
+    # --- Mode-Specific Action ---
+    if configs['mode'] == 'signal':
+        print(f"{log_prefix_task} Signal Mode: Preparing Telegram signal for AdvFibML {symbol} {potential_trade_side_ml.upper()}.")
+        est_pnl_tp_ml = calculate_pnl_for_fixed_capital(actual_entry_price, actual_tp_price, potential_trade_side_ml.upper(), leverage_for_ml_trade, 100.0, s_info)
+        est_pnl_sl_ml = calculate_pnl_for_fixed_capital(actual_entry_price, actual_sl_price, potential_trade_side_ml.upper(), leverage_for_ml_trade, 100.0, s_info)
+        
+        send_entry_signal_telegram(
+            configs, symbol, f"ADV_FIB_ML_{potential_trade_side_ml.upper()}", leverage_for_ml_trade, actual_entry_price,
+            actual_tp_price, None, None, actual_sl_price, # Assuming single TP for ML strategy signals for now
+            effective_risk_pct, est_pnl_tp_ml, est_pnl_sl_ml, s_info,
+            "AdvFib ML Signal", klines_df_ml_raw.index[-1], "MARKET" # Signal based on market execution
+        )
+        # TODO: Add to active_signals if desired for signal mode monitoring
+        print(f"{log_prefix_task} Signal Mode: AdvFibML signal for {symbol} sent.")
+        return f"{symbol}: AdvFibML Signal Sent"
+
+    # --- Live Mode: Place Orders ---
+    entry_order_obj_ml, entry_err_ml = place_new_order(client, s_info, 
+                                                       "BUY" if potential_trade_side_ml == "long" else "SELL", 
+                                                       "MARKET", qty_to_order, 
+                                                       position_side=potential_trade_side_ml.upper())
+    if not entry_order_obj_ml or entry_order_obj_ml.get('status') != 'FILLED':
+        print(f"{log_prefix_task} Market entry FAILED. Err: {entry_err_ml}. Order: {entry_order_obj_ml}"); return f"{symbol}: AdvFibML Error - Entry Order Fail"
+    
+    actual_filled_price_ml = float(entry_order_obj_ml['avgPrice'])
+    print(f"{log_prefix_task} Market entry FILLED at {actual_filled_price_ml:.{p_prec}f}")
+
+    # Re-adjust SL/TP based on actual fill if significantly different (optional)
+    # For now, use SL/TP calculated from `actual_entry_price` (which was current close)
+    final_sl_price_ml = actual_sl_price 
+    final_tp_price_ml = actual_tp_price
+    if abs(actual_filled_price_ml - actual_entry_price) / actual_entry_price > 0.001: # If fill is >0.1% different
+        print(f"{log_prefix_task} Actual fill {actual_filled_price_ml} differs from expected {actual_entry_price}. Re-evaluating SL/TP.")
+        risk_dist_adj = abs(actual_filled_price_ml - actual_sl_price) # Original SL point vs new entry
+        if potential_trade_side_ml == "long":
+            final_sl_price_ml = actual_sl_price # Keep original SL point relative to structure
+            final_tp_price_ml = round(actual_filled_price_ml + (risk_dist_adj * tp_rr_trade), p_prec)
+        else:
+            final_sl_price_ml = actual_sl_price # Keep original SL point
+            final_tp_price_ml = round(actual_filled_price_ml - (risk_dist_adj * tp_rr_trade), p_prec)
+        print(f"{log_prefix_task} Adjusted SL/TP: SL={final_sl_price_ml:.{p_prec}f}, TP={final_tp_price_ml:.{p_prec}f}")
+
+
+    sl_ord_ml, sl_err_ml = place_new_order(client, s_info, "SELL" if potential_trade_side_ml == "long" else "BUY", "STOP_MARKET", qty_to_order, stop_price=final_sl_price_ml, position_side=potential_trade_side_ml.upper(), is_closing_order=True)
+    tp_ord_ml, tp_err_ml = place_new_order(client, s_info, "SELL" if potential_trade_side_ml == "long" else "BUY", "TAKE_PROFIT_MARKET", qty_to_order, stop_price=final_tp_price_ml, position_side=potential_trade_side_ml.upper(), is_closing_order=True)
+
+    if not sl_ord_ml: print(f"{log_prefix_task} CRITICAL: SL order FAILED. Err: {sl_err_ml}")
+    if not tp_ord_ml: print(f"{log_prefix_task} WARNING: TP order FAILED. Err: {tp_err_ml}")
+
+    with active_trades_lock:
+        active_trades[symbol] = {
+            "entry_order_id": entry_order_obj_ml['orderId'],
+            "sl_order_id": sl_ord_ml.get('orderId') if sl_ord_ml else None,
+            "tp_order_id": tp_ord_ml.get('orderId') if tp_ord_ml else None,
+            "entry_price": actual_filled_price_ml,
+            "current_sl_price": final_sl_price_ml, "initial_sl_price": final_sl_price_ml,
+            "current_tp_price": final_tp_price_ml, "initial_tp_price": final_tp_price_ml,
+            "quantity": qty_to_order, "side": potential_trade_side_ml.upper(),
+            "symbol_info": s_info, "open_timestamp": pd.Timestamp.now(tz='UTC'),
+            "strategy_type": "ADV_FIB_ML", "sl_management_stage": "initial",
+            "p_swing_at_entry": p_swing_final, "p_profit_at_entry": p_profit_final
+        }
+    print(f"{log_prefix_task} Trade for {symbol} (AdvFibML) added to active_trades.")
+    
+    if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+        ml_trade_msg_live = (
+            f"🚀 ML TRADE PLACED (AdvFibML) 🚀\n\n"
+            f"Symbol: {symbol}\nSide: {potential_trade_side_ml.upper()}\nQty: {qty_to_order:.{q_prec}f}\n"
+            f"Entry: {actual_filled_price_ml:.{p_prec}f}\nSL: {final_sl_price_ml:.{p_prec}f}\nTP: {final_tp_price_ml:.{p_prec}f}\n"
+            f"P_swing: {p_swing_final:.2f}, P_profit: {p_profit_final:.2f}\nEff. Risk: {effective_risk_pct*100:.2f}%"
+        )
+        send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], ml_trade_msg_live)
+
+    return f"{symbol}: AdvFibML Trade Placed"
+
+
+# --- ICT Strategy Core Components ---
 def process_symbol_adv_fib_ml_task(symbol, client, configs, lock): # lock is active_trades_lock
     """
     Processes a symbol using the Advanced Fibonacci ML strategy.
@@ -10442,13 +10889,8 @@ def main_bot_logic(): # Renamed main to main_bot_logic
     if configs.get("strategy_choice") == "adv_fib_ml":
         print("Loading ML models for Advanced Fibonacci ML strategy...")
         try:
-            # These imports are specific to loading models and potentially feature calculation from app.py
-            from app import load_model as app_load_model
-            # If app.py also defines feature names or other constants needed:
-            # from app import PIVOT_FEATURE_NAMES as APP_PIVOT_FEATURES
-            # from app import ENTRY_FEATURE_NAMES_BASE as APP_ENTRY_FEATURES_BASE
-            # from app import ATR_PERIOD as APP_ATR_PERIOD # To ensure consistency
-            # For now, assume feature names will be handled by being saved with model_params.json or hardcoded consistently.
+            import joblib # For loading .joblib files
+            import json   # For loading .json files
 
             global pivot_model, entry_model, model_best_params
             global PIVOT_FEATURE_NAMES, ENTRY_FEATURE_NAMES_BASE, MODEL_ATR_PERIOD
