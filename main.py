@@ -138,6 +138,7 @@ FIB_ORDER_STATUS_CANCELLED = 'cancelled'
 FIB_ORDER_STATUS_REJECTED_RSI = 'rejected_rsi'
 FIB_ORDER_STATUS_SIGNALLED = 'signalled' # For signal mode
 FIB_ORDER_STATUS_EXECUTION_FAILED = 'execution_failed'
+FIB_ORDER_STATUS_CANCELLED_1M_BREACH = 'cancelled_1m_breach' # New status for 1-min candle breach
 # --- End Global State for Pending Fibonacci Limit Orders ---
 
 active_trades = {}
@@ -7272,6 +7273,48 @@ def attempt_direct_adv_fib_execution(client, configs, opportunity_details: dict,
         return
 
     p_prec = int(s_info.get('pricePrecision', configs.get("price_precision_default", 2)))
+    q_prec = int(s_info['quantityPrecision'])
+
+    # --- 1-Minute Candle Breach Check ---
+    # This check is performed before any market order placement.
+    # It needs the latest 1-minute kline.
+    # The `df_15m_for_atr` is for ATR calculation. We need a separate 1m kline fetch here.
+    
+    print(f"{log_prefix} Performing 1-minute candle breach check for entry price {original_limit_entry:.{p_prec}f}...")
+    latest_1m_kline_df, err_1m = get_historical_klines_1m(client, symbol, limit=1) # Fetch only the very last 1m candle
+
+    if err_1m or latest_1m_kline_df.empty:
+        print(f"{log_prefix} Could not fetch latest 1-minute kline for breach check. Error: {err_1m}. Proceeding with caution (no breach check).")
+        # Optionally, decide if this is critical enough to halt execution. For now, proceeding.
+    else:
+        last_1m_candle = latest_1m_kline_df.iloc[-1]
+        breached_1m = False
+        if side == "long" and last_1m_candle['high'] > original_limit_entry:
+            breached_1m = True
+            reason_1m_breach = f"1m candle high ({last_1m_candle['high']:.{p_prec}f}) breached entry ({original_limit_entry:.{p_prec}f})."
+        elif side == "short" and last_1m_candle['low'] < original_limit_entry:
+            breached_1m = True
+            reason_1m_breach = f"1m candle low ({last_1m_candle['low']:.{p_prec}f}) breached entry ({original_limit_entry:.{p_prec}f})."
+
+        if breached_1m:
+            print(f"{log_prefix} TRADE INVALIDATED: {reason_1m_breach}")
+            if execution_type == "pending_limit": # Only update status for actual pending orders
+                update_pending_fib_order_status(triggered_order_details['order_id'], FIB_ORDER_STATUS_CANCELLED_1M_BREACH, reason_1m_breach)
+            
+            # Send Telegram notification
+            if configs.get("telegram_bot_token") and configs.get("telegram_chat_id"):
+                message = (
+                    f"❌ *AdvFib Trade Cancelled (1-Min Breach)*\n\n"
+                    f"Symbol: `{symbol}`\nSide: `{side.upper()}`\n"
+                    f"Original Limit: `{original_limit_entry:.{p_prec}f}`\n"
+                    f"Reason: _{escape_markdown_v1(reason_1m_breach)}_\n"
+                    f"Order ID (Bot Internal): `{triggered_order_details['order_id']}`"
+                )
+                send_telegram_message(configs["telegram_bot_token"], configs["telegram_chat_id"], message)
+            return # Do not proceed with trade execution
+    # --- End 1-Minute Candle Breach Check ---
+
+    p_prec = int(s_info.get('pricePrecision', configs.get("price_precision_default", 2)))
     
     current_market_price = get_current_market_price(client, symbol)
     if current_market_price is None:
@@ -10494,7 +10537,7 @@ def execute_triggered_fib_order(client, configs, triggered_order_details: dict, 
     leg_swing_low = triggered_order_details['swing_low_of_leg']
     leg_swing_high = triggered_order_details['swing_high_of_leg']
 
-    log_prefix = f"[{symbol} FibExec ID:{triggered_order_details['order_id']} Type:{execution_type}]" # Added execution_type
+    log_prefix = f"[{symbol} FibExec ID:{triggered_order_details['order_id']} Type:{execution_type}]"
     print(f"{log_prefix} Executing {side.upper()} trade. Original Limit Target: {original_limit_entry}, Effective Market Entry: {effective_entry_price}")
 
     s_info = get_symbol_info(client, symbol)
