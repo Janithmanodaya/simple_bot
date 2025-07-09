@@ -215,6 +215,150 @@ def get_historical_bars(symbol, interval, start_str, end_str=None):
     df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
     return df
 
+
+def get_or_download_historical_data(symbol: str, interval: str, 
+                                    start_date_str: str, end_date_str: str = None,
+                                    data_directory: str = "historical_data", 
+                                    force_redownload_all: bool = False) -> pd.DataFrame:
+    """
+    Manages fetching historical kline data for a symbol.
+    - Loads existing data from a Parquet file if available.
+    - Downloads new data since the last record or full data if no existing file/force_redownload_all.
+    - Appends new data to existing data and saves the combined data back to Parquet.
+
+    Args:
+        symbol (str): Trading symbol (e.g., "BTCUSDT").
+        interval (str): Kline interval (e.g., Client.KLINE_INTERVAL_15MINUTE).
+        start_date_str (str): The overall start date for data fetching if no existing data.
+        end_date_str (str, optional): The overall end date. Defaults to None (fetch up to current).
+        data_directory (str, optional): Directory to store/load Parquet files. Defaults to "historical_data".
+        force_redownload_all (bool, optional): If True, ignore existing file and redownload all data.
+
+    Returns:
+        pd.DataFrame: DataFrame containing the historical klines.
+    """
+    os.makedirs(data_directory, exist_ok=True)
+    # Sanitize interval string for filename (e.g. "15m" from "15minute")
+    # This is a basic sanitization; might need adjustment based on actual interval string formats
+    safe_interval_str = interval.replace(" ", "").lower()
+    if "minute" in safe_interval_str: safe_interval_str = safe_interval_str.replace("minute", "m")
+    elif "hour" in safe_interval_str: safe_interval_str = safe_interval_str.replace("hour", "h")
+    elif "day" in safe_interval_str: safe_interval_str = safe_interval_str.replace("day", "d")
+    
+    file_path = os.path.join(data_directory, f"{symbol}_{safe_interval_str}_data.parquet")
+
+    existing_df = None
+    last_timestamp_ms = None
+
+    if os.path.exists(file_path) and not force_redownload_all:
+        print(f"Loading existing data for {symbol} from {file_path}...")
+        try:
+            existing_df = pd.read_parquet(file_path)
+            if not existing_df.empty and 'timestamp' in existing_df.columns:
+                # Ensure timestamp is datetime and sorted
+                existing_df['timestamp'] = pd.to_datetime(existing_df['timestamp'])
+                existing_df.sort_values('timestamp', inplace=True)
+                existing_df.drop_duplicates(subset=['timestamp'], keep='last', inplace=True) # Deduplicate just in case
+                
+                # Get the last timestamp in milliseconds for Binance API
+                last_timestamp_dt = existing_df['timestamp'].iloc[-1]
+                last_timestamp_ms = int(last_timestamp_dt.timestamp() * 1000)
+                print(f"Last record in existing data: {last_timestamp_dt}")
+                
+                # New start date for download is 1 millisecond after the last record's timestamp
+                # Binance API `startTime` is inclusive, so we need to fetch from the next interval.
+                # To be safe, we'll fetch from the start of the interval *containing* last_timestamp_ms + 1.
+                # Or simply, last_timestamp_ms + 1 should fetch the next kline.
+                effective_start_str_for_new_data = str(last_timestamp_ms + 1) # Binance uses ms timestamp string
+            else:
+                print(f"Existing file {file_path} is empty or missing 'timestamp' column. Will perform a full download.")
+                existing_df = None # Treat as no existing data
+        except Exception as e:
+            print(f"Error loading or processing existing Parquet file {file_path}: {e}. Will attempt full redownload.")
+            existing_df = None
+            # Optionally, delete or move the corrupted file here
+            # os.remove(file_path) 
+    else:
+        print(f"No existing data file found at {file_path} (or force_redownload_all=True). Performing full download.")
+
+    if existing_df is None or force_redownload_all: # Full download needed
+        print(f"Fetching full historical data for {symbol} from {start_date_str} to {end_date_str or 'latest'}...")
+        # `get_historical_bars` is the original function to fetch from Binance
+        # It needs the global app_binance_client to be initialized.
+        # Ensure client initialization if running this part standalone or early.
+        global app_binance_client
+        if app_binance_client is None:
+            print("Warning (get_or_download_historical_data): app_binance_client not initialized. Attempting default init.")
+            if not initialize_app_binance_client(): # Default env
+                 print("CRITICAL: Failed to initialize Binance client in get_or_download. Cannot download.")
+                 return pd.DataFrame() # Return empty if client fails
+
+        downloaded_df = get_historical_bars(symbol, interval, start_date_str, end_str=end_date_str)
+        if downloaded_df.empty:
+            print(f"No data downloaded for {symbol} (full download attempt).")
+            return pd.DataFrame()
+        
+        # Sort and deduplicate, just in case API returns unsorted/duplicate data (though unlikely for historical)
+        downloaded_df.sort_values('timestamp', inplace=True)
+        downloaded_df.drop_duplicates(subset=['timestamp'], keep='last', inplace=True)
+        
+        try:
+            downloaded_df.to_parquet(file_path, index=False)
+            print(f"Full data saved to {file_path}")
+        except Exception as e:
+            print(f"Error saving full data to Parquet {file_path}: {e}")
+        return downloaded_df
+
+    else: # We have existing_df, try to download new data
+        if last_timestamp_ms is None: # Should not happen if existing_df is not None and processed correctly
+            print("Error: last_timestamp_ms is None despite having existing_df. Aborting update.")
+            return existing_df # Return existing data as is
+
+        print(f"Fetching new data for {symbol} since {pd.to_datetime(last_timestamp_ms, unit='ms')} (exclusive)...")
+        
+        # Ensure client is available
+        global app_binance_client
+        if app_binance_client is None:
+            print("Warning (get_or_download_historical_data - update): app_binance_client not initialized. Attempting default init.")
+            if not initialize_app_binance_client():
+                 print("CRITICAL: Failed to initialize Binance client in get_or_download (update). Cannot download new data.")
+                 return existing_df # Return existing data as is
+        
+        # Fetch new klines. Start time is the millisecond AFTER the last recorded kline's open time.
+        # get_historical_klines start_str is inclusive.
+        new_data_df = get_historical_bars(symbol, interval, 
+                                          start_str=str(last_timestamp_ms + 1), # Fetch data starting from the ms after the last record
+                                          end_str=end_date_str)
+
+        if not new_data_df.empty:
+            print(f"Downloaded {len(new_data_df)} new bars for {symbol}.")
+            new_data_df.sort_values('timestamp', inplace=True)
+            new_data_df.drop_duplicates(subset=['timestamp'], keep='last', inplace=True)
+
+            # Combine with existing data
+            combined_df = pd.concat([existing_df, new_data_df], ignore_index=True)
+            # Sort again and remove duplicates across the combined boundary
+            combined_df.sort_values('timestamp', inplace=True)
+            combined_df.drop_duplicates(subset=['timestamp'], keep='last', inplace=True)
+            
+            try:
+                combined_df.to_parquet(file_path, index=False)
+                print(f"Appended new data and saved to {file_path}")
+            except Exception as e:
+                print(f"Error saving appended data to Parquet {file_path}: {e}")
+            
+            # Filter final combined_df to respect original overall start_date_str if needed
+            # This ensures that even if the file contained older data, the returned df respects start_date_str
+            overall_start_dt = pd.to_datetime(start_date_str)
+            combined_df = combined_df[combined_df['timestamp'] >= overall_start_dt]
+            return combined_df
+        else:
+            print(f"No new data found for {symbol} since last record.")
+            # Filter existing_df to respect original overall start_date_str
+            overall_start_dt = pd.to_datetime(start_date_str)
+            existing_df = existing_df[existing_df['timestamp'] >= overall_start_dt]
+            return existing_df
+
 # --- Configuration Management for App Trading ---
 def load_app_trading_configs(filepath=APP_TRADE_CONFIG_FILE):
     """
@@ -1256,21 +1400,29 @@ def simulate_fib_entries(df, atr_col_name): # Added atr_col_name
     df['tp2_price_sim'] = np.nan
     df['tp3_price_sim'] = np.nan
 
+    # --- Parameters for Time Exit ---
+    # Default max_holding_bars, can be made a parameter of simulate_fib_entries if needed for tuning
+    MAX_HOLDING_BARS_DEFAULT = 75 # Example: approx 3 days on 15min chart if continuous trading
+                                  # This should ideally be passed as an argument or tuned.
+
     # Ensure the dynamic ATR column (atr_col_name) is present.
-    # The caller (objective_optuna or get_processed_data_for_symbol) is responsible for ensuring
-    # df contains an ATR column that corresponds to the atr_period used in this context.
     if atr_col_name not in df.columns:
         print(f"Error (simulate_fib_entries): Required ATR column '{atr_col_name}' not found in DataFrame. Cannot simulate entries.")
-        # Fallback or error: If an atr_period was also passed, could calculate it.
-        # For now, returning df as is, which means 'trade_outcome' will remain -1.
         return df
 
     pivots = df[(df['is_swing_high'] == 1) | (df['is_swing_low'] == 1)].copy()
 
     for i, pivot_row in pivots.iterrows():
         # Use the dynamic atr_col_name
-        atr_at_pivot = df.loc[i, atr_col_name]
-        if pd.isna(atr_at_pivot): # If ATR is NaN for this pivot, cannot reliably set SL
+        atr_at_pivot = df.loc[i, atr_col_name] # ATR at the time of the pivot/signal
+        if pd.isna(atr_at_pivot) or atr_at_pivot == 0: # If ATR is NaN or zero, cannot reliably set SL or Fib levels based on it for some strategies.
+            # Depending on how Fib levels are defined (e.g. if they use ATR), this might be an issue.
+            # For SL based on ATR, it's definitely an issue.
+            # For now, we'll allow it to proceed if Fibs are purely price-based, but SL might be problematic.
+            # If SL is critical for the simulation logic here, then 'continue' might be appropriate.
+            # The current SL logic `pivot_price - atr_at_pivot` requires a valid ATR.
+            print(f"Warning (simulate_fib_entries): ATR is NaN or zero at index {i} for pivot. SL calculation might be invalid. Skipping simulation for this pivot.")
+            df.loc[i, 'trade_outcome'] = -1 # Mark as no trade due to bad ATR
             continue
 
         pivot_price = 0
@@ -1546,29 +1698,33 @@ def train_pivot_model(X_train, y_train, X_val, y_val, model_type='lgbm',
 
 def train_entry_model(X_train, y_train, X_val, y_val, model_type='lgbm'):
     """Trains entry profitability model."""
-    # Target: binary (profit > 1R vs not) or multiclass (TP1/TP2/TP3/loss)
-    # For this example, let's use multiclass trade_outcome (0,1,2,3)
-    # We might want to transform this to binary: profitable (1,2,3) vs loss (0)
-    y_train_binary = (y_train > 0).astype(int)
-    y_val_binary = (y_val > 0).astype(int)
+    # Target: multiclass (trade_outcome: 0=SL, 1=TP1, 2=TP2, 3=TP3, potentially 4=Time Exit)
+    # y_train is now expected to be the raw multiclass labels.
 
     if model_type == 'lgbm':
         model = lgb.LGBMClassifier(num_leaves=31, learning_rate=0.05, class_weight='balanced', random_state=42)
-        model.fit(X_train, y_train_binary, eval_set=[(X_val, y_val_binary)], callbacks=[early_stopping(stopping_rounds=10, verbose=-1)])
+        # Fit with the original multiclass y_train and y_val
+        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[early_stopping(stopping_rounds=10, verbose=-1)])
     elif model_type == 'rf':
         model = RandomForestClassifier(n_estimators=100, max_depth=7, class_weight='balanced', random_state=42)
-        model.fit(X_train, y_train_binary)
+        # Fit with the original multiclass y_train
+        model.fit(X_train, y_train)
     # TODO: Add MLP option
     else:
         raise ValueError("Unsupported model type for entry evaluation.")
 
-    # Evaluate (example for binary profitable vs not)
-    preds_val = model.predict(X_val)
-    precision = precision_score(y_val_binary, preds_val, zero_division=0)
-    recall = recall_score(y_val_binary, preds_val, zero_division=0)
-    print(f"Entry Model ({model_type}) Validation (Binary Profitable):")
-    print(f"  Precision: {precision:.3f}, Recall: {recall:.3f}")
-    # print(confusion_matrix(y_val_binary, preds_val))
+    # Evaluation will need to be updated for multiclass if detailed metrics per class are needed.
+    # For now, the primary change is training with multiclass labels.
+    # Example of evaluating for one class (e.g., profitable, if we define that for multiclass)
+    # preds_val = model.predict(X_val)
+    # Example: precision for class 1 (TP1)
+    # precision_tp1 = precision_score(y_val, preds_val, labels=[1], average='micro', zero_division=0) 
+    # recall_tp1 = recall_score(y_val, preds_val, labels=[1], average='micro', zero_division=0)
+    # print(f"Entry Model ({model_type}) Validation (Example for TP1 - Class 1):")
+    # print(f"  Precision (TP1): {precision_tp1:.3f}, Recall (TP1): {recall_tp1:.3f}")
+    # print(f"Entry Model ({model_type}) trained with multiclass labels.")
+    # from sklearn.metrics import classification_report
+    # print(classification_report(y_val, preds_val)) # This would give a full multiclass report
     return model
 
 
@@ -1647,40 +1803,48 @@ def objective_optuna(trial, df_processed, pivot_features, entry_features_base):
     # This ensures the entry model learns from reasonably good pivot candidates.
     entry_train_candidates = df_train[
         (df_train['pivot_label'].isin([1, 2])) & # Is an actual pivot
-        (df_train['trade_outcome'] != -1) &      # Trade was simulated
+        (df_train['trade_outcome'] != -1) &      # Trade was simulated (outcome is not -1)
         (df_train['P_swing'] >= p_swing_threshold) # Pivot model would have picked it
     ].copy()
-
 
     if len(entry_train_candidates) < 50: # Not enough samples to train entry model
         return -1.0 # Bad score if no trades
 
     # Add specific entry features for these candidates
-    entry_train_candidates['norm_dist_entry_pivot'] = (entry_train_candidates['entry_price_sim'] - entry_train_candidates.apply(lambda r: r['low'] if r['is_swing_low'] else r['high'], axis=1)) / entry_train_candidates[atr_col_name_optuna]
+    # Ensure 'is_swing_low' is correctly referenced (e.g., from pivot_label or a dedicated column if exists)
+    # Assuming 'pivot_label' 1 is high, 2 is low.
+    entry_train_candidates['norm_dist_entry_pivot'] = (entry_train_candidates['entry_price_sim'] - entry_train_candidates.apply(lambda r: r['low'] if r['pivot_label'] == 2 else r['high'], axis=1)) / entry_train_candidates[atr_col_name_optuna]
     entry_train_candidates['norm_dist_entry_sl'] = (entry_train_candidates['entry_price_sim'] - entry_train_candidates['sl_price_sim']).abs() / entry_train_candidates[atr_col_name_optuna]
+    
+    # Construct the full list of entry features for this trial
+    # trial_entry_features_base was passed into objective_optuna or derived within it
+    current_trial_full_entry_features = trial_entry_features_base + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']
 
+    X_entry_train = entry_train_candidates[current_trial_full_entry_features].fillna(-1)
+    y_entry_train = entry_train_candidates['trade_outcome'].astype(int) # Use direct multiclass trade_outcome
 
-    X_entry_train = entry_train_candidates[entry_features_base + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']].fillna(-1)
-    y_entry_train = (entry_train_candidates['trade_outcome'] > 0).astype(int) # Binary profitable
-
-    if len(X_entry_train['P_swing'].unique()) < 2 or len(y_entry_train.unique()) < 2 : # Check for variance
+    # Ensure y_entry_train has more than one class for stratification and meaningful training
+    if len(X_entry_train) < 20 or len(y_entry_train.unique()) < 2 : # Check for variance and minimum samples
+        print(f"Optuna: Insufficient data or variance for entry model training. Samples: {len(X_entry_train)}, Unique outcomes: {y_entry_train.unique()}")
         return -1.0
 
 
-    # Train Entry Model
+    # Train Entry Model (Multiclass)
     if entry_model_type == 'lgbm':
         entry_model = lgb.LGBMClassifier(num_leaves=entry_num_leaves, learning_rate=entry_learning_rate,
-                                         max_depth=entry_max_depth, class_weight='balanced', random_state=42, n_estimators=100)
-        # Need a small val set for early stopping if used, from entry_train_candidates
-        if len(entry_train_candidates) > 20:
-             X_entry_train_sub, X_entry_val_sub, y_entry_train_sub, y_entry_val_sub = train_test_split(X_entry_train, y_entry_train, test_size=0.2, stratify=y_entry_train if len(y_entry_train.unique()) > 1 else None, random_state=42)
-             if len(X_entry_val_sub) > 0 and len(y_entry_val_sub.unique()) > 1:
-                entry_model.fit(X_entry_train_sub, y_entry_train_sub, eval_set=[(X_entry_val_sub, y_entry_val_sub)], callbacks=[early_stopping(stopping_rounds=5, verbose=-1)])
-             else:
-                entry_model.fit(X_entry_train, y_entry_train) # No early stopping
-        else:
+                                         max_depth=entry_max_depth, class_weight='balanced', random_state=42, n_estimators=100, verbosity=-1)
+        if len(entry_train_candidates) > 20: # Ensure enough data for a split
+             # Stratify by y_entry_train if it has multiple classes
+             stratify_opt = y_entry_train if len(y_entry_train.unique()) > 1 else None
+             X_entry_train_sub, X_entry_val_sub, y_entry_train_sub, y_entry_val_sub = train_test_split(
+                 X_entry_train, y_entry_train, test_size=0.2, stratify=stratify_opt, random_state=42
+             )
+             if len(X_entry_val_sub) > 0 and len(y_entry_val_sub.unique()) > 1: # Check if val subset is valid
+                entry_model.fit(X_entry_train_sub, y_entry_train_sub, eval_set=[(X_entry_val_sub, y_entry_val_sub)], callbacks=[early_stopping(stopping_rounds=5, verbose=False)])
+             else: # Not enough for a valid validation set for early stopping
+                entry_model.fit(X_entry_train, y_entry_train) 
+        else: # Too few samples overall for a split
             entry_model.fit(X_entry_train, y_entry_train)
-
     else: # rf
         entry_model = RandomForestClassifier(n_estimators=100, max_depth=entry_max_depth, class_weight='balanced', random_state=42)
         entry_model.fit(X_entry_train, y_entry_train)
@@ -1689,24 +1853,44 @@ def objective_optuna(trial, df_processed, pivot_features, entry_features_base):
     # --- Mini Backtest on df_val ---
     # 1. Identify pivots in df_val using the trained pivot_model and p_swing_threshold
     potential_pivots_val = df_val[df_val['P_swing'] >= p_swing_threshold].copy()
-    potential_pivots_val = potential_pivots_val[potential_pivots_val['trade_outcome'] != -1] # Ensure these are rows where a trade could happen
+    # Ensure these are rows where a trade could happen (valid simulated outcome, not -1)
+    potential_pivots_val = potential_pivots_val[potential_pivots_val['trade_outcome'] != -1] 
 
     if len(potential_pivots_val) == 0:
         return -0.5 # No trades triggered by pivot model
 
     # 2. For these pivots, compute entry features (including the P_swing from pivot_model)
-    potential_pivots_val['norm_dist_entry_pivot'] = (potential_pivots_val['entry_price_sim'] - potential_pivots_val.apply(lambda r: r['low'] if r['is_swing_low'] else r['high'], axis=1)) / potential_pivots_val[atr_col_name_optuna]
+    # Assuming 'is_swing_low' column exists and is 1 for low pivots, 0 otherwise.
+    # If not, derive from 'pivot_label' (1 for high, 2 for low)
+    # For this example, let's assume predicted_pivot_class from pivot model is available on df_val
+    # If not, we might need to predict it first if it's different from df_val['pivot_label']
+    # For simplicity, using actual pivot_label for norm_dist for now.
+    # This should ideally use the *predicted* class from the pivot model if available and reliable.
+    potential_pivots_val['norm_dist_entry_pivot'] = (potential_pivots_val['entry_price_sim'] - potential_pivots_val.apply(lambda r: r['low'] if r['pivot_label'] == 2 else r['high'], axis=1)) / potential_pivots_val[atr_col_name_optuna]
     potential_pivots_val['norm_dist_entry_sl'] = (potential_pivots_val['entry_price_sim'] - potential_pivots_val['sl_price_sim']).abs() / potential_pivots_val[atr_col_name_optuna]
 
-    X_entry_eval = potential_pivots_val[entry_features_base + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']].fillna(-1)
+    X_entry_eval = potential_pivots_val[current_trial_full_entry_features].fillna(-1)
 
     if len(X_entry_eval) == 0: return -0.5
 
-    # 3. Predict P_profit using the trained entry_model
-    p_profit_val = entry_model.predict_proba(X_entry_eval)[:, 1] # Probability of class 1 (profitable)
+    # 3. Predict multiclass probabilities using the trained entry_model
+    p_all_classes_val = entry_model.predict_proba(X_entry_eval) # Shape: (num_samples, num_classes)
 
-    # 4. Filter trades based on profit_threshold
-    final_trades_val = potential_pivots_val[p_profit_val >= profit_threshold]
+    # 4. Calculate Expected R
+    # R-values: Class 0 (SL): -1R, Class 1 (TP1): +1R, Class 2 (TP2): +2R, Class 3 (TP3): +3R
+    # Class 4 (Time Exit) might be added later with its own R-value (e.g., 0R)
+    r_values_by_class = [-1, 1, 2, 3] # R-value for class 0, 1, 2, 3
+    num_predicted_classes = p_all_classes_val.shape[1]
+    
+    expected_r_val = np.zeros(p_all_classes_val.shape[0])
+    for k_class_idx in range(num_predicted_classes):
+        if k_class_idx < len(r_values_by_class):
+            expected_r_val += p_all_classes_val[:, k_class_idx] * r_values_by_class[k_class_idx]
+        # else: a class was predicted for which we don't have an R-value (e.g. if model predicts class 4 but r_values_by_class isn't updated)
+
+    # 5. Filter trades based on expected_r_val and profit_threshold (now an Expected R threshold)
+    # profit_threshold is the Optuna hyperparameter, now used for Expected R
+    final_trades_val = potential_pivots_val[expected_r_val > profit_threshold]
 
     if len(final_trades_val) == 0:
         return 0.0 # No trades made it through the full pipeline
@@ -2069,24 +2253,40 @@ def full_backtest(df_processed, pivot_model, entry_model, best_params, pivot_fea
         return None, None, None, None
 
     # 3. Entry Features for these pivots
+    # Ensure 'predicted_pivot_class' (from pivot_model) is used for pivot direction if available.
+    # 'entry_features_base' should be the list of feature names determined when models were finalized.
     potential_pivots_test['norm_dist_entry_pivot'] = (potential_pivots_test['entry_price_sim'] - potential_pivots_test.apply(lambda r: r['low'] if r['predicted_pivot_class'] == 2 else r['high'], axis=1)) / potential_pivots_test[atr_col_name_backtest]
     potential_pivots_test['norm_dist_entry_sl'] = (potential_pivots_test['entry_price_sim'] - potential_pivots_test['sl_price_sim']).abs() / potential_pivots_test[atr_col_name_backtest]
 
-    X_entry_test = potential_pivots_test[entry_features_base + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']].fillna(-1)
+    # Construct the full list of entry features for the backtest
+    backtest_full_entry_features = entry_features_base + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']
+    X_entry_test = potential_pivots_test[backtest_full_entry_features].fillna(-1)
 
     if len(X_entry_test) == 0:
         print("No data for entry model evaluation in test set after feature engineering.")
-        return None, None, None, None
+        return 0, 0, 0, 0 # Return zero for metrics
 
-    # 4. Entry Predictions
-    p_profit_test = entry_model.predict_proba(X_entry_test)[:, 1] # Prob of being profitable
+    # 4. Entry Predictions (Multiclass Probabilities)
+    p_all_classes_test = entry_model.predict_proba(X_entry_test) # Shape: (num_samples, num_classes)
 
-    # 5. Filter by P_profit threshold
-    profit_threshold = best_params['profit_threshold']
-    final_trades_test = potential_pivots_test[p_profit_test >= profit_threshold].copy()
+    # 5. Calculate Expected R for test set
+    # R-values: Class 0 (SL): -1R, Class 1 (TP1): +1R, Class 2 (TP2): +2R, Class 3 (TP3): +3R
+    # (Potentially Class 4 for Time Exit later)
+    r_values_by_class_backtest = [-1, 1, 2, 3] # R-value for class 0, 1, 2, 3
+    num_predicted_classes_test = p_all_classes_test.shape[1]
+    
+    expected_r_test = np.zeros(p_all_classes_test.shape[0])
+    for k_class_idx_test in range(num_predicted_classes_test):
+        if k_class_idx_test < len(r_values_by_class_backtest):
+            expected_r_test += p_all_classes_test[:, k_class_idx_test] * r_values_by_class_backtest[k_class_idx_test]
+        # else: handle classes beyond defined r_values if necessary
+
+    # 6. Filter by Expected R threshold (using 'profit_threshold' from best_params, now an ER threshold)
+    expected_r_threshold_backtest = best_params.get('profit_threshold', 0.4) # Default if not in best_params
+    final_trades_test = potential_pivots_test[expected_r_test >= expected_r_threshold_backtest].copy() # Use >= to include threshold
 
     if len(final_trades_test) == 0:
-        print("No trades passed P_profit threshold in test set.")
+        print(f"No trades passed Expected R threshold ({expected_r_threshold_backtest:.2f}) in test set.")
         return 0, 0, 0, 0 # Trades, Win Rate, Avg R, Profit Factor
 
     # 6. Calculate Metrics
@@ -2323,28 +2523,46 @@ def get_processed_data_for_symbol(symbol_ticker, kline_interval, start_date, end
     Returns a processed DataFrame, pivot feature names, and entry feature names.
     """
     print(f"\n--- Initial Data Processing for Symbol: {symbol_ticker} ---")
-    # 1. Data Collection
-    print(f"Fetching historical data for {symbol_ticker}...")
+    # 1. Data Collection using the new function
+    print(f"Getting/Downloading historical data for {symbol_ticker}...")
     try:
-        historical_df = get_historical_bars(symbol_ticker, kline_interval, start_date, end_date)
+        # Initialize Binance client if not already done (e.g. if main script part is not run first)
+        global app_binance_client
+        if app_binance_client is None:
+            # Load trading configs which also loads API keys and initializes client
+            # This ensures client is ready for get_or_download_historical_data
+            load_app_trading_configs() # Loads default "app_trade_config.csv"
+            if not initialize_app_binance_client(env=app_trading_configs.get("app_trading_environment", "mainnet")):
+                print(f"CRITICAL: Failed to initialize Binance client for {symbol_ticker} data processing. Skipping.")
+                return None, None, None
+        
+        historical_df = get_or_download_historical_data(
+            symbol=symbol_ticker, 
+            interval=kline_interval,
+            start_date_str=start_date, # Overall start date for the dataset
+            end_date_str=end_date,     # Overall end date for the dataset
+            data_directory="historical_data" # Standardized directory
+            # force_redownload_all can be a parameter to main script if needed
+        )
         if historical_df.empty:
-            print(f"No data fetched for {symbol_ticker} (empty DataFrame). Skipping.")
+            print(f"No data obtained for {symbol_ticker} (empty DataFrame). Skipping.")
             return None, None, None
-    except BinanceAPIException as e:
-        print(f"Binance API Exception for {symbol_ticker}: {e}. Skipping symbol.")
+            
+    except BinanceAPIException as e: # These might still be caught if client init fails within get_or_download
+        print(f"Binance API Exception for {symbol_ticker} during data retrieval: {e}. Skipping symbol.")
         return None, None, None
     except BinanceRequestException as e:
-        print(f"Binance Request Exception for {symbol_ticker}: {e}. Skipping symbol.")
+        print(f"Binance Request Exception for {symbol_ticker} during data retrieval: {e}. Skipping symbol.")
         return None, None, None
-    except Exception as e: # Catch any other unforeseen errors during data fetching
-        print(f"An unexpected error occurred fetching data for {symbol_ticker}: {e}. Skipping symbol.")
+    except Exception as e: 
+        print(f"An unexpected error occurred getting/downloading data for {symbol_ticker}: {e}. Skipping symbol.")
         import traceback
         traceback.print_exc()
         return None, None, None
 
-    print(f"Data fetched for {symbol_ticker}: {len(historical_df)} bars")
+    print(f"Data obtained for {symbol_ticker}: {len(historical_df)} bars")
     if 'timestamp' not in historical_df.columns:
-         historical_df.reset_index(inplace=True)
+         historical_df.reset_index(inplace=True) # Should not be needed if get_or_download returns consistent format
     if 'timestamp' not in historical_df.columns and 'index' in historical_df.columns and pd.api.types.is_datetime64_any_dtype(historical_df['index']):
         historical_df.rename(columns={'index':'timestamp'}, inplace=True)
     
@@ -2542,9 +2760,9 @@ if __name__ == '__main__':
             # Use final_entry_features_base from the re-processing step
             current_final_full_entry_features = final_entry_features_base + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']
             X_e_universal_train = entry_universal_train_candidates[current_final_full_entry_features].fillna(-1)
-            y_e_universal_train = (entry_universal_train_candidates['trade_outcome'] > 0).astype(int)
+            y_e_universal_train = entry_universal_train_candidates['trade_outcome'].astype(int) # Use direct multiclass trade_outcome
 
-        if len(X_e_universal_train) > 0 and len(y_e_universal_train.unique()) > 1:
+        if len(X_e_universal_train) > 0 and len(y_e_universal_train.unique()) > 1: # Ensure there's data and multiple classes for training
             if best_hyperparams['entry_model_type'] == 'lgbm':
                 universal_entry_model = lgb.LGBMClassifier(
                     num_leaves=best_hyperparams['entry_num_leaves'],
