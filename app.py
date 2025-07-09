@@ -2447,6 +2447,8 @@ if __name__ == '__main__':
     # dynamically generated or determined by process_dataframe_with_params using best_hyperparams.
     # The variable static_base_entry_features_for_final is removed.
 
+    universal_train_df = universal_df_initial_processed.copy() # Define universal_train_df
+
     # 4. Optuna Hyperparameter Tuning for Universal Model
     print("Running Optuna for universal model...")
     try:
@@ -2474,9 +2476,25 @@ if __name__ == '__main__':
     # So, we can use the full universal_train_df for training the final model.
     print("Training universal final models...")
 
+    # Re-process the universal_train_df with the best hyperparameters
+    print(f"Re-processing universal training data with best_hyperparams: {best_hyperparams}")
+    df_final_processed_for_training, final_pivot_features, final_entry_features_base = process_dataframe_with_params(
+        universal_train_df.copy(), # Pass the initially processed universal data
+        best_hyperparams,
+        static_entry_features_base_list_arg=processed_entry_feature_names_base # Use base features from initial processing
+    )
+
+    if df_final_processed_for_training is None or df_final_processed_for_training.empty:
+        print("CRITICAL: Failed to re-process universal training data with best_hyperparams or data became empty. Exiting.")
+        exit()
+    
+    print(f"Universal training data re-processed: {len(df_final_processed_for_training)} rows. Using {len(final_pivot_features)} pivot features and {len(final_entry_features_base)} base entry features.")
+
+
     # --- Universal Pivot Model ---
-    X_p_universal_train = universal_train_df[processed_pivot_feature_names].fillna(-1)
-    y_p_universal_train = universal_train_df['pivot_label']
+    # Use df_final_processed_for_training and final_pivot_features
+    X_p_universal_train = df_final_processed_for_training[final_pivot_features].fillna(-1)
+    y_p_universal_train = df_final_processed_for_training['pivot_label']
 
     if best_hyperparams['pivot_model_type'] == 'lgbm':
         universal_pivot_model = lgb.LGBMClassifier(
@@ -2559,7 +2577,7 @@ if __name__ == '__main__':
         symbol_test_df_final_processed, symbol_final_pivot_features, symbol_final_entry_features_base = process_dataframe_with_params(
             symbol_test_df_initial_processed.copy(), # Important: use the initial version for reprocessing
             best_hyperparams,
-            static_entry_features_base_list_arg=static_base_entry_features_for_final # from initial processing
+            static_entry_features_base_list_arg=processed_entry_feature_names_base # Corrected: Use defined variable
         )
 
         if symbol_test_df_final_processed is None or symbol_test_df_final_processed.empty:
