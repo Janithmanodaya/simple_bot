@@ -2122,7 +2122,7 @@ def app_process_symbol_for_signal(symbol: str, client, current_app_settings: dic
         print(f"{log_prefix} Error during pivot model prediction: {e}")
         return
 
-    print(f"{log_prefix} Pivot Model Output: P_None={p_none_pivot:.3f}, P_High={p_swing_high:.3f}, P_Low={p_swing_low:.3f} -> P_Swing_Score={p_swing_score_live:.3f} (Threshold: {p_swing_thresh:.2f}), PredictedClass={predicted_pivot_class_live}")
+    print(f"{log_prefix} Pivot Model Output: P_None={p_none_pivot:.3f}, P_High={p_swing_high:.3f}, P_Low={p_swing_low:.3f} -> P_Swing_Score={p_swing_score_live:.3f} (Threshold: {p_swing_thresh_to_use:.2f}), PredictedClass={predicted_pivot_class_live}")
 
     # Detailed log of features fed to pivot model
     if live_pivot_features is not None:
