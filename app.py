@@ -2328,6 +2328,7 @@ def start_app_main_flow():
 
     # 1. Load settings
     load_app_settings() # Loads or prompts for settings and saves them
+    load_app_trading_configs() # Ensure trading configs are populated from app_settings
 
     # 2. Check for ML Models
     models_exist, pivot_model_path, entry_model_path, params_path = check_ml_models_exist()
