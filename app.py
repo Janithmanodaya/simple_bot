@@ -445,7 +445,8 @@ def load_app_settings(filepath=APP_CONFIG_FILE):
         "app_tp_rr_ratio": 1.5,             # R:R ratio for actual trade TP
         "app_symbols_csv_path": "app_symbols.csv", # Default path for symbols CSV
         "app_training_symbols_source_type": "list", # "list" or "csv"
-        "app_training_symbols_list_str": "BTCUSDT,ETHUSDT" # Comma-separated list if source_type is "list"
+        "app_training_symbols_list_str": "BTCUSDT,ETHUSDT", # Comma-separated list if source_type is "list"
+        "app_notify_on_trade": True # New: Toggle for trade/signal execution messages
     }
 
     loaded_json_settings = {}
@@ -899,12 +900,38 @@ def place_app_new_order(symbol_info_app, side, order_type, quantity, price=None,
         print(f"app.py place_order: Order PLACED: {order.get('symbol')} ID {order.get('orderId')} {order.get('positionSide','N/A')} {order.get('side')} {order.get('type')} Qty:{order.get('origQty')} @ {order.get('price','MARKET')} SP:{order.get('stopPrice','N/A')} Status:{order.get('status')}")
         return order, None
     except BinanceAPIException as e_api:
-        error_msg = f"app.py place_order: API Error for {symbol} {side} {quantity} {order_type}: {e_api}"
-        print(error_msg)
-        return None, str(e_api)
+        error_msg_detail = f"API Error: {e_api.status_code} {e_api.message} (Code: {e_api.code})"
+        error_msg_log = f"app.py place_order: {error_msg_detail} for {symbol} {side} {quantity} {order_type}"
+        print(error_msg_log)
+        # Send Telegram notification for trade rejection
+        app_send_trade_rejection_notification(
+            current_app_settings=app_trading_configs, # app_trading_configs should have telegram settings
+            symbol=symbol,
+            signal_type=f"{side} {order_type}", # Construct a signal type string
+            reason=error_msg_detail,
+            entry_price=float(params.get("price")) if params.get("price") else None,
+            sl_price=float(params.get("stopPrice")) if params.get("stopPrice") else None, # Assuming stopPrice could be SL for some orders
+            tp_price=None, # TP is not directly part of this order placement
+            quantity=quantity,
+            symbol_info=symbol_info_app
+        )
+        return None, str(e_api) # Return original full error string as before
     except Exception as e_gen:
-        error_msg = f"app.py place_order: General Error for {symbol} {side} {quantity} {order_type}: {e_gen}"
-        print(error_msg)
+        error_msg_detail = f"General Error: {str(e_gen)}"
+        error_msg_log = f"app.py place_order: {error_msg_detail} for {symbol} {side} {quantity} {order_type}"
+        print(error_msg_log)
+        # Send Telegram notification for trade rejection
+        app_send_trade_rejection_notification(
+            current_app_settings=app_trading_configs,
+            symbol=symbol,
+            signal_type=f"{side} {order_type}",
+            reason=error_msg_detail,
+            entry_price=float(params.get("price")) if params.get("price") else None,
+            sl_price=float(params.get("stopPrice")) if params.get("stopPrice") else None,
+            tp_price=None,
+            quantity=quantity,
+            symbol_info=symbol_info_app
+        )
         return None, str(e_gen)
 
 # --- End Order Placement and Sizing Functions ---
@@ -933,7 +960,8 @@ def execute_app_trade_signal(symbol: str, side: str,
 
     current_operational_mode = app_trading_configs.get("app_operational_mode", "signal")
     log_prefix = f"[AppTradeExec ({current_operational_mode.upper()}) - {symbol}]"
-    print(f"{log_prefix} Received trade signal: {side} {symbol}, Order: {order_type}, Entry Target: {entry_price_target}, SL: {sl_price}, TP1: {tp1_price}")
+    # Enhanced log message for trade signal trigger
+    print(f"{log_prefix} ✅ Trade Signal Triggered & Processing: Side={side}, Symbol={symbol}, OrderType={order_type}, EntryTarget={entry_price_target}, SL={sl_price}, TP1={tp1_price}, TP2={tp2_price}, TP3={tp3_price}")
 
     if app_binance_client is None:
         print(f"{log_prefix} Binance client not initialized. Attempting to initialize...")
@@ -1008,6 +1036,28 @@ def execute_app_trade_signal(symbol: str, side: str,
     # if not app_binance_client.futures_change_leverage(symbol=symbol, leverage=target_leverage): ... error ...
     # For simplicity, this part is omitted for now but is crucial in a full system.
 
+    # --- Handle Signal Mode ---
+    if current_operational_mode == "signal":
+        print(f"{log_prefix} Signal Mode: Generating Telegram notification for {order_type} signal.")
+        send_app_trade_execution_telegram(
+            current_app_settings=app_trading_configs, # Pass app_trading_configs which has telegram settings
+            symbol=symbol,
+            side=side,
+            entry_price=effective_entry_price_for_sizing, # For market, this is current price; for limit, it's target
+            sl_price=sl_price,
+            tp1_price=tp1_price,
+            tp2_price=tp2_price,
+            tp3_price=tp3_price,
+            order_type=order_type.upper(),
+            executed_quantity=quantity, # Pass calculated quantity for info
+            mode="signal"
+        )
+        # In signal mode, after sending the message, we don't proceed to place orders.
+        return True # Indicate signal processed successfully
+
+
+    # --- Live Mode: Place Orders ---
+    print(f"{log_prefix} Live Mode: Proceeding to place orders.")
     entry_order_result, error_msg = place_app_new_order(
         symbol_info_app, api_order_side, order_type.upper(), quantity,
         price=entry_price_target if order_type.upper() == "LIMIT" else None,
@@ -1017,32 +1067,50 @@ def execute_app_trade_signal(symbol: str, side: str,
     if entry_order_result:
         entry_order_id = entry_order_result.get('orderId')
         actual_filled_price = effective_entry_price_for_sizing # Default for LIMIT or if avgPrice not available
-        total_filled_quantity = quantity # Assume full quantity filled for now
+        total_filled_quantity = quantity # Assume full quantity filled for now, will be updated for MARKET fills
+
+        # Send Telegram notification for successful order placement (or attempt)
+        # For MARKET, actual_filled_price and total_filled_quantity will be updated if FILLED
+        # For LIMIT, this sends a "Limit Order Placed" message.
 
         if order_type.upper() == "MARKET" and entry_order_result.get('status') == 'FILLED':
             actual_filled_price = float(entry_order_result.get('avgPrice', effective_entry_price_for_sizing))
             total_filled_quantity = float(entry_order_result.get('executedQty', quantity))
             print(f"{log_prefix} Market Entry order {entry_order_id} FILLED. AvgPrice: {actual_filled_price:.{p_prec}f}, ExecutedQty: {total_filled_quantity}")
+            
+            # Send Telegram for FILLED market order
+            send_app_trade_execution_telegram(
+                current_app_settings=app_trading_configs, symbol=symbol, side=side,
+                entry_price=actual_filled_price, sl_price=sl_price,
+                tp1_price=tp1_price, tp2_price=tp2_price, tp3_price=tp3_price,
+                order_type="MARKET", executed_quantity=total_filled_quantity, mode="live"
+            )
+
         elif order_type.upper() == "LIMIT":
-            print(f"{log_prefix} LIMIT Entry order {entry_order_id} PLACED. Status: {entry_order_result.get('status')}. Waiting for fill to place SL/TP (manual or via monitor).")
-            # For LIMIT orders not immediately filled, SL/TP placement is deferred.
-            # A monitoring function will need to pick this up.
-            # For now, we can store it as pending SL/TP placement.
+            print(f"{log_prefix} LIMIT Entry order {entry_order_id} PLACED. Status: {entry_order_result.get('status')}. Waiting for fill to place SL/TP.")
+            # Send Telegram for PLACED limit order
+            send_app_trade_execution_telegram(
+                current_app_settings=app_trading_configs, symbol=symbol, side=side,
+                entry_price=entry_price_target, # Use the target limit price for the message
+                sl_price=sl_price, tp1_price=tp1_price, tp2_price=tp2_price, tp3_price=tp3_price,
+                order_type="LIMIT", executed_quantity=None, mode="live" # executed_quantity is None as it's not filled yet
+            )
+            # Store for monitoring
             with app_active_trades_lock:
                 app_active_trades[symbol] = {
                     "entry_order_id": entry_order_id,
-                    "entry_price_target": entry_price_target, # The limit price
-                    "status": "PENDING_FILL_FOR_SLTP", # Custom status
-                    "total_quantity": total_filled_quantity, # Expected quantity
+                    "entry_price_target": entry_price_target, 
+                    "status": "PENDING_FILL_FOR_SLTP", 
+                    "total_quantity": total_filled_quantity, 
                     "side": side.upper(),
                     "symbol_info": symbol_info_app,
-                    "open_timestamp": pd.Timestamp.now(tz='UTC'), # Time limit order was placed
-                    "strategy_type": "APP_ML_TRADE", # Example strategy type
+                    "open_timestamp": pd.Timestamp.now(tz='UTC'), 
+                    "strategy_type": "APP_ML_TRADE", 
                     "intended_sl": sl_price, "intended_tp1": tp1_price, 
                     "intended_tp2": tp2_price, "intended_tp3": tp3_price,
                     "order_type": "LIMIT"
                 }
-            return True # Indicate limit order placed, but SL/TP pending
+            return True # Limit order placed, SL/TP pending fill
 
 
         # Proceed with SL/TP placement only if entry is confirmed (e.g., MARKET order filled)
@@ -1479,6 +1547,11 @@ def app_send_entry_signal_telegram(current_app_settings: dict, symbol: str, sign
     log_prefix = f"[AppSendEntrySignal-{symbol}]"
     bot_token = current_app_settings.get("app_telegram_bot_token")
     chat_id = current_app_settings.get("app_telegram_chat_id")
+    notify_on_trade = current_app_settings.get("app_notify_on_trade", True) # Check the toggle
+
+    if not notify_on_trade:
+        print(f"{log_prefix} Telegram notifications for trade execution are disabled by 'app_notify_on_trade' setting. Skipping signal message.")
+        return
 
     if not bot_token or not chat_id:
         print(f"{log_prefix} Telegram token/chat_id not configured in app_settings. Cannot send signal.")
@@ -1546,6 +1619,70 @@ def app_send_entry_signal_telegram(current_app_settings: dict, symbol: str, sign
     print(f"{log_prefix} Formatted entry signal message for Telegram.")
     send_app_telegram_message(message) # Uses app.py's sender
 
+def send_app_trade_execution_telegram(current_app_settings: dict, symbol: str, side: str,
+                                      entry_price: float, sl_price: float,
+                                      tp1_price: float, tp2_price: float | None, tp3_price: float | None,
+                                      order_type: str, executed_quantity: float | None,
+                                      mode: str = "live"):
+    """
+    Formats and sends a Telegram message for a trade execution or confirmed signal.
+    """
+    log_prefix = f"[AppSendTradeExec-{symbol}]"
+    bot_token = current_app_settings.get("app_telegram_bot_token")
+    chat_id = current_app_settings.get("app_telegram_chat_id")
+    notify_on_trade = current_app_settings.get("app_notify_on_trade", True)
+
+    if not notify_on_trade:
+        print(f"{log_prefix} Telegram notifications for trade execution are disabled. Skipping.")
+        return
+
+    if not bot_token or not chat_id:
+        print(f"{log_prefix} Telegram token/chat_id not configured. Cannot send trade execution message.")
+        return
+
+    s_info = get_app_symbol_info(symbol) # Fetch fresh symbol info for precision
+    p_prec = int(s_info.get('pricePrecision', 2)) if s_info else 2
+    q_prec = int(s_info.get('quantityPrecision', 0)) if s_info else 0
+
+
+    side_upper = side.upper()
+    action_title = "📈 Trade Executed" if mode == "live" else "🎯 Trade Signal Confirmed"
+    if order_type.upper() == "LIMIT" and mode == "live" and executed_quantity is None: # Limit order placed, not yet filled
+        action_title = "⏳ Limit Order Placed"
+    elif order_type.upper() == "LIMIT" and mode == "signal":
+        action_title = "🎯 Limit Signal Confirmed"
+
+
+    message = f"{action_title}\n\n"
+    message += f"🪙 Symbol: `{escape_app_markdown_v1(symbol)}`\n"
+    message += f"📊 Side: *{escape_app_markdown_v1(side_upper)}*\n"
+    if order_type.upper() == "MARKET" or (order_type.upper() == "LIMIT" and executed_quantity is not None):
+        message += f"🎯 Entry: `{entry_price:.{p_prec}f}`\n"
+    elif order_type.upper() == "LIMIT": # Limit order not yet filled, or signal mode for limit
+         message += f"⏳ Limit Entry Target: `{entry_price:.{p_prec}f}`\n"
+
+    message += f"🛡️ SL: `{sl_price:.{p_prec}f}`\n"
+    
+    if tp1_price is not None:
+        message += f"🏁 TP1: `{tp1_price:.{p_prec}f}`\n"
+    if tp2_price is not None:
+        message += f"🏁 TP2: `{tp2_price:.{p_prec}f}`\n"
+    if tp3_price is not None:
+        message += f"🏁 TP3: `{tp3_price:.{p_prec}f}`\n"
+
+    if executed_quantity is not None and mode == "live":
+        message += f"📦 Quantity: `{executed_quantity:.{q_prec}f}`\n"
+    
+    if mode == "signal":
+        message += f"\nℹ️ _This is a signal notification ({order_type.upper()} type). No live trade was placed by the bot._"
+    elif order_type.upper() == "LIMIT" and executed_quantity is None and mode == "live":
+        message += f"\nℹ️ _This LIMIT order has been placed. SL/TP will be set upon fill._"
+
+
+    print(f"{log_prefix} Formatted trade execution message for Telegram.")
+    send_app_telegram_message(message)
+
+
 def app_send_signal_update_telegram(current_app_settings: dict, signal_details: dict, update_type: str, 
                                     message_detail: str, current_market_price: float, 
                                     pnl_estimation_fixed_capital: float | None = None):
@@ -1609,6 +1746,11 @@ def app_send_trade_rejection_notification(current_app_settings: dict, symbol: st
     log_prefix = f"[AppSendTradeRejection-{symbol}]"
     bot_token = current_app_settings.get("app_telegram_bot_token")
     chat_id = current_app_settings.get("app_telegram_chat_id")
+    notify_on_trade = current_app_settings.get("app_notify_on_trade", True) # Check the toggle
+
+    if not notify_on_trade:
+        print(f"{log_prefix} Telegram notifications for trade execution are disabled by 'app_notify_on_trade' setting. Skipping.")
+        return
 
     if not bot_token or not chat_id:
         print(f"{log_prefix} Telegram token/chat_id not configured. Cannot send rejection notification.")
@@ -2160,6 +2302,11 @@ def app_process_symbol_for_signal(symbol: str, client, current_app_settings: dic
     
     # If pivot passes, log the full decision message
     print(f"{log_prefix} Pivot passes {threshold_mode_in_use} threshold. {pivot_decision_log_message}")
+
+    # --- Debug message for Pivot Signal Passed ---
+    print(f"{log_prefix} ✅ Pivot Signal Passed - Score: {p_swing_score_live:.3f} (≥ {p_swing_thresh_to_use:.3f}), Class: {predicted_pivot_class_live}")
+    # Optional: Send Telegram alert for pivot detection (for testing, can be removed or made configurable)
+    # send_app_telegram_message(f"⚠️ DEBUG PIVOT: {symbol} Pivot detected. Score: {p_swing_score_live:.3f} (Class: {predicted_pivot_class_live})")
 
     # --- Pivot Detected, Proceed to Entry Model ---
     current_candle = df_live_raw.iloc[-1]
