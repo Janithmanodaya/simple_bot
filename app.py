@@ -2405,27 +2405,55 @@ def start_app_main_flow():
                     static_entry_features_base_list=processed_entry_feature_names_base_app, # Pass determined base names
                     n_trials=optuna_trials_app
                 )
-                # Add feature names and model ATR period to params file
-                current_best_hyperparams['pivot_feature_names_used'] = processed_pivot_feature_names_app
-                current_best_hyperparams['entry_feature_names_base_used'] = processed_entry_feature_names_base_app
-                current_best_hyperparams['model_training_atr_period_used'] = current_best_hyperparams.get('atr_period_opt', ATR_PERIOD) # Store ATR period from Optuna
+
+                # --- Correctly define feature names based on Optuna's tuned ATR period ---
+                tuned_atr_period = current_best_hyperparams.get('atr_period_opt', ATR_PERIOD)
+                atr_col_name_tuned = f'atr_{tuned_atr_period}'
+
+                # Define pivot feature names consistent with engineer_pivot_features and tuned ATR
+                pivot_feature_names_list_tuned = [
+                    atr_col_name_tuned, 'range_atr_norm', 'macd_slope_atr_norm',
+                    'return_1b_atr_norm', 'return_3b_atr_norm', 'return_5b_atr_norm',
+                    'high_rank_7', 'bars_since_last_pivot', 'volume_spike_vs_avg', 'rsi_14'
+                ]
+
+                # Define entry base feature names consistent with engineer_entry_features and tuned ATR
+                entry_feature_names_base_list_tuned = [
+                    'ema20_ema50_norm_atr',
+                    'return_entry_1b', 'return_entry_3b', 'return_entry_5b',
+                    f'{atr_col_name_tuned}_change', # Uses tuned ATR column name
+                    'hour_of_day', 'day_of_week', 'vol_regime'
+                ]
+                # Note: 'P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl' are added later to form full entry features.
+
+                current_best_hyperparams['pivot_feature_names_used'] = pivot_feature_names_list_tuned
+                current_best_hyperparams['entry_feature_names_base_used'] = entry_feature_names_base_list_tuned
+                current_best_hyperparams['model_training_atr_period_used'] = tuned_atr_period
+                # --- End feature name correction ---
 
                 with open(params_path, 'w') as f: json.dump(current_best_hyperparams, f, indent=4)
-                print(f"Best Optuna parameters (including feature names and ATR period) saved to {params_path}")
+                print(f"Best Optuna parameters (including dynamically generated feature names and ATR period) saved to {params_path}")
                 best_hyperparams = current_best_hyperparams # Update global
-            except Exception as e: print(f"Optuna tuning failed: {e}. Exiting."); sys.exit(1)
+            except Exception as e: print(f"Optuna tuning failed: {e}. Exiting."); import traceback; traceback.print_exc(); sys.exit(1) # Added traceback
 
-            # Use feature names from the saved best_hyperparams for final model training
-            final_pivot_feats_to_use = best_hyperparams.get('pivot_feature_names_used', processed_pivot_feature_names_app)
-            final_entry_base_feats_to_use = best_hyperparams.get('entry_feature_names_base_used', processed_entry_feature_names_base_app)
-
-
-            df_final_train, _, _ = process_dataframe_with_params( # We get refined feature lists from this if needed, but should match
-                universal_df_initial_processed_app.copy(), best_hyperparams, final_entry_base_feats_to_use
+            # Use feature names directly from the now-corrected best_hyperparams for final model training
+            final_pivot_feats_to_use = best_hyperparams['pivot_feature_names_used']
+            final_entry_base_feats_to_use = best_hyperparams['entry_feature_names_base_used']
+            
+            # Pass the correctly defined final_entry_base_feats_to_use to process_dataframe_with_params
+            df_final_train, processed_pivot_features_final, processed_entry_features_base_final = process_dataframe_with_params(
+                universal_df_initial_processed_app.copy(), 
+                best_hyperparams, # Contains the correct ATR period and feature name lists
+                static_entry_features_base_list_arg=final_entry_base_feats_to_use # Pass the list based on tuned ATR
             )
+            # df_final_train should now be processed using the tuned ATR period, and its features should align.
+            # processed_pivot_features_final and processed_entry_features_base_final from this function
+            # should match what's in best_hyperparams if process_dataframe_with_params is consistent.
+
             if df_final_train is None: print("CRITICAL: Failed to process data with best params. Exiting."); sys.exit(1)
 
-            X_p_train = df_final_train[final_pivot_feats_to_use].fillna(-1) # Use names from params
+            # Ensure X_p_train uses the feature list that the model will expect, which is from best_hyperparams
+            X_p_train = df_final_train[final_pivot_feats_to_use].fillna(-1)
             y_p_train = df_final_train['pivot_label']
             
             # Define valid keys for train_pivot_model based on its signature
