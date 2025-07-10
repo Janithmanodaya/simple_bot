@@ -2026,7 +2026,9 @@ def app_process_symbol_for_signal(symbol: str, client, current_app_settings: dic
         return
 
     try:
-        pivot_probs = pivot_model_loaded.predict_proba(live_pivot_features.values.reshape(1, -1))[0]
+        # Convert Series to DataFrame with named columns for robust prediction
+        live_pivot_df = pd.DataFrame([live_pivot_features.to_dict()])
+        pivot_probs = pivot_model_loaded.predict_proba(live_pivot_df)[0]
         # Assuming class 0: none, 1: high, 2: low (from app.py's pivot_label)
         p_swing_high = pivot_probs[1] if len(pivot_probs) > 1 else 0
         p_swing_low = pivot_probs[2] if len(pivot_probs) > 2 else 0
@@ -2038,6 +2040,15 @@ def app_process_symbol_for_signal(symbol: str, client, current_app_settings: dic
         return
 
     print(f"{log_prefix} Pivot Model Output: P_None={p_none_pivot:.3f}, P_High={p_swing_high:.3f}, P_Low={p_swing_low:.3f} -> P_Swing_Score={p_swing_score_live:.3f} (Threshold: {p_swing_thresh:.2f}), PredictedClass={predicted_pivot_class_live}")
+
+    # Detailed log of features fed to pivot model
+    if live_pivot_features is not None:
+        feature_log_str = f"{log_prefix} Features for Pivot Model ({symbol} @ {df_live_raw.index[-1]}):\n"
+        for feature_name, value in live_pivot_features.items():
+            feature_log_str += f"  - {feature_name}: {value:.4f}\n"
+        print(feature_log_str)
+    else:
+        print(f"{log_prefix} live_pivot_features is None, cannot log them.")
 
     if p_swing_score_live < p_swing_thresh or predicted_pivot_class_live == 0:
         print(f"{log_prefix} No significant pivot detected by model (P_Swing {p_swing_score_live:.3f} < {p_swing_thresh:.2f} or PredClass is 0).")
@@ -2084,7 +2095,9 @@ def app_process_symbol_for_signal(symbol: str, client, current_app_settings: dic
         return
 
     try:
-        entry_probs = entry_model_loaded.predict_proba(live_entry_features.values.reshape(1, -1))[0]
+        # Convert Series to DataFrame with named columns for robust prediction
+        live_entry_df = pd.DataFrame([live_entry_features.to_dict()])
+        entry_probs = entry_model_loaded.predict_proba(live_entry_df)[0]
         # Assuming binary classification: class 1 is "profitable"
         p_profit_live = entry_probs[1] if len(entry_probs) > 1 else 0
     except Exception as e:
@@ -2456,6 +2469,11 @@ def start_app_main_flow():
             # Ensure X_p_train uses the feature list that the model will expect, which is from best_hyperparams
             X_p_train = df_final_train[final_pivot_feats_to_use].fillna(-1)
             y_p_train = df_final_train['pivot_label']
+
+            # Log class distribution for pivot labels
+            print(f"{log_prefix} Pivot Label Distribution in Final Training Data (df_final_train):")
+            print(y_p_train.value_counts(normalize=True)) # Log normalized distribution
+            print(y_p_train.value_counts()) # Log raw counts
             
             # Define valid keys for train_pivot_model based on its signature
             valid_pivot_model_arg_names = ['model_type', 'num_leaves', 'learning_rate', 'max_depth']
@@ -2982,35 +3000,67 @@ def engineer_pivot_features(df, atr_col_name): # Added atr_col_name
         # A better fallback might be to calculate it using a default period if an atr_period param was also passed.
 
     # Volatility & Range
-    df['range_atr_norm'] = (df['high'] - df['low']) / df[atr_col_name]
+    # df['range_atr_norm'] = (df['high'] - df['low']) / df[atr_col_name]
+    df['range_atr_norm'] = np.where(df[atr_col_name] == 0, 0, (df['high'] - df['low']) / df[atr_col_name])
+
 
     # Trend & Momentum
     df['ema12'] = calculate_ema(df, 12)
     df['ema26'] = calculate_ema(df, 26)
     df['macd_line'] = df['ema12'] - df['ema26']
     # Use dynamic atr_col_name for normalization
-    df['macd_slope_atr_norm'] = df['macd_line'].diff() / df[atr_col_name]
+    # df['macd_slope_atr_norm'] = df['macd_line'].diff() / df[atr_col_name]
+    macd_slope = df['macd_line'].diff()
+    df['macd_slope_atr_norm'] = np.where(df[atr_col_name] == 0, 0, macd_slope / df[atr_col_name])
+
 
     for n in [1, 3, 5]:
         # Use dynamic atr_col_name for normalization
-        df[f'return_{n}b_atr_norm'] = df['close'].pct_change(n) / df[atr_col_name]
+        # df[f'return_{n}b_atr_norm'] = df['close'].pct_change(n) / df[atr_col_name]
+        return_n_b = df['close'].pct_change(n)
+        df[f'return_{n}b_atr_norm'] = np.where(df[atr_col_name] == 0, 0, return_n_b / df[atr_col_name])
+
 
     # Local Structure
     df['high_rank_7'] = df['high'].rolling(window=7).rank(pct=True)
     # Bars since last candidate pivot (requires iterating or more complex logic)
-    # This is tricky to do vectorized efficiently for *any* candidate.
-    # For now, let's use bars since last *confirmed* pivot as a proxy, though the request was candidate.
-    # This might be better done during the iteration when confirming pivots or in a post-processing step.
-    # Placeholder:
-    df['bars_since_last_pivot'] = 0
-    last_pivot_idx = -1
-    for i in range(len(df)):
-        if df['is_swing_high'].iloc[i] == 1 or df['is_swing_low'].iloc[i] == 1:
-            last_pivot_idx = i
-        if last_pivot_idx != -1:
-            df.loc[df.index[i], 'bars_since_last_pivot'] = i - last_pivot_idx
-        else:
-            df.loc[df.index[i], 'bars_since_last_pivot'] = i # Or a large number
+    df['bars_since_last_pivot'] = 0 
+    MAX_BARS_NO_PIVOT_CONSTANT = 200 # Constant if no real pivots in window
+
+    has_real_pivots_in_df = False
+    if 'is_swing_high' in df.columns and 'is_swing_low' in df.columns:
+        if (df['is_swing_high'] == 1).any() or (df['is_swing_low'] == 1).any():
+            has_real_pivots_in_df = True
+
+    if has_real_pivots_in_df:
+        last_pivot_idx = -1
+        for i in range(len(df)):
+            # Check current row for a confirmed pivot
+            # Ensure .iloc is used if df.index is not a simple range [0, ..., N-1]
+            # However, 'i' here is from range(len(df)), so it's a positional index.
+            is_high_pivot_current_row = df['is_swing_high'].iloc[i] == 1
+            is_low_pivot_current_row = df['is_swing_low'].iloc[i] == 1
+            
+            if is_high_pivot_current_row or is_low_pivot_current_row:
+                last_pivot_idx = i # Store the positional index of the last pivot
+
+            # Calculate bars since last pivot
+            if last_pivot_idx != -1:
+                # df.loc[df.index[i], 'bars_since_last_pivot'] should use positional index 'i'
+                # if df.index is not guaranteed to be [0, ..., N-1].
+                # However, since it's initialized with df['bars_since_last_pivot'] = 0,
+                # direct assignment df['bars_since_last_pivot'].iloc[i] is safer if index is complex.
+                # Given the loop is `for i in range(len(df))`, df.index[i] refers to the label-based index
+                # at position i. df.iloc[i] refers to the row at position i.
+                # Let's assume simple RangeIndex for now, so df.loc[df.index[i]] is equivalent to df.iloc[i].
+                df.loc[df.index[i], 'bars_since_last_pivot'] = i - last_pivot_idx
+            else:
+                # If no pivot encountered yet in this df slice, count from start of slice
+                df.loc[df.index[i], 'bars_since_last_pivot'] = i 
+    else:
+        # No real pivots found (e.g., live mode with dummy columns, or a section of training data without pivots)
+        # Set to a constant large value for all rows in this case.
+        df['bars_since_last_pivot'] = MAX_BARS_NO_PIVOT_CONSTANT
 
     # Volume
     df['volume_rolling_avg_20'] = df['volume'].rolling(window=20).mean()
