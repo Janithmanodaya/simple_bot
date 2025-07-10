@@ -1,3 +1,4 @@
+import math
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
@@ -440,7 +441,9 @@ def load_app_settings(filepath=APP_CONFIG_FILE):
         "app_sim_sl_atr_multiplier": 1.0,   # ATR multiplier for SL simulation for entry feature calculation
         "app_sl_atr_multiplier": 2.0,       # ATR multiplier for actual trade SL
         "app_tp_rr_ratio": 1.5,             # R:R ratio for actual trade TP
-        "app_symbols_csv_path": "app_symbols.csv" # Default path for symbols CSV
+        "app_symbols_csv_path": "app_symbols.csv", # Default path for symbols CSV
+        "app_training_symbols_source_type": "list", # "list" or "csv"
+        "app_training_symbols_list_str": "BTCUSDT,ETHUSDT" # Comma-separated list if source_type is "list"
     }
 
     loaded_json_settings = {}
@@ -1736,7 +1739,7 @@ def check_ml_models_exist():
     global app_settings
     pivot_model_path = app_settings.get("app_pivot_model_path", "app_pivot_model.joblib")
     entry_model_path = app_settings.get("app_entry_model_path", "app_entry_model.joblib")
-    models_params_path = app_settings.get("app_model_params_path", "app_model_params.json")
+    models_params_path = app_settings.get("app_model_params_path", "best_model_params.json") # Corrected default
 
     pivot_exists = os.path.exists(pivot_model_path)
     entry_exists = os.path.exists(entry_model_path)
@@ -2029,14 +2032,15 @@ def app_process_symbol_for_signal(symbol: str, client, current_app_settings: dic
         p_swing_low = pivot_probs[2] if len(pivot_probs) > 2 else 0
         p_swing_score_live = max(p_swing_high, p_swing_low)
         predicted_pivot_class_live = np.argmax(pivot_probs)
+        p_none_pivot = pivot_probs[0] if len(pivot_probs) > 0 else 0
     except Exception as e:
         print(f"{log_prefix} Error during pivot model prediction: {e}")
         return
 
-    print(f"{log_prefix} Pivot Model: P_Swing={p_swing_score_live:.3f} (H:{p_swing_high:.2f}, L:{p_swing_low:.2f}), PredClass={predicted_pivot_class_live}, Thresh={p_swing_thresh:.2f}")
+    print(f"{log_prefix} Pivot Model Output: P_None={p_none_pivot:.3f}, P_High={p_swing_high:.3f}, P_Low={p_swing_low:.3f} -> P_Swing_Score={p_swing_score_live:.3f} (Threshold: {p_swing_thresh:.2f}), PredictedClass={predicted_pivot_class_live}")
 
     if p_swing_score_live < p_swing_thresh or predicted_pivot_class_live == 0:
-        # print(f"{log_prefix} No significant pivot detected by model. P_Swing: {p_swing_score_live:.3f}")
+        print(f"{log_prefix} No significant pivot detected by model (P_Swing {p_swing_score_live:.3f} < {p_swing_thresh:.2f} or PredClass is 0).")
         return
 
     # --- Pivot Detected, Proceed to Entry Model ---
@@ -2086,15 +2090,17 @@ def app_process_symbol_for_signal(symbol: str, client, current_app_settings: dic
     except Exception as e:
         print(f"{log_prefix} Error during entry model prediction: {e}")
         return
-
-    print(f"{log_prefix} Entry Model: P_Profit={p_profit_live:.3f}, Thresh={p_profit_thresh:.2f}")
+    
+    # Assuming binary classification for entry: class 0 (not profitable), class 1 (profitable)
+    p_not_profit_live = entry_probs[0] if len(entry_probs) > 0 else 0
+    print(f"{log_prefix} Entry Model Output: P_NotProfit={p_not_profit_live:.3f}, P_Profit={p_profit_live:.3f} (Threshold: {p_profit_thresh:.2f})")
 
     if p_profit_live < p_profit_thresh:
-        # print(f"{log_prefix} Entry signal not strong enough. P_Profit: {p_profit_live:.3f}")
+        print(f"{log_prefix} Entry signal not strong enough (P_Profit {p_profit_live:.3f} < {p_profit_thresh:.2f}).")
         return
 
     # --- Entry Confirmed by Both Models ---
-    print(f"{log_prefix} ENTRY CONFIRMED: {trade_side_potential.upper()} for {symbol}. P_Swing={p_swing_score_live:.2f}, P_Profit={p_profit_live:.2f}")
+    print(f"{log_prefix} ✅ ENTRY SIGNAL CONFIRMED: {trade_side_potential.upper()} for {symbol}. P_Swing={p_swing_score_live:.2f}, P_Profit={p_profit_live:.2f}")
 
     # Determine actual entry price, SL, TP for trade/signal
     # Entry: Current market price (last close for simulation, or fetch live ticker for live)
@@ -2209,6 +2215,16 @@ def app_trading_signal_loop(current_app_settings: dict, pivot_model_loaded, entr
     """
     log_prefix = "[AppTradingLoop]"
     print(f"{log_prefix} Starting trading/signal loop...")
+
+    # Send startup Telegram message
+    startup_message = (
+        f"✅ *App Trading Bot STARTED*\n\n"
+        f"Operational Mode: `{current_app_settings.get('app_operational_mode', 'N/A').upper()}`\n"
+        f"Environment: `{current_app_settings.get('app_trading_environment', 'N/A').upper()}`\n"
+        f"Initial Symbols: `{current_app_settings.get('app_trading_symbols', 'N/A')}`\n\n"
+        f"Bot is now operational and scanning for signals."
+    )
+    send_app_telegram_message(startup_message)
     
     global app_binance_client # Ensure global client is accessible
 
@@ -2307,6 +2323,7 @@ def app_trading_signal_loop(current_app_settings: dict, pivot_model_loaded, entr
 # --- Main Orchestration & Startup Logic ---
 def start_app_main_flow():
     """Orchestrates the main application flow based on settings and user input."""
+    log_prefix = "[AppMainFlow]"
     global app_settings, universal_pivot_model, universal_entry_model, best_hyperparams # Ensure best_hyperparams is global if modified
 
     # 1. Load settings
@@ -2329,8 +2346,27 @@ def start_app_main_flow():
                 print("ML models not found. Starting training process...")
             
             # --- Training Process ---
-            training_symbols_str = app_settings.get("app_training_symbols", "BTCUSDT,ETHUSDT")
-            training_symbols_list = [s.strip().upper() for s in training_symbols_str.split(',')]
+            # Determine training symbols based on new settings
+            training_symbols_list = []
+            source_type = app_settings.get("app_training_symbols_source_type", "list")
+            
+            if source_type.lower() == "csv":
+                csv_path = app_settings.get("app_symbols_csv_path", "app_symbols.csv")
+                print(f"{log_prefix} Attempting to load training symbols from CSV: {csv_path}")
+                training_symbols_list = app_load_symbols_from_csv(csv_path)
+                if not training_symbols_list:
+                    print(f"{log_prefix} WARN: CSV specified for training symbols ('{csv_path}') load failed or empty. Falling back to list string.")
+                    source_type = "list" # Force fallback to list
+
+            if source_type.lower() == "list" or not training_symbols_list: # Fallback or primary if "list"
+                list_str = app_settings.get("app_training_symbols_list_str", "BTCUSDT,ETHUSDT")
+                print(f"{log_prefix} Loading training symbols from list string: '{list_str}'")
+                training_symbols_list = [s.strip().upper() for s in list_str.split(',') if s.strip()]
+
+            if not training_symbols_list:
+                print(f"{log_prefix} CRITICAL: No training symbols loaded from any source. Defaulting to BTCUSDT for training.")
+                training_symbols_list = ["BTCUSDT"]
+            
             kline_interval_train = app_settings.get("app_training_kline_interval", Client.KLINE_INTERVAL_15MINUTE)
             start_date_train = app_settings.get("app_training_start_date", "1 Jan, 2023")
             end_date_train = app_settings.get("app_training_end_date", "1 May, 2023")
@@ -2391,7 +2427,13 @@ def start_app_main_flow():
 
             X_p_train = df_final_train[final_pivot_feats_to_use].fillna(-1) # Use names from params
             y_p_train = df_final_train['pivot_label']
-            pivot_model_args = {k.replace('pivot_', ''):v for k,v in best_hyperparams.items() if k.startswith('pivot_')}
+            
+            # Define valid keys for train_pivot_model based on its signature
+            valid_pivot_model_arg_names = ['model_type', 'num_leaves', 'learning_rate', 'max_depth']
+            raw_pivot_args = {k.replace('pivot_', ''):v for k,v in best_hyperparams.items() if k.startswith('pivot_')}
+            pivot_model_args = {k: v for k, v in raw_pivot_args.items() if k in valid_pivot_model_arg_names}
+            
+            print(f"DEBUG: Args passed to train_pivot_model: {pivot_model_args}") # Log the actual args
             temp_pivot_model = train_pivot_model(X_p_train, y_p_train, X_p_train, y_p_train, **pivot_model_args)
             save_model(temp_pivot_model, pivot_model_path)
             universal_pivot_model = temp_pivot_model
@@ -2410,7 +2452,12 @@ def start_app_main_flow():
                 y_e_train = entry_candidates['trade_outcome'].astype(int)
                 
                 if len(X_e_train) > 0 and len(y_e_train.unique()) > 1:
-                    entry_model_args = {k.replace('entry_', ''):v for k,v in best_hyperparams.items() if k.startswith('entry_')}
+                    # Define valid keys for train_entry_model based on its intended use with LGBM/RF
+                    valid_entry_model_arg_names = ['model_type', 'num_leaves', 'learning_rate', 'max_depth', 'n_estimators'] # Add more if Optuna tunes them
+                    raw_entry_args = {k.replace('entry_', ''):v for k,v in best_hyperparams.items() if k.startswith('entry_')}
+                    entry_model_args = {k: v for k, v in raw_entry_args.items() if k in valid_entry_model_arg_names}
+                    
+                    print(f"DEBUG: Args passed to train_entry_model: {entry_model_args}") # Log the actual args
                     temp_entry_model = train_entry_model(X_e_train, y_e_train, X_e_train, y_e_train, **entry_model_args)
                     save_model(temp_entry_model, entry_model_path)
                     universal_entry_model = temp_entry_model
@@ -2420,15 +2467,36 @@ def start_app_main_flow():
             print("ML Model training process complete.")
             models_exist = True # Update status
 
+            # Generate and display backtest summary after training
+            print("DEBUG: Preparing data for training summary backtest...")
+            if df_final_train is not None and universal_pivot_model is not None and universal_entry_model is not None and best_hyperparams:
+                # Ensure feature names used for training are correctly passed
+                # These should be what process_dataframe_with_params returned along with df_final_train
+                # final_pivot_feats_to_use and final_entry_base_feats_to_use are already in scope
+                generate_training_backtest_summary(
+                    df_processed_full_dataset=df_final_train, 
+                    pivot_model=universal_pivot_model,
+                    entry_model=universal_entry_model,
+                    best_params_from_optuna=best_hyperparams, # This contains all tuned params including thresholds
+                    pivot_feature_names_list=final_pivot_feats_to_use, # Features used for pivot model
+                    entry_feature_names_base_list=final_entry_base_feats_to_use, # Base features for entry model
+                    app_settings_dict=app_settings
+                )
+            else:
+                print("Skipping training summary generation due to missing data or models from training process.")
+
+
             if not app_settings.get("app_auto_start_trading_after_train", False):
-                choice_after_train = input("Training complete. Proceed to live market trading? (yes/no) [no]: ").lower()
+                choice_after_train = input("Training complete & summary shown. Proceed to live market trading? (yes/no) [no]: ").lower()
                 if choice_after_train not in ['yes', 'y']:
                     print("Exiting after training as per user choice.")
                     sys.exit(0)
             # If auto_start or user chose yes, fall through to model loading and trading choice.
+            # Note: Models are already in global vars if training just happened.
 
-        # Models exist (either initially or after training)
-        # Try to load models and params into global vars if they are not already (e.g. after training or on fresh start with existing files)
+        # Models exist (either initially or after training, or loaded below)
+        # Try to load models and params into global vars if they are not already 
+        # (e.g. on fresh start with existing files, or if training was skipped and we fell through)
         if universal_pivot_model is None or universal_entry_model is None or not best_hyperparams:
             print("Loading trained ML models and parameters...")
             try:
@@ -2451,16 +2519,24 @@ def start_app_main_flow():
             try:
                 with open(params_path, 'r') as f:
                     best_hyperparams = json.load(f) # This loads params like thresholds and feature names
+                
+                # Add a check for essential keys after loading
+                required_keys = ['pivot_feature_names_used', 'entry_feature_names_base_used', 'model_training_atr_period_used']
+                missing_keys = [key for key in required_keys if key not in best_hyperparams or not best_hyperparams[key]]
+                if missing_keys:
+                    print(f"[ERROR] Parameters file '{params_path}' is incomplete. Missing or empty for keys: {missing_keys}.")
+                    raise ValueError(f"Incomplete parameters file, missing: {missing_keys}") # This will be caught by the generic except below
+
             except FileNotFoundError:
                 print(f"[ERROR] parameters file not found at '{params_path}'.")
-                retry_train = input(f"Error loading parameters file. Attempt to retrain models (which recreates this file)? (yes/no) [yes]: ").lower()
+                retry_train = input(f"Parameters file not found. Attempt to retrain models (which recreates this file)? (yes/no) [yes]: ").lower()
                 if retry_train in ['no', 'n']: sys.exit(1)
-                force_retrain = True; models_exist = False; continue
-            except json.JSONDecodeError as e_json:
-                print(f"[ERROR] decoding JSON from parameters file '{params_path}': {e_json}")
-                retry_train = input(f"Error decoding parameters file. Attempt to retrain models? (yes/no) [yes]: ").lower()
+                force_retrain = True; models_exist = False; universal_pivot_model = None; universal_entry_model = None; best_hyperparams = {}; continue
+            except (json.JSONDecodeError, ValueError) as e_params_load: # Catch ValueError from our check or JSON errors
+                print(f"[ERROR] loading or validating parameters file '{params_path}': {e_params_load}")
+                retry_train = input(f"Error with parameters file. Attempt to retrain models? (yes/no) [yes]: ").lower()
                 if retry_train in ['no', 'n']: sys.exit(1)
-                force_retrain = True; models_exist = False; continue
+                force_retrain = True; models_exist = False; universal_pivot_model = None; universal_entry_model = None; best_hyperparams = {}; continue
             except Exception as e_params: # Catch any other unexpected error during params loading
                 print(f"[ERROR] loading parameters file '{params_path}': {e_params}")
                 retry_train = input(f"Unexpected error loading parameters file. Attempt to retrain models? (yes/no) [yes]: ").lower()
@@ -2598,17 +2674,29 @@ def prune_and_label_pivots(df, atr_col_name, atr_distance_factor=MIN_ATR_DISTANC
     min_index_for_valid_atr = parsed_atr_period - 1
 
     # Iterate starting from where ATR is expected to be valid
+    candidates_evaluated = 0
+    pruned_by_bar_gap = 0
+    pruned_by_atr_dist = 0
+    pruned_by_invalid_atr_current = 0
+    pruned_by_invalid_atr_last = 0
+    confirmed_pivots = 0
+
     for i in range(len(df)):
         if i < min_index_for_valid_atr and atr_distance_factor > 0: # Skip early bars if ATR is used for pruning
             continue
+        
+        is_ch_initial = df['is_candidate_high'].iloc[i]
+        is_cl_initial = df['is_candidate_low'].iloc[i]
+        if not is_ch_initial and not is_cl_initial:
+            continue
+        candidates_evaluated +=1
 
         # ATR at the current candidate pivot `i`
         atr_val_at_current_pivot = df.loc[df.index[i], atr_col_name] 
         
         # If ATR is needed for distance factor and current ATR is invalid, skip this candidate
         if atr_distance_factor > 0 and (pd.isna(atr_val_at_current_pivot) or atr_val_at_current_pivot == 0):
-            # This warning helps identify if candidates are skipped due to their own invalid ATR.
-            # print(f"Debug (prune_and_label_pivots): Skipping candidate at index {df.index[i]} due to invalid ATR: {atr_val_at_current_pivot} (ATR distance factor is active).")
+            pruned_by_invalid_atr_current +=1
             continue
 
         is_ch = df['is_candidate_high'].iloc[i]
@@ -2624,7 +2712,8 @@ def prune_and_label_pivots(df, atr_col_name, atr_distance_factor=MIN_ATR_DISTANC
             # However, 'i' is from range(len(df)), and last_confirmed_pivot_idx stores 'i'.
             # So, this comparison is on the integer position.
             if (i - last_confirmed_pivot_idx) < min_bar_gap: # Corrected to use integer index i
-                 continue
+                pruned_by_bar_gap += 1
+                continue
 
 
         current_price = 0
@@ -2645,17 +2734,16 @@ def prune_and_label_pivots(df, atr_col_name, atr_distance_factor=MIN_ATR_DISTANC
             atr_at_last_pivot = df.loc[df.index[last_confirmed_pivot_idx], atr_col_name]
 
             if pd.isna(atr_at_last_pivot) or atr_at_last_pivot == 0:
-                # If ATR at the *last* pivot is invalid, we cannot reliably apply ATR distance.
-                # Skip the current candidate as a rule cannot be checked.
-                # print(f"Debug (prune_and_label_pivots): Skipping candidate at index {df.index[i]} because ATR at last pivot (index {df.index[last_confirmed_pivot_idx]}) is invalid: {atr_at_last_pivot}.")
+                pruned_by_invalid_atr_last += 1
                 continue
             
             price_diff = abs(current_price - last_confirmed_pivot_price)
             if price_diff < (atr_distance_factor * atr_at_last_pivot):
-                # Too close to the last pivot in terms of price * ATR
+                pruned_by_atr_dist += 1
                 continue
         
         # Confirm pivot
+        confirmed_pivots +=1
         # Note: last_confirmed_pivot_idx stores the integer position 'i', not the DataFrame label index.
         if current_type == 'high':
             # Ensure it's not immediately followed by a higher high or preceded by a higher high (within candidate window)
@@ -2672,7 +2760,11 @@ def prune_and_label_pivots(df, atr_col_name, atr_distance_factor=MIN_ATR_DISTANC
             last_confirmed_pivot_idx = i
             last_confirmed_pivot_price = current_price
             last_confirmed_pivot_type = 'low'
-
+    
+    print(f"DEBUG (prune_and_label_pivots): Evaluated {candidates_evaluated} candidates. "
+          f"Pruned by BarGap: {pruned_by_bar_gap}, ATRDist: {pruned_by_atr_dist}, "
+          f"InvalidCurrATR: {pruned_by_invalid_atr_current}, InvalidLastATR: {pruned_by_invalid_atr_last}. "
+          f"Confirmed Pivots: {confirmed_pivots}")
     return df
 
 
@@ -2723,8 +2815,12 @@ def simulate_fib_entries(df, atr_col_name): # Added atr_col_name
     pivots = all_pivots[all_pivots.index >= min_pivot_index_for_valid_atr].copy()
 
     if pivots.empty:
-        # print(f"Debug (simulate_fib_entries): No pivots found after ATR warmup period ({min_pivot_index_for_valid_atr}). Original pivots: {len(all_pivots)}")
+        print(f"DEBUG (simulate_fib_entries): No pivots found after ATR warmup period ({min_pivot_index_for_valid_atr}). Original pivots: {len(all_pivots)}")
         return df # No pivots to simulate after warmup
+
+    simulated_trades = 0
+    skipped_due_to_bad_atr = 0
+    entries_not_triggered = 0
 
     # print(f"Debug (simulate_fib_entries): Total pivots before warmup filter: {len(all_pivots)}, After filter (index >= {min_pivot_index_for_valid_atr}): {len(pivots)}")
 
@@ -2736,10 +2832,12 @@ def simulate_fib_entries(df, atr_col_name): # Added atr_col_name
         if pd.isna(atr_at_pivot) or atr_at_pivot == 0:
             # This warning should ideally not occur frequently if the warmup logic above is correct,
             # but it's a good safeguard.
-            print(f"Warning (simulate_fib_entries): ATR is NaN or zero at index {i} (pivot index) for pivot despite warmup. Value: {atr_at_pivot}. Skipping simulation for this pivot.")
+            # print(f"Warning (simulate_fib_entries): ATR is NaN or zero at index {i} (pivot index) for pivot despite warmup. Value: {atr_at_pivot}. Skipping simulation for this pivot.")
             df.loc[i, 'trade_outcome'] = -1 # Mark as no trade due to bad ATR
+            skipped_due_to_bad_atr +=1
             continue
-
+        
+        simulated_trades += 1
         pivot_price = 0
         is_long_trade = False
 
@@ -2819,7 +2917,10 @@ def simulate_fib_entries(df, atr_col_name): # Added atr_col_name
             df.loc[i, 'trade_outcome'] = outcome
         else: # Trade not triggered
             df.loc[i, 'trade_outcome'] = -1 # Reset to -1 if entry not triggered
+            entries_not_triggered +=1
 
+    print(f"DEBUG (simulate_fib_entries): Attempted {simulated_trades} simulations. "
+          f"Skipped for bad ATR: {skipped_due_to_bad_atr}. Entries not triggered: {entries_not_triggered}.")
     return df
 
 # --- 2. Feature Engineering ---
@@ -2981,17 +3082,29 @@ def engineer_entry_features(df, atr_col_name, entry_features_base_list_arg=None)
 
 # --- 3. Model Training & Validation ---
 
-# Modified to accept pivot_max_depth for RF, and num_leaves/learning_rate for LGBM
-def train_pivot_model(X_train, y_train, X_val, y_val, model_type='lgbm', 
-                      num_leaves=31, learning_rate=0.05, max_depth=7):
-    """Trains pivot detection model."""
+# Modified to accept model specific kwargs
+def train_pivot_model(X_train, y_train, X_val, y_val, model_type='lgbm', **kwargs):
+    """Trains pivot detection model, accepting kwargs for model parameters."""
+    print(f"DEBUG (train_pivot_model): Received kwargs: {kwargs}")
+    
+    model_params = {'class_weight': 'balanced', 'random_state': 42}
+    
+    # Filter kwargs to only include those relevant for the specific model type
     if model_type == 'lgbm':
-        # Target: multiclass {none, high, low}
-        # pivot_label: 0=none, 1=high, 2=low
-        model = lgb.LGBMClassifier(num_leaves=31, learning_rate=0.05, class_weight='balanced', random_state=42)
+        lgbm_valid_keys = ['num_leaves', 'learning_rate', 'max_depth', 'n_estimators', 'reg_alpha', 'reg_lambda', 'colsample_bytree', 'subsample', 'min_child_samples'] # Add more as tuned by Optuna
+        model_params.update({k: v for k, v in kwargs.items() if k in lgbm_valid_keys})
+        # Ensure n_estimators is reasonable, Optuna might not always set it.
+        if 'n_estimators' not in model_params: model_params['n_estimators'] = 100 # Default
+        model = lgb.LGBMClassifier(**model_params)
         model.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[early_stopping(stopping_rounds=10, verbose=-1)])
     elif model_type == 'rf':
-        model = RandomForestClassifier(n_estimators=100, max_depth=7, class_weight='balanced', random_state=42)
+        rf_valid_keys = ['n_estimators', 'max_depth', 'min_samples_split', 'min_samples_leaf', 'max_features'] # Add more as tuned
+        model_params.update({k: v for k, v in kwargs.items() if k in rf_valid_keys})
+        if 'n_estimators' not in model_params: model_params['n_estimators'] = 100
+        if 'max_depth' not in model_params and 'max_depth' in kwargs : model_params['max_depth'] = kwargs['max_depth'] # Ensure max_depth from Optuna is used if provided
+        elif 'max_depth' not in model_params : model_params['max_depth'] = 7 # Default if not from Optuna
+
+        model = RandomForestClassifier(**model_params)
         model.fit(X_train, y_train)
     else:
         raise ValueError("Unsupported model type for pivot detection.")
@@ -3011,35 +3124,34 @@ def train_pivot_model(X_train, y_train, X_val, y_val, model_type='lgbm',
     # print(confusion_matrix(y_val, preds_val))
     return model
 
-def train_entry_model(X_train, y_train, X_val, y_val, model_type='lgbm'):
-    """Trains entry profitability model."""
-    # Target: multiclass (trade_outcome: 0=SL, 1=TP1, 2=TP2, 3=TP3, potentially 4=Time Exit)
-    # y_train is now expected to be the raw multiclass labels.
+def train_entry_model(X_train, y_train, X_val, y_val, model_type='lgbm', **kwargs):
+    """Trains entry profitability model, accepting kwargs for model parameters."""
+    # y_train is currently binary (profitable or not) due to objective_optuna's y_entry_train processing.
+    print(f"DEBUG (train_entry_model): Received kwargs: {kwargs}")
+
+    model_params = {'class_weight': 'balanced', 'random_state': 42}
 
     if model_type == 'lgbm':
-        model = lgb.LGBMClassifier(num_leaves=31, learning_rate=0.05, class_weight='balanced', random_state=42)
-        # Fit with the original multiclass y_train and y_val
+        lgbm_valid_keys = ['num_leaves', 'learning_rate', 'max_depth', 'n_estimators', 'reg_alpha', 'reg_lambda', 'colsample_bytree', 'subsample', 'min_child_samples']
+        model_params.update({k: v for k, v in kwargs.items() if k in lgbm_valid_keys})
+        if 'n_estimators' not in model_params: model_params['n_estimators'] = 100
+        
+        model = lgb.LGBMClassifier(**model_params)
+        # Fit with the y_train (binary) and y_val (binary)
         model.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[early_stopping(stopping_rounds=10, verbose=-1)])
     elif model_type == 'rf':
-        model = RandomForestClassifier(n_estimators=100, max_depth=7, class_weight='balanced', random_state=42)
-        # Fit with the original multiclass y_train
+        rf_valid_keys = ['n_estimators', 'max_depth', 'min_samples_split', 'min_samples_leaf', 'max_features']
+        model_params.update({k: v for k, v in kwargs.items() if k in rf_valid_keys})
+        if 'n_estimators' not in model_params: model_params['n_estimators'] = 100
+        if 'max_depth' not in model_params and 'max_depth' in kwargs: model_params['max_depth'] = kwargs['max_depth']
+        elif 'max_depth' not in model_params: model_params['max_depth'] = 7
+
+        model = RandomForestClassifier(**model_params)
         model.fit(X_train, y_train)
-    # TODO: Add MLP option
     else:
         raise ValueError("Unsupported model type for entry evaluation.")
-
-    # Evaluation will need to be updated for multiclass if detailed metrics per class are needed.
-    # For now, the primary change is training with multiclass labels.
-    # Example of evaluating for one class (e.g., profitable, if we define that for multiclass)
-    # preds_val = model.predict(X_val)
-    # Example: precision for class 1 (TP1)
-    # precision_tp1 = precision_score(y_val, preds_val, labels=[1], average='micro', zero_division=0) 
-    # recall_tp1 = recall_score(y_val, preds_val, labels=[1], average='micro', zero_division=0)
-    # print(f"Entry Model ({model_type}) Validation (Example for TP1 - Class 1):")
-    # print(f"  Precision (TP1): {precision_tp1:.3f}, Recall (TP1): {recall_tp1:.3f}")
-    # print(f"Entry Model ({model_type}) trained with multiclass labels.")
-    # from sklearn.metrics import classification_report
-    # print(classification_report(y_val, preds_val)) # This would give a full multiclass report
+    
+    print(f"Entry Model ({model_type}) trained (y_train shape: {y_train.shape}, unique values: {np.unique(y_train)})")
     return model
 
 
@@ -3055,15 +3167,15 @@ def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot
     entry_learning_rate = trial.suggest_float('entry_learning_rate', 0.01, 0.1) if entry_model_type == 'lgbm' else None
     entry_max_depth = trial.suggest_int('entry_max_depth', 5, 10)
     # Thresholds
-    p_swing_threshold = trial.suggest_float('p_swing_threshold', 0.5, 0.9)
-    profit_threshold = trial.suggest_float('profit_threshold', 0.5, 0.9)
+    p_swing_threshold = trial.suggest_float('p_swing_threshold', 0.3, 0.9) # Lowered min
+    profit_threshold = trial.suggest_float('profit_threshold', 0.2, 0.9) # Lowered min (used as Expected R threshold)
 
     # --- Strategy/Data Processing Parameters to Tune ---
     current_atr_period = trial.suggest_int('atr_period_opt', 10, 24)
     current_pivot_n_left = trial.suggest_int('pivot_n_left_opt', 2, 7)
     current_pivot_n_right = trial.suggest_int('pivot_n_right_opt', 2, 7)
-    current_min_atr_distance = trial.suggest_float('min_atr_distance_opt', 0.5, 2.5)
-    current_min_bar_gap = trial.suggest_int('min_bar_gap_opt', 5, 15)
+    current_min_atr_distance = trial.suggest_float('min_atr_distance_opt', 0.2, 2.5) # Lowered min
+    current_min_bar_gap = trial.suggest_int('min_bar_gap_opt', 2, 15) # Lowered min
 
     atr_col_name_optuna = f'atr_{current_atr_period}'
     print(f"Optuna Trial - Params: ATR_P={current_atr_period}, Pivot_L={current_pivot_n_left}, Pivot_R={current_pivot_n_right}, MinATR_D={current_min_atr_distance:.2f}, MinBar_G={current_min_bar_gap}")
@@ -3153,15 +3265,19 @@ def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot
     p_swing_val_all_classes = pivot_model.predict_proba(X_pivot_val)
     df_train['P_swing'] = np.max(p_swing_train_all_classes[:, 1:], axis=1)
     df_val['P_swing'] = np.max(p_swing_val_all_classes[:, 1:], axis=1)
+    
+    initial_train_pivots = df_train[(df_train['pivot_label'].isin([1, 2])) & (df_train['trade_outcome'] != -1)]
+    print(f"DEBUG (Optuna): Initial Train Pivots with outcome: {len(initial_train_pivots)}")
 
-    entry_train_candidates = df_train[
-        (df_train['pivot_label'].isin([1, 2])) &
-        (df_train['trade_outcome'] != -1) &
-        (df_train['P_swing'] >= p_swing_threshold)
+    entry_train_candidates = initial_train_pivots[
+        initial_train_pivots['P_swing'] >= p_swing_threshold
     ].copy()
+    print(f"DEBUG (Optuna): Train Candidates after P_swing ({p_swing_threshold:.2f}) filter: {len(entry_train_candidates)}")
 
-    if len(entry_train_candidates) < 50:
-        return -1.0 
+
+    if len(entry_train_candidates) < 50: # Min candidates for reliable entry model training
+        print(f"DEBUG (Optuna): Insufficient train candidates ({len(entry_train_candidates)}) after P_swing. Penalizing trial.")
+        return -100.0 # Penalize more if not enough data for entry model
 
     entry_train_candidates['norm_dist_entry_pivot'] = (entry_train_candidates['entry_price_sim'] - entry_train_candidates.apply(lambda r: r['low'] if r['is_swing_low'] == 1 else r['high'], axis=1)) / entry_train_candidates[atr_col_name_optuna]
     entry_train_candidates['norm_dist_entry_sl'] = (entry_train_candidates['entry_price_sim'] - entry_train_candidates['sl_price_sim']).abs() / entry_train_candidates[atr_col_name_optuna]
@@ -3203,23 +3319,41 @@ def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot
 
     if len(X_entry_eval) == 0: return -0.5
 
-    p_profit_val = entry_model.predict_proba(X_entry_eval)[:, 1]
+    p_profit_val = entry_model.predict_proba(X_entry_eval)[:, 1] # Assuming class 1 is "profitable"
+    
+    print(f"DEBUG (Optuna): Validation Pivots for Entry Eval: {len(potential_pivots_val)}. P_profit scores sample: {p_profit_val[:5]}")
+
     final_trades_val = potential_pivots_val[p_profit_val >= profit_threshold]
+    print(f"DEBUG (Optuna): Final Validation Trades after P_profit ({profit_threshold:.2f}) filter: {len(final_trades_val)}")
+
 
     if len(final_trades_val) == 0:
-        return 0.0
+        return -10.0 # Penalize heavily if no trades are made by the strategy
 
-    profit_sum = 0; loss_sum = 0
+    # Calculate Net R
+    net_r = 0
     for idx, trade in final_trades_val.iterrows():
         outcome = trade['trade_outcome']
-        if outcome == 0: loss_sum += 1
-        elif outcome == 1: profit_sum += 1
-        elif outcome == 2: profit_sum += 2
-        elif outcome == 3: profit_sum += 3
-    if loss_sum == 0 and profit_sum > 0: return profit_sum
-    if loss_sum == 0 and profit_sum == 0: return 0.0
-    profit_factor = profit_sum / loss_sum
-    return profit_factor if profit_factor > 0 else -1.0 * (1/ (profit_factor -0.001))
+        if outcome == 0: net_r -= 1  # SL
+        elif outcome == 1: net_r += 1 # TP1
+        elif outcome == 2: net_r += 2 # TP2
+        elif outcome == 3: net_r += 3 # TP3
+    
+    # Add a small penalty for very few trades to encourage more robust strategies
+    # if a strategy makes positive R but very few trades, it might be less preferred.
+    trade_count_penalty = 0
+    min_trades_for_no_penalty = 5 # Example value, can be tuned or part of Optuna study
+    if len(final_trades_val) < min_trades_for_no_penalty:
+        # Penalize by 0.5R for each trade short of min_trades_for_no_penalty,
+        # but don't let penalty itself make a positive R negative if it's just a few trades.
+        # This penalty is applied to Net R.
+        trade_count_penalty = (min_trades_for_no_penalty - len(final_trades_val)) * 0.5 
+        # Example: 3 trades, net_r = 2. Penalty = (5-3)*0.5 = 1. Objective = 2-1=1.
+        # Example: 1 trade, net_r = 3. Penalty = (5-1)*0.5 = 2. Objective = 3-2=1.
+        # Example: 1 trade, net_r = -1. Penalty = 2. Objective = -1-2 = -3.
+
+    final_objective_value = net_r - trade_count_penalty
+    return final_objective_value
 
 
 def run_optuna_tuning(df_universal_raw, static_entry_features_base_list, n_trials=50): # Renamed df_processed to df_universal_raw, changed features params
@@ -3381,27 +3515,20 @@ def full_backtest(df_processed, pivot_model, entry_model, best_params, pivot_fea
         print("No data for entry model evaluation in test set after feature engineering.")
         return 0, 0, 0, 0 # Return zero for metrics
 
-    # 4. Entry Predictions (Multiclass Probabilities)
-    p_all_classes_test = entry_model.predict_proba(X_entry_test) # Shape: (num_samples, num_classes)
+    # 4. Entry Predictions (Binary: Not Profitable vs. Profitable)
+    # Entry model is trained as binary, so predict_proba gives [P_NotProfitable, P_Profitable]
+    p_profit_test = entry_model.predict_proba(X_entry_test)[:, 1] # Probability of class 1 (profitable)
 
-    # 5. Calculate Expected R for test set
-    # R-values: Class 0 (SL): -1R, Class 1 (TP1): +1R, Class 2 (TP2): +2R, Class 3 (TP3): +3R
-    # (Potentially Class 4 for Time Exit later)
-    r_values_by_class_backtest = [-1, 1, 2, 3] # R-value for class 0, 1, 2, 3
-    num_predicted_classes_test = p_all_classes_test.shape[1]
+    # 5. Filter by P_profit threshold (consistent with Optuna's validation)
+    profit_threshold_backtest = best_params.get('profit_threshold', 0.6) # Default from Optuna, should be consistent
+    final_trades_test = potential_pivots_test[p_profit_test >= profit_threshold_backtest].copy()
     
-    expected_r_test = np.zeros(p_all_classes_test.shape[0])
-    for k_class_idx_test in range(num_predicted_classes_test):
-        if k_class_idx_test < len(r_values_by_class_backtest):
-            expected_r_test += p_all_classes_test[:, k_class_idx_test] * r_values_by_class_backtest[k_class_idx_test]
-        # else: handle classes beyond defined r_values if necessary
+    print(f"DEBUG (full_backtest): Test Pivots for Entry Eval: {len(potential_pivots_test)}. P_profit scores sample: {p_profit_test[:5]}")
+    print(f"DEBUG (full_backtest): Final Test Trades after P_profit ({profit_threshold_backtest:.2f}) filter: {len(final_trades_test)}")
 
-    # 6. Filter by Expected R threshold (using 'profit_threshold' from best_params, now an ER threshold)
-    expected_r_threshold_backtest = best_params.get('profit_threshold', 0.4) # Default if not in best_params
-    final_trades_test = potential_pivots_test[expected_r_test >= expected_r_threshold_backtest].copy() # Use >= to include threshold
 
     if len(final_trades_test) == 0:
-        print(f"No trades passed Expected R threshold ({expected_r_threshold_backtest:.2f}) in test set.")
+        print(f"No trades passed P_profit threshold ({profit_threshold_backtest:.2f}) in test set.")
         return 0, 0, 0, 0 # Trades, Win Rate, Avg R, Profit Factor
 
     # 6. Calculate Metrics
@@ -3625,11 +3752,144 @@ def run_backtest_scenario(scenario_name: str, df_processed: pd.DataFrame,
     print(f"  Profit Factor: {profit_factor:.3f}")
     print(f"  Max Drawdown (in R units): {max_drawdown_r:.3f}R")
 
-    return {
-        "scenario": scenario_name, "trades": num_trades, "win_rate": win_rate,
-        "avg_r": avg_r, "profit_factor": profit_factor, "max_dd_r": max_drawdown_r,
-        "trade_frequency": trade_frequency
+    # Return a dictionary of results
+    results_dict = {
+        "scenario": scenario_name,
+        "trades": num_trades,
+        "win_rate": win_rate,
+        "avg_r": avg_r,
+        "profit_factor": profit_factor,
+        "max_dd_r": max_drawdown_r,
+        "trade_frequency": trade_frequency,
+        # Potentially add symbol if this function is to be used per symbol for summary
+        # "symbol": df_test.name if hasattr(df_test, 'name') else 'N/A' 
     }
+    return results_dict
+
+# --- Backtest Summary Generation ---
+def generate_training_backtest_summary(df_processed_full_dataset, # This is the full dataset used for training/val/test split
+                                       pivot_model, entry_model, 
+                                       best_params_from_optuna, 
+                                       pivot_feature_names_list, entry_feature_names_base_list,
+                                       app_settings_dict):
+    """
+    Generates and displays a summary of backtest results for different scenarios.
+    Uses a portion of df_processed_full_dataset as a consistent test set for all scenarios.
+    """
+    log_prefix_summary = "[TrainingSummary]"
+    print(f"\n{log_prefix_summary} --- Generating Training Backtest Summary ---")
+
+    all_scenario_results = []
+    
+    # Define symbols for summary - could come from app_settings_dict or be fixed
+    # For now, let's assume the summary is for the universal model's performance on a test split
+    # of the data it was trained on, rather than re-processing specific symbols from scratch.
+    # This uses the test portion of the universal dataset.
+    
+    # Determine ATR column name from best_params_from_optuna
+    atr_period_summary = best_params_from_optuna.get('atr_period_opt', ATR_PERIOD) # Default if not in optuna params
+    atr_col_name_summary = f'atr_{atr_period_summary}'
+
+    # Scenarios to run
+    scenarios = ["Rule-Based Baseline", "ML Stage 1 (Pivot Filter)", "Full ML Pipeline"]
+
+    # The df_processed_full_dataset is the one that was split into train/val/test for the main model training.
+    # full_backtest already takes the last 15% of this as its test set.
+    # We can call run_backtest_scenario with use_full_df_as_test=False, and it will derive the same test set.
+    # Or, to be explicit, we can split it here once. Let's rely on run_backtest_scenario's default split for now.
+    
+    print(f"{log_prefix_summary} Using universal processed dataset for summary. Test split will be derived by run_backtest_scenario.")
+
+    for scenario in scenarios:
+        print(f"{log_prefix_summary} Running scenario: {scenario}...")
+        # Note: df_processed_full_dataset might not have 'symbol' if it's concatenated.
+        # run_backtest_scenario doesn't strictly need symbol name for metrics, but good for context.
+        
+        # Ensure the atr_col_name_summary exists in df_processed_full_dataset if it's different from default ATR_PERIOD
+        # This should be handled if df_processed_full_dataset was created by process_dataframe_with_params
+        # using best_params_from_optuna which set the correct atr_period.
+        if atr_col_name_summary not in df_processed_full_dataset.columns:
+            print(f"{log_prefix_summary} WARNING: ATR column '{atr_col_name_summary}' for scenario '{scenario}' not found in provided df_processed_full_dataset. Skipping scenario.")
+            # Fallback: try with default ATR_PERIOD if that column exists? Or just skip.
+            # For now, skipping as it implies a data mismatch.
+            # A more robust approach would be to re-process a subset of data using the specific ATR period for each symbol.
+            # However, the goal here is a summary of the *trained universal model's performance*.
+            # So, we use the df_processed_full_dataset that was used for training it.
+            continue
+
+
+        scenario_results = run_backtest_scenario(
+            scenario_name=scenario,
+            df_processed=df_processed_full_dataset.copy(), # Pass a copy to avoid in-place modifications
+            pivot_model=pivot_model,
+            entry_model=entry_model,
+            best_params=best_params_from_optuna,
+            pivot_features=pivot_feature_names_list,
+            entry_features_base=entry_feature_names_base_list,
+            atr_col_name=atr_col_name_summary, # Use ATR col consistent with model training
+            use_full_df_as_test=False # run_backtest_scenario will take its usual test split (last 15%)
+        )
+        # Add symbol context if possible/relevant for universal model summary (e.g. "Universal")
+        scenario_results['symbol_context'] = "UniversalTestSet" 
+        all_scenario_results.append(scenario_results)
+
+    if not all_scenario_results:
+        print(f"{log_prefix_summary} No results generated for summary.")
+        return
+
+    # Display the summary table (implement display_summary_table next)
+    summary_csv_path = "training_backtest_summary.csv"
+    display_summary_table(all_scenario_results, log_prefix_summary, save_to_csv_path=summary_csv_path)
+    print(f"{log_prefix_summary} --- Training Backtest Summary Generation Complete ---")
+
+def display_summary_table(results_list: list[dict], log_prefix: str = "[SummaryTable]", save_to_csv_path: str = None):
+    """
+    Displays a list of backtest result dictionaries as a formatted table.
+    Optionally saves the raw results to a CSV file.
+    """
+    if not results_list:
+        print(f"{log_prefix} No results to display.")
+        return
+
+    df_results = pd.DataFrame(results_list)
+    
+    # Define desired column order and formatting
+    # (symbol_context was added in generate_training_backtest_summary)
+    columns_ordered = ['symbol_context', 'scenario', 'trades', 'win_rate', 'avg_r', 'profit_factor', 'max_dd_r', 'trade_frequency']
+    
+    # Filter for existing columns to prevent errors if some are missing
+    display_columns = [col for col in columns_ordered if col in df_results.columns]
+    df_display = df_results[display_columns].copy()
+
+    # Apply formatting for readability
+    if 'win_rate' in df_display:
+        df_display['win_rate'] = df_display['win_rate'].map(lambda x: f"{x:.2%}" if pd.notnull(x) else "N/A")
+    if 'avg_r' in df_display:
+        df_display['avg_r'] = df_display['avg_r'].map(lambda x: f"{x:.2f}R" if pd.notnull(x) else "N/A")
+    if 'profit_factor' in df_display:
+        df_display['profit_factor'] = df_display['profit_factor'].map(lambda x: f"{x:.2f}" if pd.notnull(x) else "N/A")
+    if 'max_dd_r' in df_display:
+        df_display['max_dd_r'] = df_display['max_dd_r'].map(lambda x: f"{x:.2f}R" if pd.notnull(x) else "N/A")
+    if 'trade_frequency' in df_display:
+        df_display['trade_frequency'] = df_display['trade_frequency'].map(lambda x: f"{x:.2f}" if pd.notnull(x) else "N/A")
+    if 'trades' in df_display:
+        df_display['trades'] = df_display['trades'].map(lambda x: f"{int(x)}" if pd.notnull(x) else "N/A")
+
+    print(f"\n{log_prefix} === Backtest Summary Table ===")
+    # Convert to string and print; using to_string() for better console display
+    table_string = df_display.to_string(index=False)
+    print(table_string)
+    print(f"{log_prefix} ============================\n")
+
+    # Save to CSV if path is provided
+    if save_to_csv_path:
+        try:
+            # Use the original df_results for CSV to keep raw numbers if needed, or df_display for formatted
+            df_results.to_csv(save_to_csv_path, index=False)
+            print(f"{log_prefix} Summary table saved to {save_to_csv_path}")
+        except Exception as e:
+            print(f"{log_prefix} Error saving summary table to CSV '{save_to_csv_path}': {e}")
+
 
 # --- Main Orchestration ---
 def get_processed_data_for_symbol(symbol_ticker, kline_interval, start_date, end_date):
