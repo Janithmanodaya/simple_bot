@@ -432,6 +432,8 @@ def load_app_settings(filepath=APP_CONFIG_FILE):
         "app_force_retrain_on_startup": False,
         # Add other ML training specific defaults if needed (e.g., Optuna trials)
         "app_optuna_trials": 20, # Default Optuna trials for app.py training
+        "app_use_dynamic_threshold": True, # New: Toggle for dynamic/fixed pivot threshold
+        "app_fixed_pivot_threshold": 0.7,  # New: Fixed pivot threshold value
         
         # New settings for the trading/signal loop
         "app_trading_symbols": "BTCUSDT", # Comma-separated list of symbols
@@ -550,6 +552,46 @@ def load_app_settings(filepath=APP_CONFIG_FILE):
             current_settings.get("app_force_retrain_on_startup", defaults["app_force_retrain_on_startup"]),
             bool
         )
+
+    # Dynamic/Fixed Threshold Mode
+    app_use_dynamic_thresh_valid = False
+    if "app_use_dynamic_threshold" in loaded_json_settings:
+        use_dyn_val = loaded_json_settings["app_use_dynamic_threshold"]
+        if isinstance(use_dyn_val, bool):
+            current_settings["app_use_dynamic_threshold"] = use_dyn_val
+            app_use_dynamic_thresh_valid = True
+    if not app_use_dynamic_thresh_valid:
+        print("app.py: 'app_use_dynamic_threshold' missing or invalid. Prompting.")
+        current_settings["app_use_dynamic_threshold"] = get_user_input(
+            "Use dynamic pivot threshold (true/false)?",
+            current_settings.get("app_use_dynamic_threshold", defaults["app_use_dynamic_threshold"]),
+            bool
+        )
+
+    # Fixed Pivot Threshold Value
+    app_fixed_thresh_valid = False
+    if "app_fixed_pivot_threshold" in loaded_json_settings:
+        try:
+            fixed_thresh_val = float(loaded_json_settings["app_fixed_pivot_threshold"])
+            if 0.0 < fixed_thresh_val < 1.0: # Threshold should be a probability
+                current_settings["app_fixed_pivot_threshold"] = fixed_thresh_val
+                app_fixed_thresh_valid = True
+        except ValueError:
+            pass # Invalid float, will prompt
+    if not app_fixed_thresh_valid:
+        print("app.py: 'app_fixed_pivot_threshold' missing or invalid. Prompting.")
+        current_settings["app_fixed_pivot_threshold"] = get_user_input(
+            "Fixed pivot threshold value (e.g., 0.7)",
+            current_settings.get("app_fixed_pivot_threshold", defaults["app_fixed_pivot_threshold"]),
+            float
+        )
+        while not (0.0 < current_settings["app_fixed_pivot_threshold"] < 1.0):
+            print("Invalid input: Fixed pivot threshold must be between 0.0 and 1.0 (exclusive).")
+            current_settings["app_fixed_pivot_threshold"] = get_user_input(
+                "Fixed pivot threshold value (e.g., 0.7)",
+                defaults["app_fixed_pivot_threshold"],
+                float
+            )
         
     # Operational mode (this is often set interactively later in start_app_main_flow)
     # If missing or invalid in JSON, it will use the default. No interactive prompt here
@@ -1976,17 +2018,58 @@ def app_process_symbol_for_signal(symbol: str, client, current_app_settings: dic
         print(f"{log_prefix} Best hyperparameters not loaded. Skipping.")
         return
 
-    # --- Parameters from best_hyperparams ---
+    # --- Parameters from best_hyperparams and app_settings ---
     atr_period_for_features = current_best_hyperparams.get('model_training_atr_period_used')
     pivot_feature_names_list = current_best_hyperparams.get('pivot_feature_names_used')
     entry_feature_names_base_list = current_best_hyperparams.get('entry_feature_names_base_used')
-    p_swing_thresh = current_best_hyperparams.get('p_swing_threshold')
-    p_profit_thresh = current_best_hyperparams.get('profit_threshold') # Assuming this is prob of profitable class
+    
+    # Dynamic threshold is the p_swing_threshold from Optuna/best_params.json
+    dynamic_pivot_threshold = current_best_hyperparams.get('p_swing_threshold')
+    # Fixed threshold is from app_settings.json
+    fixed_pivot_threshold = current_app_settings.get('app_fixed_pivot_threshold', 0.7) # Default if not in settings
+    use_dynamic_threshold_mode = current_app_settings.get('app_use_dynamic_threshold', True) # Default to dynamic
 
-    if not all([atr_period_for_features, pivot_feature_names_list, entry_feature_names_base_list, p_swing_thresh, p_profit_thresh]):
-        print(f"{log_prefix} Critical parameters missing from best_hyperparams. Skipping. Check app_model_params.json.")
-        print(f"  ATR Period: {atr_period_for_features}, P-Swing Thresh: {p_swing_thresh}, P-Profit Thresh: {p_profit_thresh}")
-        print(f"  Pivot Features List Empty: {not pivot_feature_names_list}, Entry Features Base List Empty: {not entry_feature_names_base_list}")
+    p_profit_thresh = current_best_hyperparams.get('profit_threshold') # For entry model
+
+    # Validate dynamic_pivot_threshold
+    if dynamic_pivot_threshold is None or not (0.0 < dynamic_pivot_threshold < 1.0):
+        print(f"{log_prefix} WARNING: Dynamic pivot threshold (p_swing_threshold from best_params.json: {dynamic_pivot_threshold}) is missing or invalid.")
+        if use_dynamic_threshold_mode:
+            print(f"{log_prefix} Dynamic mode was enabled but dynamic threshold is invalid. Falling back to fixed threshold: {fixed_pivot_threshold}.")
+            # Fallback to fixed threshold if dynamic was selected but invalid
+            p_swing_thresh_to_use = fixed_pivot_threshold
+            threshold_mode_in_use = f"Fixed (Fallback from invalid Dynamic: {dynamic_pivot_threshold})"
+            # Log the original dynamic threshold for reference if it was just out of range but not None
+            reference_threshold_val = dynamic_pivot_threshold if dynamic_pivot_threshold is not None else "N/A (Missing)"
+            reference_threshold_type = "Dynamic (Invalid)"
+        else: # Fixed mode was already selected, dynamic threshold invalidity is just for logging comparison
+            p_swing_thresh_to_use = fixed_pivot_threshold
+            threshold_mode_in_use = "Fixed"
+            reference_threshold_val = dynamic_pivot_threshold if dynamic_pivot_threshold is not None else "N/A (Missing)"
+            reference_threshold_type = "Dynamic (Invalid)"
+    elif use_dynamic_threshold_mode:
+        p_swing_thresh_to_use = dynamic_pivot_threshold
+        threshold_mode_in_use = "Dynamic"
+        reference_threshold_val = fixed_pivot_threshold
+        reference_threshold_type = "Fixed"
+    else: # Using fixed threshold mode, and dynamic_pivot_threshold is valid (for comparison logging)
+        p_swing_thresh_to_use = fixed_pivot_threshold
+        threshold_mode_in_use = "Fixed"
+        reference_threshold_val = dynamic_pivot_threshold
+        reference_threshold_type = "Dynamic"
+
+    print(f"{log_prefix} Pivot Threshold Selection: Mode Active='{threshold_mode_in_use}', Threshold Value Used={p_swing_thresh_to_use:.3f}")
+    print(f"{log_prefix}   Reference Threshold: Type='{reference_threshold_type}', Value={reference_threshold_val if isinstance(reference_threshold_val, str) else f'{reference_threshold_val:.3f}'}")
+
+
+    if not all([atr_period_for_features, pivot_feature_names_list, entry_feature_names_base_list, p_profit_thresh]): # p_swing_thresh_to_use is now primary
+        print(f"{log_prefix} Critical parameters missing from best_hyperparams or app_settings. Skipping.")
+        # Log which specific core parameters are missing
+        if not atr_period_for_features: print("  - Missing: model_training_atr_period_used")
+        if not pivot_feature_names_list: print("  - Missing: pivot_feature_names_used")
+        if not entry_feature_names_base_list: print("  - Missing: entry_feature_names_base_used")
+        # p_swing_thresh_to_use is derived, so its validity check is above.
+        if not p_profit_thresh: print("  - Missing: profit_threshold (for entry model)")
         return
 
     # --- Data Fetching ---
@@ -2050,9 +2133,33 @@ def app_process_symbol_for_signal(symbol: str, client, current_app_settings: dic
     else:
         print(f"{log_prefix} live_pivot_features is None, cannot log them.")
 
-    if p_swing_score_live < p_swing_thresh or predicted_pivot_class_live == 0:
-        print(f"{log_prefix} No significant pivot detected by model (P_Swing {p_swing_score_live:.3f} < {p_swing_thresh:.2f} or PredClass is 0).")
+    # Log the decision based on the *chosen* threshold
+    pivot_decision_log_message = f"Pivot Score: {p_swing_score_live:.3f}. Threshold Used ({threshold_mode_in_use}): {p_swing_thresh_to_use:.3f}. "
+    
+    # Determine if trade would be taken under dynamic and fixed for logging
+    # Ensure dynamic_pivot_threshold and fixed_pivot_threshold are valid floats for comparison
+    # If dynamic_pivot_threshold was invalid, its comparison result is not meaningful for "would it have taken trade"
+    
+    # Dynamic perspective
+    would_trade_dynamic = False
+    if dynamic_pivot_threshold is not None and (0.0 < dynamic_pivot_threshold < 1.0): # Only if valid dynamic threshold
+        if p_swing_score_live >= dynamic_pivot_threshold and predicted_pivot_class_live != 0:
+            would_trade_dynamic = True
+    
+    # Fixed perspective (fixed_pivot_threshold is validated during load_app_settings)
+    would_trade_fixed = False
+    if p_swing_score_live >= fixed_pivot_threshold and predicted_pivot_class_live != 0:
+        would_trade_fixed = True
+
+    pivot_decision_log_message += f"Trade Signal (Dynamic: {'YES' if would_trade_dynamic else 'NO'}, Fixed: {'YES' if would_trade_fixed else 'NO'})."
+
+
+    if p_swing_score_live < p_swing_thresh_to_use or predicted_pivot_class_live == 0:
+        print(f"{log_prefix} No significant pivot based on {threshold_mode_in_use} threshold. {pivot_decision_log_message}")
         return
+    
+    # If pivot passes, log the full decision message
+    print(f"{log_prefix} Pivot passes {threshold_mode_in_use} threshold. {pivot_decision_log_message}")
 
     # --- Pivot Detected, Proceed to Entry Model ---
     current_candle = df_live_raw.iloc[-1]
