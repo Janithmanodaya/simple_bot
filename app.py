@@ -2005,8 +2005,9 @@ def app_calculate_live_pivot_features(df_live: pd.DataFrame, atr_period: int, pi
     # For now, let's assume `engineer_pivot_features` can run and we'll address `bars_since_last_pivot` if it causes issues.
     # A simple fix for 'bars_since_last_pivot' if labels are missing: set it to 0 or a high number.
     # Add dummy label columns if engineer_pivot_features strictly requires them, but they won't be used for actual labeling.
-    if 'is_swing_high' not in df.columns: df['is_swing_high'] = 0
-    if 'is_swing_low' not in df.columns: df['is_swing_low'] = 0
+    # The modified engineer_pivot_features will handle this internally.
+    # if 'is_swing_high' not in df.columns: df['is_swing_high'] = 0 # No longer needed here
+    # if 'is_swing_low' not in df.columns: df['is_swing_low'] = 0 # No longer needed here
     
     df_with_features, calculated_feature_names = engineer_pivot_features(df, atr_col_name=atr_col_name)
     
@@ -2017,7 +2018,7 @@ def app_calculate_live_pivot_features(df_live: pd.DataFrame, atr_period: int, pi
     live_features_series = df_with_features.iloc[-1][pivot_feature_names].copy()
     
     # Replace Inf values (e.g., from division by zero if ATR was zero and not handled robustly)
-    live_features_series.replace([np.inf, -np.inf], np.nan, inplace=True)
+    live_features_series = live_features_series.replace([np.inf, -np.inf], np.nan) # Addressed FutureWarning
 
     if live_features_series.isnull().any():
         print(f"{log_prefix} NaN values found in live pivot features for the latest candle:")
@@ -2102,7 +2103,7 @@ def app_calculate_live_entry_features(df_live: pd.DataFrame, atr_period: int, en
     live_features_series = df_with_base_features.iloc[-1][full_entry_feature_list].copy()
 
     # Replace Inf values
-    live_features_series.replace([np.inf, -np.inf], np.nan, inplace=True)
+    live_features_series = live_features_series.replace([np.inf, -np.inf], np.nan) # Addressed FutureWarning
 
     if live_features_series.isnull().any():
         print(f"{log_prefix} NaN values found in live entry features for the latest candle:")
@@ -3277,44 +3278,66 @@ def engineer_pivot_features(df, atr_col_name): # Added atr_col_name
 
     # Local Structure
     df['high_rank_7'] = df['high'].rolling(window=7).rank(pct=True)
-    # Bars since last candidate pivot (requires iterating or more complex logic)
-    df['bars_since_last_pivot'] = 0 
-    MAX_BARS_NO_PIVOT_CONSTANT = 200 # Constant if no real pivots in window
+    
+    # --- Bars Since Last Pivot Calculation (Revised) ---
+    MAX_BARS_NO_PIVOT_CONSTANT = 200
+    df['bars_since_last_pivot'] = MAX_BARS_NO_PIVOT_CONSTANT # Default
 
-    has_real_pivots_in_df = False
+    has_pre_calculated_pivots = False
     if 'is_swing_high' in df.columns and 'is_swing_low' in df.columns:
         if (df['is_swing_high'] == 1).any() or (df['is_swing_low'] == 1).any():
-            has_real_pivots_in_df = True
+            has_pre_calculated_pivots = True
 
-    if has_real_pivots_in_df:
-        last_pivot_idx = -1
-        for i in range(len(df)):
-            # Check current row for a confirmed pivot
-            # Ensure .iloc is used if df.index is not a simple range [0, ..., N-1]
-            # However, 'i' here is from range(len(df)), so it's a positional index.
-            is_high_pivot_current_row = df['is_swing_high'].iloc[i] == 1
-            is_low_pivot_current_row = df['is_swing_low'].iloc[i] == 1
+    if has_pre_calculated_pivots:
+        # Training path: Use pre-calculated is_swing_high/is_swing_low from prune_and_label_pivots
+        pivot_indices_series = df[(df.get('is_swing_high') == 1) | (df.get('is_swing_low') == 1)].index
+        if not pivot_indices_series.empty:
+            last_pivot_map = pd.Series(index=df.index, dtype='float64')
+            current_last_pivot_idx = np.nan # Use np.nan for missing initial pivots
+            for idx in df.index:
+                pivots_up_to_idx = pivot_indices_series[pivot_indices_series <= idx]
+                if not pivots_up_to_idx.empty:
+                    current_last_pivot_idx = pivots_up_to_idx[-1]
+                last_pivot_map.loc[idx] = current_last_pivot_idx
             
-            if is_high_pivot_current_row or is_low_pivot_current_row:
-                last_pivot_idx = i # Store the positional index of the last pivot
-
-            # Calculate bars since last pivot
-            if last_pivot_idx != -1:
-                # df.loc[df.index[i], 'bars_since_last_pivot'] should use positional index 'i'
-                # if df.index is not guaranteed to be [0, ..., N-1].
-                # However, since it's initialized with df['bars_since_last_pivot'] = 0,
-                # direct assignment df['bars_since_last_pivot'].iloc[i] is safer if index is complex.
-                # Given the loop is `for i in range(len(df))`, df.index[i] refers to the label-based index
-                # at position i. df.iloc[i] refers to the row at position i.
-                # Let's assume simple RangeIndex for now, so df.loc[df.index[i]] is equivalent to df.iloc[i].
-                df.loc[df.index[i], 'bars_since_last_pivot'] = i - last_pivot_idx
-            else:
-                # If no pivot encountered yet in this df slice, count from start of slice
-                df.loc[df.index[i], 'bars_since_last_pivot'] = i 
+            df_idx_to_pos = pd.Series(range(len(df)), index=df.index)
+            # Calculate bars_since: current_pos - pos_of_last_pivot
+            # Ensure mapping from df.index (potentially non-integer) to integer positions
+            pos_of_last_pivot = last_pivot_map.map(df_idx_to_pos).fillna(-1).astype(int) # Map pivot index labels to positions
+            bars_since = df_idx_to_pos - pos_of_last_pivot
+            
+            # For rows before the first pivot, last_pivot_map would be NaN, pos_of_last_pivot -1
+            # So bars_since would be df_idx_to_pos - (-1) = df_idx_to_pos + 1. This is correct.
+            # If last_pivot_map.map(df_idx_to_pos) results in NaN (pivot index not in df_idx_to_pos), fillna(-1) handles it.
+            df['bars_since_last_pivot'] = bars_since.astype(int)
+            # Any remaining NaNs (e.g. if mapping failed unexpectedly) or if no pivots at all, should be caught by fillna later if not here.
+            # If pivot_indices_series was empty, this block is skipped, default MAX_BARS_NO_PIVOT_CONSTANT remains.
     else:
-        # No real pivots found (e.g., live mode with dummy columns, or a section of training data without pivots)
-        # Set to a constant large value for all rows in this case.
-        df['bars_since_last_pivot'] = MAX_BARS_NO_PIVOT_CONSTANT
+        # Live prediction path (or training segment without any true pivots):
+        # Use local candidate pivots within the current df segment.
+        df_temp_candidates = df.copy()
+        df_temp_candidates = generate_candidate_pivots(df_temp_candidates, n_left=PIVOT_N_LEFT, n_right=PIVOT_N_RIGHT) # Use global PIVOT_N_LEFT/RIGHT
+        
+        candidate_indices = df_temp_candidates[(df_temp_candidates['is_candidate_high']) | (df_temp_candidates['is_candidate_low'])].index
+        
+        if not candidate_indices.empty:
+            last_candidate_pivot_map = pd.Series(index=df.index, dtype='float64')
+            current_last_candidate_idx = np.nan
+            for idx in df.index:
+                candidates_up_to_idx = candidate_indices[candidate_indices <= idx]
+                if not candidates_up_to_idx.empty:
+                    current_last_candidate_idx = candidates_up_to_idx[-1]
+                last_candidate_pivot_map.loc[idx] = current_last_candidate_idx
+
+            df_idx_to_pos = pd.Series(range(len(df)), index=df.index)
+            pos_of_last_candidate_pivot = last_candidate_pivot_map.map(df_idx_to_pos).fillna(-1).astype(int)
+            bars_since_candidate = df_idx_to_pos - pos_of_last_candidate_pivot
+            df['bars_since_last_pivot'] = bars_since_candidate.astype(int)
+        # If no candidates found, 'bars_since_last_pivot' remains MAX_BARS_NO_PIVOT_CONSTANT
+
+    # Ensure any NaNs that might have slipped through (e.g. if df.index was very unusual) are defaulted
+    df['bars_since_last_pivot'].fillna(MAX_BARS_NO_PIVOT_CONSTANT, inplace=True)
+
 
     # Volume
     df['volume_rolling_avg_20'] = df['volume'].rolling(window=20).mean()
