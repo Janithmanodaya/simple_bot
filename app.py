@@ -218,6 +218,10 @@ def get_historical_bars(symbol, interval, start_str, end_str=None):
         # If successful, app_binance_client is now set.
 
     klines = app_binance_client.get_historical_klines(symbol, interval, start_str, end_str)
+    if not klines: # Check if klines list is empty
+        print(f"Warning (get_historical_bars): No klines returned from API for {symbol} {interval} {start_str} {end_str}.")
+        # Return DataFrame with expected columns but no data
+        return pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df = pd.DataFrame(klines, columns=[
         'timestamp', 'open', 'high', 'low', 'close', 'volume',
         'close_time', 'quote_asset_volume', 'number_of_trades',
@@ -261,15 +265,17 @@ def get_or_download_historical_data(symbol: str, interval: str,
     elif "day" in safe_interval_str: safe_interval_str = safe_interval_str.replace("day", "d")
     
     file_path = os.path.join(data_directory, f"{symbol}_{safe_interval_str}_data.parquet")
+    log_prefix_parquet = f"[ParquetIO-{symbol}]" # Logger prefix for this function
 
     existing_df = None
     last_timestamp_ms = None
 
     if os.path.exists(file_path) and not force_redownload_all:
-        print(f"Loading existing data for {symbol} from {file_path}...")
+        print(f"{log_prefix_parquet} Loading existing data for {symbol} from {file_path}...")
         try:
             existing_df = pd.read_parquet(file_path)
-            if not existing_df.empty and 'timestamp' in existing_df.columns:
+            if existing_df is not None and not existing_df.empty and 'timestamp' in existing_df.columns:
+                print(f"{log_prefix_parquet} Existing data loaded. Shape: {existing_df.shape}")
                 # Ensure timestamp is datetime and sorted
                 existing_df['timestamp'] = pd.to_datetime(existing_df['timestamp'])
                 existing_df.sort_values('timestamp', inplace=True)
@@ -278,92 +284,85 @@ def get_or_download_historical_data(symbol: str, interval: str,
                 # Get the last timestamp in milliseconds for Binance API
                 last_timestamp_dt = existing_df['timestamp'].iloc[-1]
                 last_timestamp_ms = int(last_timestamp_dt.timestamp() * 1000)
-                print(f"Last record in existing data: {last_timestamp_dt}")
+                print(f"{log_prefix_parquet} Last record in existing data: {last_timestamp_dt}")
                 
                 # New start date for download is 1 millisecond after the last record's timestamp
-                # Binance API `startTime` is inclusive, so we need to fetch from the next interval.
-                # To be safe, we'll fetch from the start of the interval *containing* last_timestamp_ms + 1.
-                # Or simply, last_timestamp_ms + 1 should fetch the next kline.
                 effective_start_str_for_new_data = str(last_timestamp_ms + 1) # Binance uses ms timestamp string
-            else:
-                print(f"Existing file {file_path} is empty or missing 'timestamp' column. Will perform a full download.")
+            elif existing_df is not None: # Loaded but empty or no timestamp
+                print(f"{log_prefix_parquet} Existing file {file_path} is empty or missing 'timestamp' column. Will perform a full download.")
                 existing_df = None # Treat as no existing data
+            else: # existing_df is None from read_parquet
+                 print(f"{log_prefix_parquet} read_parquet returned None for {file_path}. Will perform a full download.")
+                 existing_df = None # Ensure it's None
         except Exception as e:
-            print(f"Error loading or processing existing Parquet file {file_path}: {e}. Will attempt full redownload.")
+            print(f"{log_prefix_parquet} ERROR: Error loading or processing existing Parquet file {file_path}: {e}. Will attempt full redownload.")
             existing_df = None
             # Optionally, delete or move the corrupted file here
             # os.remove(file_path) 
     else:
-        print(f"No existing data file found at {file_path} (or force_redownload_all=True). Performing full download.")
+        print(f"{log_prefix_parquet} No existing data file found at {file_path} (or force_redownload_all=True). Performing full download.")
 
     if existing_df is None or force_redownload_all: # Full download needed
-        print(f"Fetching full historical data for {symbol} from {start_date_str} to {end_date_str or 'latest'}...")
-        # `get_historical_bars` is the original function to fetch from Binance
-        # It needs the global app_binance_client to be initialized.
-        # Ensure client initialization if running this part standalone or early.
+        print(f"{log_prefix_parquet} Fetching full historical data for {symbol} from {start_date_str} to {end_date_str or 'latest'}...")
         global app_binance_client
         if app_binance_client is None:
-            print("Warning (get_or_download_historical_data): app_binance_client not initialized. Attempting default init.")
+            print(f"{log_prefix_parquet} Warning: app_binance_client not initialized. Attempting default init.")
             if not initialize_app_binance_client(): # Default env
-                 print("CRITICAL: Failed to initialize Binance client in get_or_download. Cannot download.")
-                 return pd.DataFrame() # Return empty if client fails
-
-        downloaded_df = get_historical_bars(symbol, interval, start_date_str, end_str=end_date_str)
-        if downloaded_df.empty:
-            print(f"No data downloaded for {symbol} (full download attempt).")
-            return pd.DataFrame()
+                 print(f"{log_prefix_parquet} CRITICAL: Failed to initialize Binance client. Cannot download.")
+                 return pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']) # Return empty with headers
         
-        # Sort and deduplicate, just in case API returns unsorted/duplicate data (though unlikely for historical)
+        downloaded_df = get_historical_bars(symbol, interval, start_date_str, end_str=end_date_str)
+        if downloaded_df is None or downloaded_df.empty:
+            print(f"{log_prefix_parquet} No data downloaded for {symbol} (full download attempt). Returning empty DataFrame with headers.")
+            return pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        
+        print(f"{log_prefix_parquet} Downloaded full data. Shape: {downloaded_df.shape}. Sorting and saving...")
         downloaded_df.sort_values('timestamp', inplace=True)
         downloaded_df.drop_duplicates(subset=['timestamp'], keep='last', inplace=True)
         
         try:
+            print(f"{log_prefix_parquet} Attempting to write full data to Parquet. Shape: {downloaded_df.shape}. Path: {file_path}")
             downloaded_df.to_parquet(file_path, index=False)
-            print(f"Full data saved to {file_path}")
+            print(f"{log_prefix_parquet} INFO: Wrote full data: {file_path}")
         except Exception as e:
-            print(f"Error saving full data to Parquet {file_path}: {e}")
+            print(f"{log_prefix_parquet} ERROR: Failed writing full data to Parquet {file_path}: {e}")
         return downloaded_df
 
     else: # We have existing_df, try to download new data
-        if last_timestamp_ms is None: # Should not happen if existing_df is not None and processed correctly
-            print("Error: last_timestamp_ms is None despite having existing_df. Aborting update.")
-            return existing_df # Return existing data as is
+        if last_timestamp_ms is None: 
+            print(f"{log_prefix_parquet} Error: last_timestamp_ms is None despite having existing_df. Aborting update.")
+            return existing_df 
 
-        print(f"Fetching new data for {symbol} since {pd.to_datetime(last_timestamp_ms, unit='ms')} (exclusive)...")
+        print(f"{log_prefix_parquet} Fetching new data for {symbol} since {pd.to_datetime(last_timestamp_ms, unit='ms')} (exclusive)...")
         
-        # Ensure client is available
-        #global app_binance_client
         if app_binance_client is None:
-            print("Warning (get_or_download_historical_data - update): app_binance_client not initialized. Attempting default init.")
+            print(f"{log_prefix_parquet} Warning (update): app_binance_client not initialized. Attempting default init.")
             if not initialize_app_binance_client():
-                 print("CRITICAL: Failed to initialize Binance client in get_or_download (update). Cannot download new data.")
-                 return existing_df # Return existing data as is
+                 print(f"{log_prefix_parquet} CRITICAL: Failed to initialize Binance client (update). Cannot download new data.")
+                 return existing_df 
         
-        # Fetch new klines. Start time is the millisecond AFTER the last recorded kline's open time.
-        # get_historical_klines start_str is inclusive.
         new_data_df = get_historical_bars(symbol, interval, 
-                                          start_str=str(last_timestamp_ms + 1), # Fetch data starting from the ms after the last record
+                                          start_str=str(last_timestamp_ms + 1), 
                                           end_str=end_date_str)
 
-        if not new_data_df.empty:
-            print(f"Downloaded {len(new_data_df)} new bars for {symbol}.")
+        if new_data_df is not None and not new_data_df.empty:
+            print(f"{log_prefix_parquet} Downloaded {len(new_data_df)} new bars for {symbol}. Shape: {new_data_df.shape}")
             new_data_df.sort_values('timestamp', inplace=True)
             new_data_df.drop_duplicates(subset=['timestamp'], keep='last', inplace=True)
 
-            # Combine with existing data
             combined_df = pd.concat([existing_df, new_data_df], ignore_index=True)
-            # Sort again and remove duplicates across the combined boundary
+            print(f"{log_prefix_parquet} Combined old and new data. Shape before final sort/dedup: {combined_df.shape}")
             combined_df.sort_values('timestamp', inplace=True)
             combined_df.drop_duplicates(subset=['timestamp'], keep='last', inplace=True)
+            print(f"{log_prefix_parquet} Shape after final sort/dedup: {combined_df.shape}")
             
             try:
+                print(f"{log_prefix_parquet} Attempting to write appended data to Parquet. Shape: {combined_df.shape}. Path: {file_path}")
                 combined_df.to_parquet(file_path, index=False)
-                print(f"Appended new data and saved to {file_path}")
+                print(f"{log_prefix_parquet} INFO: Wrote appended data: {file_path}")
             except Exception as e:
-                print(f"Error saving appended data to Parquet {file_path}: {e}")
+                print(f"{log_prefix_parquet} ERROR: Failed writing appended data to Parquet {file_path}: {e}")
             
-            # Filter final combined_df to respect original overall start_date_str if needed
-            # This ensures that even if the file contained older data, the returned df respects start_date_str
             overall_start_dt = pd.to_datetime(start_date_str)
             combined_df = combined_df[combined_df['timestamp'] >= overall_start_dt]
             return combined_df
@@ -668,12 +667,12 @@ def load_app_trading_configs():
     """
     global app_trading_configs, app_settings
 
-    if not app_settings:
-        print("Warning (load_app_trading_configs): app_settings is empty. Attempting to load them first.")
+    if app_settings is None or not app_settings: # Explicit check for None or empty
+        print("Warning (load_app_trading_configs): app_settings is empty or None. Attempting to load them first.")
         # Note: load_app_settings() might prompt user if file is missing.
         # This is acceptable as app_settings are fundamental.
         load_app_settings() 
-        if not app_settings:
+        if app_settings is None or not app_settings: # Re-check after load attempt
             print("Error (load_app_trading_configs): Failed to load app_settings. Trading configs will be empty or defaults.")
             # Populate with some very basic defaults if app_settings loading failed entirely
             app_trading_configs = {
@@ -982,7 +981,7 @@ def execute_app_trade_signal(symbol: str, side: str,
 
     # 1. Get Symbol Info
     symbol_info_app = get_app_symbol_info(symbol)
-    if not symbol_info_app:
+    if symbol_info_app is None: # Explicit check for None
         print(f"{log_prefix} Failed to get symbol info for {symbol}. Cannot execute trade.")
         return False
     
@@ -1002,6 +1001,9 @@ def execute_app_trade_signal(symbol: str, side: str,
     if order_type.upper() == "MARKET":
         try:
             ticker = app_binance_client.futures_ticker(symbol=symbol)
+            if ticker is None or 'lastPrice' not in ticker: # Check ticker and lastPrice
+                print(f"{log_prefix} Could not fetch valid ticker or lastPrice for MARKET order sizing. Ticker: {ticker}")
+                return False
             effective_entry_price_for_sizing = float(ticker['lastPrice'])
             print(f"{log_prefix} Using current market price for MARKET order sizing: {effective_entry_price_for_sizing:.{p_prec}f}")
         except Exception as e:
@@ -1011,16 +1013,16 @@ def execute_app_trade_signal(symbol: str, side: str,
         print(f"{log_prefix} Entry price target required for LIMIT order. Cannot execute.")
         return False
         
-    if effective_entry_price_for_sizing is None: # Should be caught above, but as a safeguard
+    if effective_entry_price_for_sizing is None: 
         print(f"{log_prefix} Effective entry price for sizing could not be determined. Cannot execute.")
         return False
 
     # 4. Calculate Position Size
     # Ensure app_trading_configs is loaded and available
-    if not app_trading_configs:
-        print(f"{log_prefix} App trading configurations not loaded. Attempting to load defaults...")
+    if app_trading_configs is None or not app_trading_configs: # Explicit check for None or empty
+        print(f"{log_prefix} App trading configurations not loaded or empty. Attempting to load defaults...")
         load_app_trading_configs() # Load with defaults if not already loaded
-        if not app_trading_configs: # Still not loaded
+        if app_trading_configs is None or not app_trading_configs: # Still not loaded or empty
             print(f"{log_prefix} Critical: Failed to load app trading configurations. Cannot size trade.")
             return False
             
@@ -1313,7 +1315,7 @@ def monitor_app_trades():
     """
     global app_binance_client, app_trading_configs, app_active_trades, app_active_trades_lock, app_settings
 
-    if not app_active_trades: # No trades to monitor
+    if app_active_trades is None or not app_active_trades: # Explicit check for None or empty
         return
 
     current_operational_mode = app_trading_configs.get("app_operational_mode", "signal")
@@ -1322,9 +1324,10 @@ def monitor_app_trades():
     trades_to_remove = []
     active_trades_snapshot = {}
     with app_active_trades_lock:
-        active_trades_snapshot = app_active_trades.copy()
+        if app_active_trades is not None: # Check inside lock as well
+            active_trades_snapshot = app_active_trades.copy()
 
-    if not active_trades_snapshot: return # Double check after lock
+    if active_trades_snapshot is None or not active_trades_snapshot: return # Double check after lock
 
     for symbol, trade_details in active_trades_snapshot.items():
         trade_id_log = trade_details.get('entry_order_id', 'N/A') # Use for logging
@@ -1336,7 +1339,7 @@ def monitor_app_trades():
             continue
 
         s_info = trade_details.get('symbol_info')
-        if not s_info:
+        if s_info is None: # Explicit check for None
             print(f"{log_sym_prefix} Missing symbol_info. Removing trade.")
             append_decision_log({"symbol": symbol, "trade_id": trade_id_log, "event_type": "MONITOR_ERROR_NO_SYM_INFO"})
             trades_to_remove.append(symbol)
@@ -1666,8 +1669,8 @@ def send_app_telegram_message(message: str):
     bot_token = app_trading_configs.get("app_telegram_bot_token")
     chat_id = app_trading_configs.get("app_telegram_chat_id")
 
-    if not bot_token or not chat_id:
-        print(f"APP_TELEGRAM_SKIPPED: Token or Chat ID not configured in app_trading_configs. Message: '{message[:100]}...'")
+    if bot_token is None or chat_id is None: # Explicit check for None
+        print(f"APP_TELEGRAM_SKIPPED: Token or Chat ID not configured (None) in app_trading_configs. Message: '{message[:100]}...'")
         return False
 
     async def _send_async():
@@ -1683,7 +1686,7 @@ def send_app_telegram_message(message: str):
             print(f"app.py: Unexpected error sending Telegram message: {e_unexp}")
             return False
 
-    if app_ptb_event_loop and app_ptb_event_loop.is_running():
+    if app_ptb_event_loop is not None and app_ptb_event_loop.is_running(): # Explicit check for None
         future = asyncio.run_coroutine_threadsafe(_send_async(), app_ptb_event_loop)
         try:
             return future.result(timeout=10) # Wait up to 10 seconds
@@ -1727,18 +1730,18 @@ def app_send_entry_signal_telegram(current_app_settings: dict, symbol: str, sign
     chat_id = current_app_settings.get("app_telegram_chat_id")
     notify_on_trade = current_app_settings.get("app_notify_on_trade", True) # Check the toggle
 
-    if not notify_on_trade:
+    if not notify_on_trade: # This is a boolean check, not an object check, so it's fine.
         print(f"{log_prefix} Telegram notifications for trade execution are disabled by 'app_notify_on_trade' setting. Skipping signal message.")
         return
 
-    if not bot_token or not chat_id:
-        print(f"{log_prefix} Telegram token/chat_id not configured in app_settings. Cannot send signal.")
+    if bot_token is None or chat_id is None: # Explicit check for None
+        print(f"{log_prefix} Telegram token/chat_id not configured (None) in app_settings. Cannot send signal.")
         return
 
     if signal_timestamp is None:
         signal_timestamp = pd.Timestamp.now(tz='UTC')
     
-    p_prec = int(symbol_info.get('pricePrecision', 2)) if symbol_info else 2
+    p_prec = int(symbol_info.get('pricePrecision', 2)) if symbol_info is not None else 2 # Check symbol_info
 
     tp1_str = f"{tp1_price:.{p_prec}f}" if tp1_price is not None else "N/A"
     tp2_str = f"{tp2_price:.{p_prec}f}" if tp2_price is not None else "N/A"
@@ -1810,17 +1813,17 @@ def send_app_trade_execution_telegram(current_app_settings: dict, symbol: str, s
     chat_id = current_app_settings.get("app_telegram_chat_id")
     notify_on_trade = current_app_settings.get("app_notify_on_trade", True)
 
-    if not notify_on_trade:
+    if not notify_on_trade: # Boolean check, fine as is
         print(f"{log_prefix} Telegram notifications for trade execution are disabled. Skipping.")
         return
 
-    if not bot_token or not chat_id:
-        print(f"{log_prefix} Telegram token/chat_id not configured. Cannot send trade execution message.")
+    if bot_token is None or chat_id is None: # Explicit check for None
+        print(f"{log_prefix} Telegram token/chat_id not configured (None). Cannot send trade execution message.")
         return
 
     s_info = get_app_symbol_info(symbol) # Fetch fresh symbol info for precision
-    p_prec = int(s_info.get('pricePrecision', 2)) if s_info else 2
-    q_prec = int(s_info.get('quantityPrecision', 0)) if s_info else 0
+    p_prec = int(s_info.get('pricePrecision', 2)) if s_info is not None else 2 # Check s_info
+    q_prec = int(s_info.get('quantityPrecision', 0)) if s_info is not None else 0 # Check s_info
 
 
     side_upper = side.upper()
@@ -1873,15 +1876,15 @@ def app_send_signal_update_telegram(current_app_settings: dict, signal_details: 
     bot_token = current_app_settings.get("app_telegram_bot_token")
     chat_id = current_app_settings.get("app_telegram_chat_id")
 
-    if not bot_token or not chat_id:
-        print(f"{log_prefix} Telegram token/chat_id not configured. Cannot send signal update.")
+    if bot_token is None or chat_id is None: # Explicit check for None
+        print(f"{log_prefix} Telegram token/chat_id not configured (None). Cannot send signal update.")
         return
 
     symbol = signal_details.get('symbol', 'N/A')
     side = signal_details.get('side', 'N/A')
     entry_price = signal_details.get('entry_price', 0.0) # This should be the actual entry price
-    s_info = signal_details.get('symbol_info', {})
-    p_prec = int(s_info.get('pricePrecision', 2)) if s_info else 2
+    s_info = signal_details.get('symbol_info', {}) # s_info can be an empty dict, that's fine
+    p_prec = int(s_info.get('pricePrecision', 2)) if s_info is not None and s_info else 2 # Check s_info is not None and not empty
     strategy_type_display = escape_app_markdown_v1(signal_details.get('strategy_type', "App Signal"))
     escaped_symbol = escape_app_markdown_v1(symbol)
     escaped_update_type = escape_app_markdown_v1(update_type)
@@ -1926,16 +1929,16 @@ def app_send_trade_rejection_notification(current_app_settings: dict, symbol: st
     chat_id = current_app_settings.get("app_telegram_chat_id")
     notify_on_trade = current_app_settings.get("app_notify_on_trade", True) # Check the toggle
 
-    if not notify_on_trade:
+    if not notify_on_trade: # Boolean check, fine
         print(f"{log_prefix} Telegram notifications for trade execution are disabled by 'app_notify_on_trade' setting. Skipping.")
         return
 
-    if not bot_token or not chat_id:
-        print(f"{log_prefix} Telegram token/chat_id not configured. Cannot send rejection notification.")
+    if bot_token is None or chat_id is None: # Explicit check for None
+        print(f"{log_prefix} Telegram token/chat_id not configured (None). Cannot send rejection notification.")
         return
 
-    p_prec = int(symbol_info.get('pricePrecision', 2)) if symbol_info else 2
-    q_prec = int(symbol_info.get('quantityPrecision', 0)) if symbol_info else 0
+    p_prec = int(symbol_info.get('pricePrecision', 2)) if symbol_info is not None else 2 # Check symbol_info
+    q_prec = int(symbol_info.get('quantityPrecision', 0)) if symbol_info is not None else 0 # Check symbol_info
 
     entry_price_str = f"{entry_price:.{p_prec}f}" if entry_price is not None else "N/A"
     sl_price_str = f"{sl_price:.{p_prec}f}" if sl_price is not None else "N/A"
@@ -1985,12 +1988,12 @@ def app_calculate_pnl_for_fixed_capital(entry_price: float, exit_price: float, s
     position_value_usdt = fixed_capital_usdt * leverage
     quantity_base_asset = position_value_usdt / entry_price # Ideal quantity
 
-    if symbol_info:
+    if symbol_info is not None: # Explicit check for None
         q_prec = int(symbol_info.get('quantityPrecision', 8))
         lot_size_filter = next((f for f in symbol_info.get('filters', []) if f.get('filterType') == 'LOT_SIZE'), None)
         
         min_qty_val = 0.0
-        if lot_size_filter:
+        if lot_size_filter is not None: # Check lot_size_filter
             min_qty_val = float(lot_size_filter.get('minQty', 0.0))
             step_size = float(lot_size_filter.get('stepSize', 0.0))
             if step_size > 0:
@@ -2003,7 +2006,7 @@ def app_calculate_pnl_for_fixed_capital(entry_price: float, exit_price: float, s
             return 0.0
     
     if quantity_base_asset == 0:
-        print(f"{log_prefix} Calculated quantity for ${fixed_capital_usdt} is zero for {symbol_info.get('symbol', 'N/A') if symbol_info else 'N/A'}. PNL is 0.")
+        print(f"{log_prefix} Calculated quantity for ${fixed_capital_usdt} is zero for {symbol_info.get('symbol', 'N/A') if symbol_info is not None else 'N/A'}. PNL is 0.") # Check symbol_info here too
         return 0.0
 
     pnl = 0.0
@@ -2139,6 +2142,7 @@ def save_decision_log_to_csv(force_save=False):
     
     # Define a buffer size, e.g., save every 100 entries or if forced
     LOG_BUFFER_SIZE_TO_SAVE = 100 
+    log_prefix_decision = "[AppDecisionLog]" # Logger prefix
     
     with app_decision_log_lock:
         if not app_decision_log_entries:
@@ -2149,18 +2153,20 @@ def save_decision_log_to_csv(force_save=False):
 
         try:
             log_df = pd.DataFrame(app_decision_log_entries)
-            # Ensure consistent column order, add new columns if they appear
-            # For simplicity, let pandas handle column order for now, or define a fixed set
+            if log_df.empty: # Should be caught by app_decision_log_entries check, but safeguard
+                print(f"{log_prefix_decision} Decision log DataFrame is empty after creation. Skipping save.")
+                app_decision_log_entries.clear() # Clear if it was somehow non-empty but produced empty df
+                return
+
+            print(f"{log_prefix_decision} Attempting to write decision log. Shape: {log_df.shape}. Entries: {len(app_decision_log_entries)}. Path: {APP_DECISION_LOG_FILE}")
             
-            if os.path.exists(APP_DECISION_LOG_FILE):
-                log_df.to_csv(APP_DECISION_LOG_FILE, mode='a', header=False, index=False)
-            else:
-                log_df.to_csv(APP_DECISION_LOG_FILE, mode='w', header=True, index=False)
+            file_exists = os.path.exists(APP_DECISION_LOG_FILE)
+            log_df.to_csv(APP_DECISION_LOG_FILE, mode='a' if file_exists else 'w', header=not file_exists, index=False)
             
-            print(f"[AppDecisionLog] Saved {len(app_decision_log_entries)} entries to {APP_DECISION_LOG_FILE}")
+            print(f"{log_prefix_decision} INFO: Wrote {len(app_decision_log_entries)} entries to {APP_DECISION_LOG_FILE}")
             app_decision_log_entries.clear() # Clear after saving
         except Exception as e:
-            print(f"[AppDecisionLog] Error saving decision log: {e}")
+            print(f"{log_prefix_decision} ERROR: Failed writing decision log {APP_DECISION_LOG_FILE}: {e}")
 # --- End Logging Utilities ---
 
 
@@ -2384,6 +2390,10 @@ def app_process_symbol_for_signal(symbol: str, client, current_app_settings: dic
         return
 
     # --- Parameters from best_hyperparams and app_settings ---
+    if current_best_hyperparams is None: # Explicit check for None
+        print(f"{log_prefix} Best hyperparameters not loaded (None). Skipping.")
+        return
+
     atr_period_for_features = current_best_hyperparams.get('model_training_atr_period_used')
     pivot_feature_names_list = current_best_hyperparams.get('pivot_feature_names_used')
     entry_feature_names_base_list = current_best_hyperparams.get('entry_feature_names_base_used')
@@ -2426,15 +2436,23 @@ def app_process_symbol_for_signal(symbol: str, client, current_app_settings: dic
     print(f"{log_prefix} Pivot Threshold Selection: Mode Active='{threshold_mode_in_use}', Threshold Value Used={p_swing_thresh_to_use:.3f}")
     print(f"{log_prefix}   Reference Threshold: Type='{reference_threshold_type}', Value={reference_threshold_val if isinstance(reference_threshold_val, str) else f'{reference_threshold_val:.3f}'}")
 
-
-    if not all([atr_period_for_features, pivot_feature_names_list, entry_feature_names_base_list, p_profit_thresh]): # p_swing_thresh_to_use is now primary
-        print(f"{log_prefix} Critical parameters missing from best_hyperparams or app_settings. Skipping.")
-        # Log which specific core parameters are missing
-        if not atr_period_for_features: print("  - Missing: model_training_atr_period_used")
-        if not pivot_feature_names_list: print("  - Missing: pivot_feature_names_used")
-        if not entry_feature_names_base_list: print("  - Missing: entry_feature_names_base_used")
-        # p_swing_thresh_to_use is derived, so its validity check is above.
-        if not p_profit_thresh: print("  - Missing: profit_threshold (for entry model)")
+    # Check for None or empty for list parameters
+    missing_params = False
+    if atr_period_for_features is None:
+        print(f"{log_prefix} Missing: model_training_atr_period_used")
+        missing_params = True
+    if pivot_feature_names_list is None or not pivot_feature_names_list: # Check for None or empty list
+        print(f"{log_prefix} Missing or empty: pivot_feature_names_used")
+        missing_params = True
+    if entry_feature_names_base_list is None or not entry_feature_names_base_list: # Check for None or empty list
+        print(f"{log_prefix} Missing or empty: entry_feature_names_base_used")
+        missing_params = True
+    if p_profit_thresh is None:
+        print(f"{log_prefix} Missing: profit_threshold (for entry model)")
+        missing_params = True
+    
+    if missing_params:
+        print(f"{log_prefix} Critical parameters missing or empty from best_hyperparams or app_settings. Skipping.")
         return
 
     # --- Data Fetching ---
@@ -2993,16 +3011,16 @@ def start_app_main_flow():
                 csv_path = app_settings.get("app_symbols_csv_path", "app_symbols.csv")
                 print(f"{log_prefix} Attempting to load training symbols from CSV: {csv_path}")
                 training_symbols_list = app_load_symbols_from_csv(csv_path)
-                if not training_symbols_list:
+                if training_symbols_list is None or not training_symbols_list: # Check None or empty
                     print(f"{log_prefix} WARN: CSV specified for training symbols ('{csv_path}') load failed or empty. Falling back to list string.")
                     source_type = "list" # Force fallback to list
 
-            if source_type.lower() == "list" or not training_symbols_list: # Fallback or primary if "list"
+            if source_type.lower() == "list" or training_symbols_list is None or not training_symbols_list: # Fallback or primary if "list"
                 list_str = app_settings.get("app_training_symbols_list_str", "BTCUSDT,ETHUSDT")
                 print(f"{log_prefix} Loading training symbols from list string: '{list_str}'")
                 training_symbols_list = [s.strip().upper() for s in list_str.split(',') if s.strip()]
 
-            if not training_symbols_list:
+            if training_symbols_list is None or not training_symbols_list: # Check None or empty
                 print(f"{log_prefix} CRITICAL: No training symbols loaded from any source. Defaulting to BTCUSDT for training.")
                 training_symbols_list = ["BTCUSDT"]
             
@@ -3029,7 +3047,7 @@ def start_app_main_flow():
                         processed_entry_feature_names_base_app = entry_feats_base_app
                     all_symbols_train_data_list_app.append(processed_df_app)
             
-            if not all_symbols_train_data_list_app: print("CRITICAL: No training data. Cannot train models."); sys.exit(1)
+            if not all_symbols_train_data_list_app: print("CRITICAL: No training data. Cannot train models."); sys.exit(1) # Empty list check
             universal_df_initial_processed_app = pd.concat(all_symbols_train_data_list_app, ignore_index=True)
             if len(universal_df_initial_processed_app) < 200: print(f"CRITICAL: Combined training data too small ({len(universal_df_initial_processed_app)})."); sys.exit(1)
 
@@ -3044,6 +3062,9 @@ def start_app_main_flow():
                     static_entry_features_base_list=processed_entry_feature_names_base_app, # Pass determined base names
                     n_trials=optuna_trials_app
                 )
+                if current_best_hyperparams is None: # Check if Optuna returned None
+                    print(f"Optuna tuning did not return valid parameters. Exiting."); sys.exit(1)
+
 
                 # --- Correctly define feature names based on Optuna's tuned ATR period ---
                 tuned_atr_period = current_best_hyperparams.get('atr_period_opt', ATR_PERIOD)
@@ -3076,8 +3097,11 @@ def start_app_main_flow():
             except Exception as e: print(f"Optuna tuning failed: {e}. Exiting."); import traceback; traceback.print_exc(); sys.exit(1) # Added traceback
 
             # Use feature names directly from the now-corrected best_hyperparams for final model training
-            final_pivot_feats_to_use = best_hyperparams['pivot_feature_names_used']
-            final_entry_base_feats_to_use = best_hyperparams['entry_feature_names_base_used']
+            final_pivot_feats_to_use = best_hyperparams.get('pivot_feature_names_used') # Use .get()
+            final_entry_base_feats_to_use = best_hyperparams.get('entry_feature_names_base_used') # Use .get()
+            if final_pivot_feats_to_use is None or final_entry_base_feats_to_use is None:
+                print("CRITICAL: Feature names not found in best_hyperparams after Optuna. Exiting."); sys.exit(1)
+
             
             # Pass the correctly defined final_entry_base_feats_to_use to process_dataframe_with_params
             df_final_train, processed_pivot_features_final, processed_entry_features_base_final = process_dataframe_with_params(
@@ -3107,6 +3131,7 @@ def start_app_main_flow():
             
             print(f"DEBUG: Args passed to train_pivot_model: {pivot_model_args}") # Log the actual args
             temp_pivot_model, _ = train_pivot_model(X_p_train, y_p_train, X_p_train, y_p_train, **pivot_model_args)
+            if temp_pivot_model is None: print("CRITICAL: Pivot model training failed. Exiting."); sys.exit(1)
             save_model(temp_pivot_model, pivot_model_path)
             universal_pivot_model = temp_pivot_model
 
@@ -3141,9 +3166,8 @@ def start_app_main_flow():
                     
                     print(f"DEBUG: Args passed to train_entry_model: {entry_model_args}")
                     temp_entry_model, _ = train_entry_model(X_e_train, y_e_train, X_e_train, y_e_train, **entry_model_args)
-                    save_model(temp_entry_model, entry_model_path)
-                    universal_entry_model = temp_entry_model
-                    print(f"{log_prefix} Entry model trained and saved.")
+                    if temp_entry_model is None: print(f"{log_prefix} Entry model training returned None. Marking as not trained."); universal_entry_model = None
+                    else: save_model(temp_entry_model, entry_model_path); universal_entry_model = temp_entry_model; print(f"{log_prefix} Entry model trained and saved.")
                 else:
                     print(f"{log_prefix} Entry model training SKIPPED: Insufficient data diversity for training. X_e_train length: {len(X_e_train)}, y_e_train unique values: {y_e_train.unique() if len(X_e_train) > 0 else 'N/A'}.")
                     universal_entry_model = None # Ensure it's None if skipped
@@ -3156,10 +3180,14 @@ def start_app_main_flow():
 
             # Generate and display backtest summary after training
             print("DEBUG: Preparing data for training summary backtest...")
-            if df_final_train is not None and universal_pivot_model is not None and universal_entry_model is not None and best_hyperparams:
-                # Ensure feature names used for training are correctly passed
-                # These should be what process_dataframe_with_params returned along with df_final_train
-                # final_pivot_feats_to_use and final_entry_base_feats_to_use are already in scope
+            # Check all required components are not None
+            if df_final_train is not None and \
+               universal_pivot_model is not None and \
+               universal_entry_model is not None and \
+               best_hyperparams is not None and \
+               final_pivot_feats_to_use is not None and \
+               final_entry_base_feats_to_use is not None and \
+               app_settings is not None:
                 generate_training_backtest_summary(
                     df_processed_full_dataset=df_final_train, 
                     pivot_model=universal_pivot_model,
@@ -3171,6 +3199,14 @@ def start_app_main_flow():
                 )
             else:
                 print("Skipping training summary generation due to missing data or models from training process.")
+                # Log which parts are missing for debugging
+                if df_final_train is None: print("  - df_final_train is None")
+                if universal_pivot_model is None: print("  - universal_pivot_model is None")
+                if universal_entry_model is None: print("  - universal_entry_model is None")
+                if best_hyperparams is None: print("  - best_hyperparams is None")
+                if final_pivot_feats_to_use is None: print("  - final_pivot_feats_to_use is None")
+                if final_entry_base_feats_to_use is None: print("  - final_entry_base_feats_to_use is None")
+                if app_settings is None: print("  - app_settings is None")
 
 
             if not app_settings.get("app_auto_start_trading_after_train", False):
@@ -3184,10 +3220,12 @@ def start_app_main_flow():
         # Models exist (either initially or after training, or loaded below)
         # Try to load models and params into global vars if they are not already 
         # (e.g. on fresh start with existing files, or if training was skipped and we fell through)
-        if universal_pivot_model is None or universal_entry_model is None or not best_hyperparams:
+        # Also ensure best_hyperparams is not an empty dict if models are loaded
+        if universal_pivot_model is None or universal_entry_model is None or best_hyperparams is None or not best_hyperparams:
             print("Loading trained ML models and parameters...")
             try:
                 universal_pivot_model = load_model(pivot_model_path)
+                if universal_pivot_model is None: raise FileNotFoundError("Pivot model loaded as None.")
             except Exception as e:
                 print(f"[ERROR] loading pivot model from '{pivot_model_path}': {e}")
                 # Decide if to offer retry_train or just exit
@@ -3197,6 +3235,7 @@ def start_app_main_flow():
             
             try:
                 universal_entry_model = load_model(entry_model_path)
+                if universal_entry_model is None: raise FileNotFoundError("Entry model loaded as None.")
             except Exception as e:
                 print(f"[ERROR] loading entry model from '{entry_model_path}': {e}")
                 retry_train = input(f"Error loading entry model. Attempt to retrain models? (yes/no) [yes]: ").lower()
@@ -3205,7 +3244,10 @@ def start_app_main_flow():
 
             try:
                 with open(params_path, 'r') as f:
-                    best_hyperparams = json.load(f) # This loads params like thresholds and feature names
+                    loaded_params = json.load(f) 
+                if loaded_params is None or not loaded_params: # Check for None or empty dict
+                    raise ValueError("Parameters file loaded as None or empty.")
+                best_hyperparams = loaded_params # This loads params like thresholds and feature names
                 
                 # Add a check for essential keys after loading
                 required_keys = ['pivot_feature_names_used', 'entry_feature_names_base_used', 'model_training_atr_period_used']
@@ -4909,29 +4951,47 @@ def display_summary_table(main_summary_df: pd.DataFrame,
     print(table_string)
     print(f"{log_prefix} =====================================\n")
 
+    # --- Setup Logger for this function ---
+    # Assuming a global logger might be set up elsewhere, or create a specific one.
+    # For now, using print for logger.info/logger.error style messages.
+    # A proper logging setup would involve:
+    # import logging
+    # logger = logging.getLogger(__name__) # Or a specific name
+    # And then logger.info(), logger.error()
+    
     # --- Save Consolidated Files ---
 
     # File 1: Overview (already have main_summary_df)
     overview_path = f"{output_base_filename}_overview.csv"
     try:
-        if not main_summary_df.empty:
+        if main_summary_df is not None and not main_summary_df.empty:
+            print(f"{log_prefix} Attempting to write overview summary. Shape: {main_summary_df.shape}. Path: {overview_path}")
             main_summary_df.to_csv(overview_path, index=False)
-            print(f"{log_prefix} Main summary overview saved to {overview_path}")
-        else:
-            print(f"{log_prefix} Main summary overview DataFrame is empty. Skipping save for {overview_path}.")
+            print(f"{log_prefix} INFO: Wrote summary: {overview_path}") # Using print as logger.info
+        elif main_summary_df is not None: # Empty DataFrame
+            print(f"{log_prefix} Overview summary DataFrame is empty. Writing headers only to {overview_path}")
+            pd.DataFrame(columns=main_summary_df.columns if main_summary_df.columns.tolist() else columns_ordered).to_csv(overview_path, index=False)
+            print(f"{log_prefix} INFO: Wrote empty summary (headers only): {overview_path}")
+        else: # main_summary_df is None
+            print(f"{log_prefix} Main summary overview DataFrame is None. Skipping save for {overview_path}.")
     except Exception as e:
-        print(f"{log_prefix} Error saving main summary overview to CSV '{overview_path}': {e}")
+        print(f"{log_prefix} ERROR: Failed writing {overview_path}: {e}") # Using print as logger.error
 
     # File 2: Trade Details Log
     trade_details_log_path = f"{output_base_filename}_trade_details_log.csv"
     try:
-        if not all_trades_df.empty:
+        if all_trades_df is not None and not all_trades_df.empty:
+            print(f"{log_prefix} Attempting to write trade details log. Shape: {all_trades_df.shape}. Path: {trade_details_log_path}")
             all_trades_df.to_csv(trade_details_log_path, index=False)
-            print(f"{log_prefix} Consolidated trade details log saved to {trade_details_log_path}")
-        else:
-            print(f"{log_prefix} Consolidated trade details DataFrame is empty. Skipping save for {trade_details_log_path}.")
+            print(f"{log_prefix} INFO: Wrote trade details log: {trade_details_log_path}")
+        elif all_trades_df is not None: # Empty DataFrame
+            print(f"{log_prefix} Trade details log DataFrame is empty. Writing headers only to {trade_details_log_path}")
+            pd.DataFrame(columns=all_trades_df.columns if all_trades_df.columns.tolist() else ['scenario', 'trade_id', 'timestamp_pivot']).to_csv(trade_details_log_path, index=False) # Basic default cols
+            print(f"{log_prefix} INFO: Wrote empty trade details log (headers only): {trade_details_log_path}")
+        else: # all_trades_df is None
+            print(f"{log_prefix} Consolidated trade details DataFrame is None. Skipping save for {trade_details_log_path}.")
     except Exception as e:
-        print(f"{log_prefix} Error saving consolidated trade details to CSV '{trade_details_log_path}': {e}")
+        print(f"{log_prefix} ERROR: Failed writing {trade_details_log_path}: {e}")
 
     # File 3: Model Configs and Importances
     model_configs_importances_list = []
@@ -4969,13 +5029,18 @@ def display_summary_table(main_summary_df: pd.DataFrame,
     model_configs_importances_df = pd.DataFrame(model_configs_importances_list)
     model_configs_path = f"{output_base_filename}_model_configs_importances.csv"
     try:
-        if not model_configs_importances_df.empty:
+        if model_configs_importances_df is not None and not model_configs_importances_df.empty:
+            print(f"{log_prefix} Attempting to write model configs & importances. Shape: {model_configs_importances_df.shape}. Path: {model_configs_path}")
             model_configs_importances_df.to_csv(model_configs_path, index=False)
-            print(f"{log_prefix} Model configs and importances saved to {model_configs_path}")
-        else:
-            print(f"{log_prefix} Model configs and importances DataFrame is empty. Skipping save for {model_configs_path}.")
+            print(f"{log_prefix} INFO: Wrote model configs and importances: {model_configs_path}")
+        elif model_configs_importances_df is not None: # Empty DataFrame
+            print(f"{log_prefix} Model configs and importances DataFrame is empty. Writing headers only to {model_configs_path}")
+            pd.DataFrame(columns=model_configs_importances_df.columns if model_configs_importances_df.columns.tolist() else ['record_type', 'parameter_name', 'model_context']).to_csv(model_configs_path, index=False) # Basic default
+            print(f"{log_prefix} INFO: Wrote empty model configs (headers only): {model_configs_path}")
+        else: # DataFrame is None
+             print(f"{log_prefix} Model configs and importances DataFrame is None. Skipping save for {model_configs_path}.")
     except Exception as e:
-        print(f"{log_prefix} Error saving model configs and importances to CSV '{model_configs_path}': {e}")
+        print(f"{log_prefix} ERROR: Failed writing {model_configs_path}: {e}")
 
     # File 4: Performance Analytics (Equity Curves, Segmented Perf, Score Dists)
     performance_analytics_list = []
@@ -5007,13 +5072,18 @@ def display_summary_table(main_summary_df: pd.DataFrame,
     performance_analytics_df = pd.DataFrame(performance_analytics_list)
     perf_analytics_path = f"{output_base_filename}_performance_analytics.csv"
     try:
-        if not performance_analytics_df.empty:
+        if performance_analytics_df is not None and not performance_analytics_df.empty:
+            print(f"{log_prefix} Attempting to write performance analytics. Shape: {performance_analytics_df.shape}. Path: {perf_analytics_path}")
             performance_analytics_df.to_csv(perf_analytics_path, index=False)
-            print(f"{log_prefix} Performance analytics saved to {perf_analytics_path}")
-        else:
-            print(f"{log_prefix} Performance analytics DataFrame is empty. Skipping save for {perf_analytics_path}.")
+            print(f"{log_prefix} INFO: Wrote performance analytics: {perf_analytics_path}")
+        elif performance_analytics_df is not None: # Empty DataFrame
+            print(f"{log_prefix} Performance analytics DataFrame is empty. Writing headers only to {perf_analytics_path}")
+            pd.DataFrame(columns=performance_analytics_df.columns if performance_analytics_df.columns.tolist() else ['record_type', 'scenario', 'value1_name']).to_csv(perf_analytics_path, index=False) # Basic default
+            print(f"{log_prefix} INFO: Wrote empty performance analytics (headers only): {perf_analytics_path}")
+        else: # DataFrame is None
+            print(f"{log_prefix} Performance analytics DataFrame is None. Skipping save for {perf_analytics_path}.")
     except Exception as e:
-        print(f"{log_prefix} Error saving performance analytics to CSV '{perf_analytics_path}': {e}")
+        print(f"{log_prefix} ERROR: Failed writing {perf_analytics_path}: {e}")
 
 
 # --- Main Orchestration ---
@@ -5027,11 +5097,15 @@ def get_processed_data_for_symbol(symbol_ticker, kline_interval, start_date, end
     print(f"Getting/Downloading historical data for {symbol_ticker}...")
     try:
         # Initialize Binance client if not already done (e.g. if main script part is not run first)
-        global app_binance_client
+        global app_binance_client, app_trading_configs # Added app_trading_configs
         if app_binance_client is None:
             # Load trading configs which also loads API keys and initializes client
             # This ensures client is ready for get_or_download_historical_data
             load_app_trading_configs() # Loads default "app_trade_config.csv"
+            # Check if app_trading_configs was loaded successfully
+            if app_trading_configs is None or not app_trading_configs:
+                 print(f"CRITICAL: Failed to load app_trading_configs for {symbol_ticker}. Skipping.")
+                 return None, None, None
             if not initialize_app_binance_client(env=app_trading_configs.get("app_trading_environment", "mainnet")):
                 print(f"CRITICAL: Failed to initialize Binance client for {symbol_ticker} data processing. Skipping.")
                 return None, None, None
@@ -5044,8 +5118,8 @@ def get_processed_data_for_symbol(symbol_ticker, kline_interval, start_date, end
             data_directory="historical_data" # Standardized directory
             # force_redownload_all can be a parameter to main script if needed
         )
-        if historical_df.empty:
-            print(f"No data obtained for {symbol_ticker} (empty DataFrame). Skipping.")
+        if historical_df is None or historical_df.empty: # Check for None as well
+            print(f"No data obtained for {symbol_ticker} (None or empty DataFrame). Skipping.")
             return None, None, None
             
     except BinanceAPIException as e: # These might still be caught if client init fails within get_or_download
@@ -5070,10 +5144,14 @@ def get_processed_data_for_symbol(symbol_ticker, kline_interval, start_date, end
 
     # 2. Preprocessing & Labeling
     historical_df = calculate_atr(historical_df, period=ATR_PERIOD) # Ensure ATR_PERIOD is used
+    if historical_df is None: return None, None, None # Check after each processing step
     atr_col_name_dynamic = f'atr_{ATR_PERIOD}'
     historical_df = generate_candidate_pivots(historical_df)
+    if historical_df is None: return None, None, None
     historical_df = prune_and_label_pivots(historical_df, atr_col_name=atr_col_name_dynamic)
+    if historical_df is None: return None, None, None
     historical_df = simulate_fib_entries(historical_df, atr_col_name=atr_col_name_dynamic)
+    if historical_df is None: return None, None, None
     
     if 'timestamp' not in historical_df.columns:
         if pd.api.types.is_datetime64_any_dtype(historical_df.index):
@@ -5087,7 +5165,9 @@ def get_processed_data_for_symbol(symbol_ticker, kline_interval, start_date, end
     # 3. Feature Engineering
     # atr_col_name_dynamic was defined above
     historical_df, pivot_feature_names = engineer_pivot_features(historical_df, atr_col_name=atr_col_name_dynamic)
+    if historical_df is None or pivot_feature_names is None: return None, None, None # Check features as well
     historical_df, entry_feature_names_base = engineer_entry_features(historical_df, atr_col_name=atr_col_name_dynamic, entry_features_base_list_arg=None)
+    if historical_df is None or entry_feature_names_base is None: return None, None, None
 
     historical_df.replace([np.inf, -np.inf], np.nan, inplace=True)
     min_required_data_for_features = 30
@@ -5101,6 +5181,9 @@ def get_processed_data_for_symbol(symbol_ticker, kline_interval, start_date, end
         print(f"CRITICAL: 'timestamp' column lost for {symbol_ticker} during processing.")
         return None, None, None # Cannot proceed without timestamp
 
+    if pivot_feature_names is None or not pivot_feature_names: # Check features list itself
+        print(f"CRITICAL: Pivot feature names list is None or empty for {symbol_ticker}.")
+        return None, None, None
     df_processed.dropna(subset=pivot_feature_names, inplace=True) # Ensure core features are present
     df_processed.reset_index(drop=True, inplace=True)
 
