@@ -2422,6 +2422,17 @@ def app_calculate_live_pivot_features(df_live: pd.DataFrame, atr_period: int, pi
         print(f"{log_prefix} NaNs filled with -1.")
 
     print(f"{log_prefix} Successfully calculated live pivot features for the latest candle.")
+    
+    # --- Enhanced Logging for Final Selected Live Features ---
+    print(f"\n--- Final Selected Live Pivot Feature Values (Series sent to model) ---")
+    if live_features_series is not None and not live_features_series.empty:
+        for idx, val in live_features_series.items():
+            print(f"  {idx}: {val:.4f}")
+    else:
+        print("  Live features series is None or empty.")
+    print(f"--- End Final Selected Live Pivot Feature Values ---\n")
+    # --- End Enhanced Logging ---
+
     return live_features_series
 
 def app_calculate_live_entry_features(df_live: pd.DataFrame, atr_period: int, entry_feature_names_base: list,
@@ -3078,12 +3089,7 @@ def app_check_fib_proposals(client, current_app_settings: dict,
     global app_fib_proposals, app_fib_proposals_lock, app_active_trades_lock # app_active_trades used by execute_app_trade_signal
 
     if not app_fib_proposals:
-    Manages proposal expiry.
-    """
-    global app_fib_proposals, app_fib_proposals_lock, app_active_trades_lock # app_active_trades used by execute_app_trade_signal
-
-    if not app_fib_proposals:
-        return"""
+        return
 
     log_prefix_main_checker = "[AppFibChecker]"
     print(f"{log_prefix_main_checker} Checking {len(app_fib_proposals)} active Fibonacci proposal(s)...")
@@ -3672,23 +3678,75 @@ def start_app_main_flow():
             y_p_train = df_final_train['pivot_label']
 
             # Log class distribution for pivot labels
-            print(f"{log_prefix} Pivot Label Distribution in Final Training Data (df_final_train):")
-            print(y_p_train.value_counts(normalize=True)) # Log normalized distribution
-            print(y_p_train.value_counts()) # Log raw counts
+            print(f"\n{log_prefix} --- Pivot Label Distribution BEFORE Resampling (y_p_train) ---")
+            print(f"{log_prefix} Raw Value Counts:")
+            print(y_p_train.value_counts())
+            print(f"{log_prefix} Normalized Value Counts (Percentages):")
+            print(y_p_train.value_counts(normalize=True) * 100)
+            print(f"{log_prefix} --- End Pivot Label Distribution ---\n")
+
+            # --- Implement Oversampling for Pivot Model Training Data ---
+            from sklearn.utils import resample
+
+            df_pivot_train_temp = pd.concat([X_p_train, y_p_train], axis=1)
+            df_majority = df_pivot_train_temp[df_pivot_train_temp['pivot_label'] == 0]
+            df_minority1 = df_pivot_train_temp[df_pivot_train_temp['pivot_label'] == 1] # Swing High
+            df_minority2 = df_pivot_train_temp[df_pivot_train_temp['pivot_label'] == 2] # Swing Low
+
+            # Determine target sample size for minority classes
+            # Example: Oversample to be 30% of the majority class size for each minority class
+            # Or a fixed number, e.g., min(len(df_majority) * 0.3, 20000) to avoid excessive memory usage
+            target_minority_samples = int(len(df_majority) * 0.30) 
+            if target_minority_samples == 0 and len(df_majority) > 0: # Handle cases where 30% is less than 1
+                target_minority_samples = 1
             
+            print(f"{log_prefix} Resampling: Majority size: {len(df_majority)}, Target for each minority: {target_minority_samples}")
+
+            df_minority1_resampled = pd.DataFrame()
+            if not df_minority1.empty:
+                df_minority1_resampled = resample(df_minority1, 
+                                                  replace=True, # Oversample with replacement
+                                                  n_samples=target_minority_samples if target_minority_samples > 0 else len(df_minority1), 
+                                                  random_state=42)
+            
+            df_minority2_resampled = pd.DataFrame()
+            if not df_minority2.empty:
+                df_minority2_resampled = resample(df_minority2,
+                                                  replace=True,
+                                                  n_samples=target_minority_samples if target_minority_samples > 0 else len(df_minority2),
+                                                  random_state=42)
+
+            df_resampled = pd.concat([df_majority, df_minority1_resampled, df_minority2_resampled])
+            
+            X_p_train_resampled = df_resampled[final_pivot_feats_to_use]
+            y_p_train_resampled = df_resampled['pivot_label']
+            
+            print(f"\n{log_prefix} --- Pivot Label Distribution AFTER Resampling ---")
+            print(f"{log_prefix} Raw Value Counts:")
+            print(y_p_train_resampled.value_counts())
+            print(f"{log_prefix} Normalized Value Counts (Percentages):")
+            print(y_p_train_resampled.value_counts(normalize=True) * 100)
+            print(f"{log_prefix} --- End Resampled Pivot Label Distribution ---\n")
+            # --- End Resampling ---
+
             # Define valid keys for train_pivot_model based on its signature
             valid_pivot_model_arg_names = ['model_type', 'num_leaves', 'learning_rate', 'max_depth']
             raw_pivot_args = {k.replace('pivot_', ''):v for k,v in best_hyperparams.items() if k.startswith('pivot_')}
             pivot_model_args = {k: v for k, v in raw_pivot_args.items() if k in valid_pivot_model_arg_names}
             
             print(f"DEBUG: Args passed to train_pivot_model: {pivot_model_args}") # Log the actual args
-            temp_pivot_model, _ = train_pivot_model(X_p_train, y_p_train, X_p_train, y_p_train, **pivot_model_args)
+            # Train pivot model with resampled data
+            temp_pivot_model, _ = train_pivot_model(X_p_train_resampled, y_p_train_resampled, 
+                                                    X_p_train_resampled, y_p_train_resampled, # Using resampled for validation during this fit
+                                                    **pivot_model_args)
             if temp_pivot_model is None: print("CRITICAL: Pivot model training failed. Exiting."); sys.exit(1)
             save_model(temp_pivot_model, pivot_model_path)
             universal_pivot_model = temp_pivot_model
 
-            p_swing_train = temp_pivot_model.predict_proba(X_p_train)
-            df_final_train['P_swing'] = np.max(p_swing_train[:,1:], axis=1)
+            # For calculating P_swing on the original (non-resampled) df_final_train for entry candidate filtering:
+            # This is important because we want to evaluate P_swing on the original data distribution.
+            p_swing_on_original_train_data = temp_pivot_model.predict_proba(X_p_train) # X_p_train is original
+            df_final_train['P_swing'] = np.max(p_swing_on_original_train_data[:,1:], axis=1)
             
             # Filter for entry candidates
             p_swing_thresh_for_entry_candidates = best_hyperparams.get('p_swing_threshold', 0.5) # Default if not in params
@@ -4272,10 +4330,11 @@ def calculate_rsi(df, period=14, column='close'):
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
-def engineer_pivot_features(df, atr_col_name): # Added atr_col_name
+def engineer_pivot_features(df, atr_col_name, force_live_bars_since_pivot_calc: bool = False): # Added force_live_bars_since_pivot_calc
     """
     Engineers features for the pivot detection model.
     `atr_col_name` should be the name of the ATR column to use (e.g., 'atr_14').
+    `force_live_bars_since_pivot_calc` forces the use of candidate pivots for 'bars_since_last_pivot'.
     """
     # The caller is responsible for ensuring df contains the correct atr_col_name.
     # This function will use the provided atr_col_name.
@@ -4316,14 +4375,23 @@ def engineer_pivot_features(df, atr_col_name): # Added atr_col_name
     df['bars_since_last_pivot'] = MAX_BARS_NO_PIVOT_CONSTANT # Default
 
     has_pre_calculated_pivots = False
+    # Determine if actual pre-calculated pivots exist (for the original "TrainingLabels" path)
     if 'is_swing_high' in df.columns and 'is_swing_low' in df.columns:
         if (df['is_swing_high'] == 1).any() or (df['is_swing_low'] == 1).any():
-            has_pre_calculated_pivots = True
+            has_pre_calculated_pivots = True # True labels exist
 
-    if has_pre_calculated_pivots:
-        # Training path: Use pre-calculated is_swing_high/is_swing_low from prune_and_label_pivots
-        pivot_indices_series = df[(df.get('is_swing_high') == 1) | (df.get('is_swing_low') == 1)].index
+    # Decide which path to take for bars_since_last_pivot
+    # If force_live_bars_since_pivot_calc is True, always use the candidate-based method.
+    # Otherwise, use true pivots if they exist, else fall back to candidates.
+    use_candidate_pivot_path = force_live_bars_since_pivot_calc or not has_pre_calculated_pivots
+    path_type_for_log = "" # Will be set below
+
+    if not use_candidate_pivot_path:
+        # Path 1: Using actual pre-calculated (pruned) pivots - Original "TrainingLabels" path
+        path_type_for_log = "TrainingLabels"
+        pivot_indices_series = df[(df['is_swing_high'] == 1) | (df['is_swing_low'] == 1)].index
         if not pivot_indices_series.empty:
+            # (Original logic for TrainingLabels path remains here)
             last_pivot_map = pd.Series(index=df.index, dtype='float64')
             current_last_pivot_idx = np.nan # Use np.nan for missing initial pivots
             for idx in df.index:
@@ -4344,24 +4412,30 @@ def engineer_pivot_features(df, atr_col_name): # Added atr_col_name
             df['bars_since_last_pivot'] = bars_since.astype(int)
             # Any remaining NaNs (e.g. if mapping failed unexpectedly) or if no pivots at all, should be caught by fillna later if not here.
             # If pivot_indices_series was empty, this block is skipped, default MAX_BARS_NO_PIVOT_CONSTANT remains.
-    else:
-        # Live prediction path (or training segment without any true pivots):
-        # Use local candidate pivots within the current df segment.
-        df_temp_candidates = df.copy()
-        df_temp_candidates = generate_candidate_pivots(df_temp_candidates, n_left=PIVOT_N_LEFT, n_right=PIVOT_N_RIGHT) # Use global PIVOT_N_LEFT/RIGHT
+    # else: # This 'else' corresponds to 'if not use_candidate_pivot_path'
+    if use_candidate_pivot_path: # Combined condition for live path or forced live-like calculation
+        # Path 2: Using candidate pivots - Original "LiveCandidates" path OR forced for training
+        path_type_for_log = "LiveCandidates"
+        if force_live_bars_since_pivot_calc:
+            path_type_for_log = "TrainingUniversal (ForcedLiveCalc)"
+
+        df_temp_candidates = df.copy() # Operate on a copy to avoid modifying 'is_candidate_high/low' if they already exist
+        # Ensure candidate columns are fresh for this calculation if forced
+        if force_live_bars_since_pivot_calc or 'is_candidate_high' not in df_temp_candidates.columns:
+            df_temp_candidates = generate_candidate_pivots(df_temp_candidates, n_left=PIVOT_N_LEFT, n_right=PIVOT_N_RIGHT) 
         
         candidate_indices = df_temp_candidates[(df_temp_candidates['is_candidate_high']) | (df_temp_candidates['is_candidate_low'])].index
         
         if not candidate_indices.empty:
-            last_candidate_pivot_map = pd.Series(index=df.index, dtype='float64')
+            last_candidate_pivot_map = pd.Series(index=df.index, dtype='float64') # Use original df.index for map
             current_last_candidate_idx = np.nan
-            for idx in df.index:
+            for idx in df.index: # Iterate using original df's index
                 candidates_up_to_idx = candidate_indices[candidate_indices <= idx]
                 if not candidates_up_to_idx.empty:
                     current_last_candidate_idx = candidates_up_to_idx[-1]
                 last_candidate_pivot_map.loc[idx] = current_last_candidate_idx
 
-            df_idx_to_pos = pd.Series(range(len(df)), index=df.index)
+            df_idx_to_pos = pd.Series(range(len(df)), index=df.index) # Map for original df
             pos_of_last_candidate_pivot = last_candidate_pivot_map.map(df_idx_to_pos).fillna(-1).astype(int)
             bars_since_candidate = df_idx_to_pos - pos_of_last_candidate_pivot
             df['bars_since_last_pivot'] = bars_since_candidate.astype(int)
@@ -4370,6 +4444,15 @@ def engineer_pivot_features(df, atr_col_name): # Added atr_col_name
     # Ensure any NaNs that might have slipped through (e.g. if df.index was very unusual) are defaulted
     df['bars_since_last_pivot'] = df['bars_since_last_pivot'].fillna(MAX_BARS_NO_PIVOT_CONSTANT)
 
+    # --- Logging for bars_since_last_pivot ---
+    # path_type_for_log is now set correctly based on the path taken
+    print(f"\n--- `bars_since_last_pivot` Statistics (Path: {path_type_for_log}) ---")
+    if 'bars_since_last_pivot' in df and not df['bars_since_last_pivot'].empty:
+        print(df['bars_since_last_pivot'].describe(percentiles=[.01, .05, .25, .5, .75, .95, .99]))
+    else:
+        print("`bars_since_last_pivot` column not found or empty.")
+    print(f"--- End `bars_since_last_pivot` Statistics ---\n")
+    # --- End Logging ---
 
     # Volume
     df['volume_rolling_avg_20'] = df['volume'].rolling(window=20).mean()
@@ -4384,7 +4467,38 @@ def engineer_pivot_features(df, atr_col_name): # Added atr_col_name
         'return_1b_atr_norm', 'return_3b_atr_norm', 'return_5b_atr_norm',
         'high_rank_7', 'bars_since_last_pivot', 'volume_spike_vs_avg', 'rsi_14'
     ]
-    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    # df.replace([np.inf, -np.inf], np.nan, inplace=True) # Moved after clipping
+
+    # --- Clipping extreme values for specific normalized features ---
+    # Define a clipping range (e.g., -5 to 5 standard deviations, or fixed values)
+    # For now, let's use a fixed range that seems reasonable for normalized slopes/returns.
+    CLIP_MIN = -5.0
+    CLIP_MAX = 5.0
+
+    features_to_clip = [
+        'macd_slope_atr_norm',
+        'return_1b_atr_norm', 'return_3b_atr_norm', 'return_5b_atr_norm'
+    ]
+    for feature_name in features_to_clip:
+        if feature_name in df.columns:
+            # Log before clipping for comparison, if needed for debugging, but can be verbose
+            # print(f"Clipping {feature_name}: Min before: {df[feature_name].min()}, Max before: {df[feature_name].max()}")
+            df[feature_name] = df[feature_name].clip(lower=CLIP_MIN, upper=CLIP_MAX)
+            # print(f"Clipping {feature_name}: Min after: {df[feature_name].min()}, Max after: {df[feature_name].max()}")
+    # --- End Clipping ---
+
+    # --- Enhanced Logging for Feature Statistics ---
+    print(f"\n--- Feature Statistics from engineer_pivot_features (ATR: {atr_col_name}) ---")
+    for col in feature_cols:
+        if col in df:
+            stats = df[col].describe(percentiles=[.01, .05, .25, .5, .75, .95, .99])
+            print(f"\nFeature: {col}")
+            print(stats)
+        else:
+            print(f"\nFeature: {col} - Not found in DataFrame after engineering.")
+    print("--- End Feature Statistics from engineer_pivot_features ---\n")
+    # --- End Enhanced Logging ---
+
     return df, feature_cols
 
 def engineer_entry_features(df, atr_col_name, entry_features_base_list_arg=None): # Added atr_col_name, made list an arg
@@ -4592,6 +4706,7 @@ def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot
 
     # --- Per-Trial Data Processing ---
     df_trial_processed = df_raw.copy() # Start with a fresh copy of the raw data for each trial
+    df_trial_processed.reset_index(drop=True, inplace=True) # Ensure 0-based index for concatenated DFs
 
     # 1. Calculate ATR for the current trial's period
     df_trial_processed = calculate_atr(df_trial_processed, period=current_atr_period)
@@ -4599,15 +4714,16 @@ def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot
         print(f"Error: ATR column '{atr_col_name_optuna}' not created in trial. Skipping trial.")
         return -100.0 # Penalize heavily
 
-    # 2. Generate candidate pivots
+    # 2. Generate candidate pivots (will be used by engineer_pivot_features if force_live_bars_since_pivot_calc=True,
+    # but also needed for prune_and_label_pivots if that's still part of the sequence before feature engineering)
     df_trial_processed = generate_candidate_pivots(df_trial_processed, n_left=current_pivot_n_left, n_right=current_pivot_n_right)
 
-    # 3. Prune and label pivots
+    # 3. Prune and label pivots (to get the actual y_target for training)
     df_trial_processed = prune_and_label_pivots(df_trial_processed, atr_col_name=atr_col_name_optuna, 
                                                 atr_distance_factor=current_min_atr_distance, 
                                                 min_bar_gap=current_min_bar_gap)
 
-    # 4. Simulate Fibonacci entries
+    # 4. Simulate Fibonacci entries (for entry model's y_target)
     df_trial_processed = simulate_fib_entries(df_trial_processed, atr_col_name=atr_col_name_optuna)
     
     # Drop rows with NaN in critical columns that might have been introduced or not handled by ATR/simulation
@@ -4619,17 +4735,24 @@ def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot
         print(f"Warning: Not enough data ({len(df_trial_processed)} rows) after initial trial processing. Skipping trial.")
         return -99.0
 
-
     # 5. Engineer pivot features (returns DataFrame and pivot_feature_names for this trial)
-    df_trial_processed, trial_pivot_features = engineer_pivot_features(df_trial_processed, atr_col_name=atr_col_name_optuna)
+    # Force bars_since_last_pivot to use the candidate-based calculation for training consistency with live
+    df_trial_processed, trial_pivot_features = engineer_pivot_features(
+        df_trial_processed, 
+        atr_col_name=atr_col_name_optuna,
+        force_live_bars_since_pivot_calc=True 
+    )
 
     # 6. Engineer entry features (returns DataFrame and entry_feature_names_base for this trial)
     # Pass the static_entry_features_base list which engineer_entry_features will use and potentially extend
     # with atr_col_name_optuna related features.
-    df_trial_processed, trial_entry_features_base = engineer_entry_features(df_trial_processed, atr_col_name=atr_col_name_optuna, 
-                                                                          entry_features_base_list_arg=static_entry_features_base)
+    df_trial_processed, trial_entry_features_base = engineer_entry_features(
+        df_trial_processed, 
+        atr_col_name=atr_col_name_optuna, 
+        entry_features_base_list_arg=static_entry_features_base
+    )
 
-    df_trial_processed.replace([np.inf, -np.inf], np.nan, inplace=True)
+    # df.replace([np.inf, -np.inf], np.nan, inplace=True) # This is now inside engineer_pivot_features & engineer_entry_features
     # It's crucial to handle NaNs from feature engineering before splitting
     df_trial_processed.dropna(subset=trial_pivot_features, inplace=True) # Drop rows where pivot features are NaN
     # For entry features, NaNs are typically handled on the subset of data used for entry model training.
@@ -4807,6 +4930,7 @@ def process_dataframe_with_params(df_initial, params, static_entry_features_base
     """
     print(f"Processing DataFrame with params: {params}")
     df_processed = df_initial.copy()
+    df_processed.reset_index(drop=True, inplace=True) # Ensure 0-based index
 
     # Extract parameters, providing defaults if not all are in 'params' (e.g. if Optuna didn't tune some)
     atr_period = params.get('atr_period_opt', ATR_PERIOD)
@@ -4842,7 +4966,12 @@ def process_dataframe_with_params(df_initial, params, static_entry_features_base
         return None, None, None
 
     # 5. Engineer pivot features
-    df_processed, final_pivot_features = engineer_pivot_features(df_processed, atr_col_name=atr_col_name)
+    # Force bars_since_last_pivot to use the candidate-based calculation for training consistency with live
+    df_processed, final_pivot_features = engineer_pivot_features(
+        df_processed, 
+        atr_col_name=atr_col_name,
+        force_live_bars_since_pivot_calc=True
+    )
 
     # 6. Engineer entry features
     df_processed, final_entry_features_base = engineer_entry_features(
