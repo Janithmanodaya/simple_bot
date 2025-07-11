@@ -47,6 +47,12 @@ app_trading_configs = {}
 app_active_trades = {}
 app_active_trades_lock = threading.Lock()
 
+# --- Global Fibonacci Pre-Order Proposals ---
+# Stores details of proposed Fibonacci limit orders before they meet secondary conditions.
+# Key: symbol (str), Value: dict of proposal details
+app_fib_proposals = {}
+app_fib_proposals_lock = threading.Lock()
+
 # --- Global ML Models & Parameters ---
 # These will be populated by training or loading from disk.
 universal_pivot_model = None
@@ -455,7 +461,11 @@ def load_app_settings(filepath=APP_CONFIG_FILE):
         "app_rsi_min_long": 0.0,  # Min RSI for LONG entry (0 effectively means no lower bound)
         "app_rsi_min_short": 30.0, # Min RSI for SHORT entry
         "app_rsi_max_short": 100.0, # Max RSI for SHORT entry (100 effectively means no upper bound)
-        "app_reject_notify_telegram": True # Toggle for sending Telegram notifications for pre-check rejections
+        "app_reject_notify_telegram": True, # Toggle for sending Telegram notifications for pre-check rejections
+        "use_fib_preorder": False, # Default for the new Fibonacci pre-order logic
+        "fib_proposal_validity_minutes": 15, # Default validity for Fib proposals
+        "fib_leg_lookback_candles": 50, # Default lookback for finding the other end of Fib leg
+        "app_simulate_limit_orders": False # Default for dry-run/paper trading mode for Fib limits
     }
 
     loaded_json_settings = {}
@@ -1707,6 +1717,62 @@ def send_app_telegram_message(message: str):
             sender_thread.start()
             return True # Assume submitted to thread is success for this fallback
 
+# --- Fibonacci Calculation Helper ---
+def compute_fib_levels(anchor_1: float, anchor_2: float, direction: str) -> dict | None:
+    """
+    Calculates Fibonacci retracement levels for a given swing.
+
+    Args:
+        anchor_1 (float): Price of the first anchor point of the swing.
+        anchor_2 (float): Price of the second anchor point of the swing.
+        direction (str): "long" if the original move was up (expecting retracement down),
+                         "short" if the original move was down (expecting retracement up).
+                         This refers to the direction of the *main leg* for which fibs are drawn.
+                         A "long" direction means the leg went from a low (anchor_X) to a high (anchor_Y),
+                         and we expect price to retrace *down* from high towards low.
+                         A "short" direction means the leg went from a high to a low,
+                         and we expect price to retrace *up* from low towards high.
+
+
+    Returns:
+        dict | None: A dictionary with Fib levels (e.g., "0.618": price), or None if inputs invalid.
+    """
+    if anchor_1 is None or anchor_2 is None:
+        print("compute_fib_levels: One or both anchor prices are None.")
+        return None
+
+    swing_high_price = max(anchor_1, anchor_2)
+    swing_low_price = min(anchor_1, anchor_2)
+
+    if swing_high_price == swing_low_price:
+        print(f"compute_fib_levels: Swing high and low are identical ({swing_high_price}). Cannot calculate Fib levels.")
+        return None
+
+    price_range = swing_high_price - swing_low_price
+    # Standard Fibonacci retracement levels often used for entries.
+    # Extensions (e.g., 1.272, 1.618) are typically for targets, not handled here.
+    fib_ratios = {"0.236": 0.236, "0.382": 0.382, "0.500": 0.500, "0.618": 0.618, "0.786": 0.786}
+    calculated_levels = {}
+
+    # The 'direction' parameter determines how retracement is viewed.
+    # If direction == "long", it implies the primary move was UP (from swing_low_price to swing_high_price),
+    # and we are looking for a retracement DOWNWARDS from swing_high_price.
+    # If direction == "short", it implies the primary move was DOWN (from swing_high_price to swing_low_price),
+    # and we are looking for a retracement UPWARDS from swing_low_price.
+
+    for level_name, ratio_val in fib_ratios.items():
+        if direction.lower() == "long": # Primary move was up, expect retrace down from swing_high_price
+            calculated_levels[level_name] = swing_high_price - (price_range * ratio_val)
+        elif direction.lower() == "short": # Primary move was down, expect retrace up from swing_low_price
+            calculated_levels[level_name] = swing_low_price + (price_range * ratio_val)
+        else:
+            print(f"compute_fib_levels: Invalid direction '{direction}'. Must be 'long' or 'short'.")
+            return None
+            
+    # print(f"compute_fib_levels ({direction}): Leg [{swing_low_price} - {swing_high_price}]. Levels: {calculated_levels}")
+    return calculated_levels
+# --- End Fibonacci Calculation Helper ---
+
 def escape_app_markdown_v1(text: str) -> str:
     """Escapes characters for Telegram Markdown V1 (app.py version)."""
     if not isinstance(text, str): return ""
@@ -1799,6 +1865,106 @@ def app_send_entry_signal_telegram(current_app_settings: dict, symbol: str, sign
     
     print(f"{log_prefix} Formatted entry signal message for Telegram.")
     send_app_telegram_message(message) # Uses app.py's sender
+
+def app_send_fib_proposal_telegram(current_app_settings: dict, symbol: str, direction: str,
+                                   pivot_price: float, leg_start_price: float, leg_end_price: float,
+                                   proposed_limit_price: float, fib_ratio_used: float,
+                                   valid_until_timestamp: pd.Timestamp,
+                                   p_swing_score: float, p_profit_score_initial: float,
+                                   symbol_info_for_prec: dict):
+    """
+    Formats and sends a Telegram message for a new Fibonacci limit order proposal.
+    Indicates if it's a paper trade proposal based on app_settings.
+    """
+    log_prefix = f"[AppSendFibProposal-{symbol}]"
+    bot_token = current_app_settings.get("app_telegram_bot_token")
+    chat_id = current_app_settings.get("app_telegram_chat_id")
+    notify_on_trade = current_app_settings.get("app_notify_on_trade", True) # Use general notification toggle
+
+    if not notify_on_trade:
+        print(f"{log_prefix} Telegram notifications are disabled. Skipping Fib proposal message.")
+        return
+    if bot_token is None or chat_id is None:
+        print(f"{log_prefix} Telegram token/chat_id not configured. Cannot send Fib proposal.")
+        return
+
+    p_prec = int(symbol_info_for_prec.get('pricePrecision', 2)) if symbol_info_for_prec else 2
+    
+    direction_upper = direction.upper()
+    side_emoji = "🔼" if direction_upper == "LONG" else "🔽" if direction_upper == "SHORT" else "↔️"
+    
+    proposal_time_str = pd.Timestamp.now(tz='UTC').strftime('%Y-%m-%d %H:%M:%S %Z')
+    expiry_time_str = valid_until_timestamp.strftime('%Y-%m-%d %H:%M:%S %Z')
+
+    title = "🚧 *Fibonacci Limit Order PROPOSED*"
+    if current_app_settings.get("app_simulate_limit_orders", False):
+        title = "PAPER TRADE: " + title
+    
+    message = (
+        f"{title} {side_emoji}\n\n"
+        f"🗓️ Proposal Time: `{proposal_time_str}`\n"
+        f"📈 Symbol: `{escape_app_markdown_v1(symbol)}`\n"
+        f"Direction: *{direction_upper}*\n\n"
+        f"🔍 **Basis:**\n"
+        f"  - ML Pivot Price ({'Low' if direction_upper == 'LONG' else 'High'}): `{pivot_price:.{p_prec}f}`\n"
+        f"  - Fib Leg Start: `{leg_start_price:.{p_prec}f}`\n"
+        f"  - Fib Leg End: `{leg_end_price:.{p_prec}f}`\n"
+        f"  - P_Swing Score: `{p_swing_score:.3f}`\n"
+        f"  - P_Profit (Initial): `{p_profit_score_initial:.3f}`\n\n"
+        f"🎯 **Proposal:**\n"
+        f"  - Target Fib Level: `{fib_ratio_used*100:.1f}%`\n"
+        f"  - Proposed Limit Price: `{proposed_limit_price:.{p_prec}f}`\n"
+        f"  - Valid Until: `{expiry_time_str}`\n\n"
+        f"⏳ _Waiting for price to touch limit and secondary conditions to be met..._"
+    )
+    
+    print(f"{log_prefix} Formatted Fib proposal message for Telegram.")
+    send_app_telegram_message(message)
+
+def app_send_fib_proposal_update_telegram(current_app_settings: dict, proposal_data: dict, 
+                                          update_type: str, message_detail: str):
+    """
+    Formats and sends a Telegram message for an update on a Fibonacci proposal 
+    (e.g., expired, error, conditions met for simulated execution).
+    """
+    symbol = proposal_data.get('symbol', 'N/A')
+    log_prefix = f"[AppSendFibUpdate-{symbol}]"
+    bot_token = current_app_settings.get("app_telegram_bot_token")
+    chat_id = current_app_settings.get("app_telegram_chat_id")
+    notify_on_trade = current_app_settings.get("app_notify_on_trade", True)
+
+    if not notify_on_trade:
+        print(f"{log_prefix} Telegram notifications disabled. Skipping Fib proposal update.")
+        return
+    if bot_token is None or chat_id is None:
+        print(f"{log_prefix} Telegram token/chat_id not configured. Cannot send Fib update.")
+        return
+
+    s_info = get_app_symbol_info(symbol) # Fetch fresh for precision
+    p_prec = int(s_info.get('pricePrecision', 2)) if s_info else 2
+    
+    proposal_id_display = proposal_data.get('proposal_id', 'N/A')
+    side_display = proposal_data.get('side', 'N/A').upper()
+    limit_price_display = f"{proposal_data.get('proposed_limit_price', 0.0):.{p_prec}f}"
+
+    title_emoji = "ℹ️" # Default
+    if update_type == "EXPIRED": title_emoji = "⏱️"
+    elif update_type == "CANCELLED_MANUAL": title_emoji = "❌" # Example for future use
+    elif "ERROR" in update_type.upper(): title_emoji = "🆘"
+
+    message = (
+        f"{title_emoji} *Fibonacci Proposal Update* {title_emoji}\n\n"
+        f"Symbol: `{escape_app_markdown_v1(symbol)}`\n"
+        f"Side: `{side_display}`\n"
+        f"Proposal ID: `{proposal_id_display}`\n"
+        f"Original Limit: `{limit_price_display}`\n\n"
+        f"Update Type: *{escape_app_markdown_v1(update_type)}*\n"
+        f"Details: _{escape_app_markdown_v1(message_detail)}_"
+    )
+    
+    print(f"{log_prefix} Formatted Fib proposal update message for Telegram.")
+    send_app_telegram_message(message)
+
 
 def send_app_trade_execution_telegram(current_app_settings: dict, symbol: str, side: str,
                                       entry_price: float, sl_price: float,
@@ -2701,7 +2867,125 @@ def app_process_symbol_for_signal(symbol: str, client, current_app_settings: dic
     # actual_tp_price = round(actual_tp_price, p_prec)
 
     # --- Perform Action based on Operational Mode ---
-    if current_app_settings.get('app_operational_mode') == 'signal':
+
+    # --- NEW: Fibonacci Pre-Order Logic ---
+    use_fib_logic = current_app_settings.get("use_fib_preorder", False)
+    fib_proposal_details_for_log = None # For decision log
+
+    if use_fib_logic:
+        print(f"{log_prefix} Fibonacci pre-order logic is ENABLED.")
+        # 1. Determine Preceding Swing for Fib Leg
+        fib_leg_lookback = current_app_settings.get("fib_leg_lookback_candles", 50)
+        
+        # Data for leg anchor should be before the current pivot candle (df_live_raw.iloc[-1])
+        # So, look at df_live_raw up to index -2, then take a tail of fib_leg_lookback.
+        if len(df_live_raw) > fib_leg_lookback + 1:
+            data_for_leg_anchor = df_live_raw.iloc[-(fib_leg_lookback + 1) : -1]
+        else: # Not enough history for full lookback, use what's available before current candle
+            data_for_leg_anchor = df_live_raw.iloc[:-1]
+
+        preceding_swing_price = None
+        if not data_for_leg_anchor.empty:
+            if trade_side_potential == "long": # Current pivot is a low, need preceding high
+                preceding_swing_price = data_for_leg_anchor['high'].max()
+            else: # Current pivot is a high, need preceding low
+                preceding_swing_price = data_for_leg_anchor['low'].min()
+        
+        if preceding_swing_price is None or pd.isna(preceding_swing_price):
+            print(f"{log_prefix} Could not determine valid preceding swing price for Fib leg. Skipping Fib proposal.")
+            append_decision_log({"symbol": symbol, "event_type": "FIB_PROPOSAL_SKIP_NO_PRECEDING_SWING", "side": trade_side_potential})
+            # Fall through to original logic if Fib proposal cannot be made
+            use_fib_logic = False # Temporarily disable for this instance
+        else:
+            print(f"{log_prefix} Fib Leg Anchors: Pivot_Price_Sim={pivot_price_sim}, Preceding_Swing_Price={preceding_swing_price}")
+            
+            # 2. Calculate Fibonacci Levels
+            # The `direction` for compute_fib_levels refers to the direction of the main leg.
+            # If trade_side_potential is "long", the ML pivot was a LOW, so the main leg was UP to a preceding_swing_price (which was a high).
+            # So, fib_direction should be "long".
+            # If trade_side_potential is "short", ML pivot was a HIGH, main leg was DOWN to a preceding_swing_price (which was a low).
+            # So, fib_direction should be "short".
+            # This seems correct with compute_fib_levels definition.
+            fib_levels = compute_fib_levels(pivot_price_sim, preceding_swing_price, direction=trade_side_potential)
+
+            if fib_levels and "0.618" in fib_levels:
+                proposed_limit_price_raw = fib_levels["0.618"]
+                s_info_fib = get_app_symbol_info(symbol)
+                p_prec_fib = int(s_info_fib.get('pricePrecision', 2)) if s_info_fib else 2
+                proposed_limit_price = round(proposed_limit_price_raw, p_prec_fib)
+
+                # Validate proposed_limit_price (must be between pivot_price_sim and preceding_swing_price)
+                # For long: pivot_low < proposed_limit < preceding_high
+                # For short: preceding_low < proposed_limit < pivot_high
+                valid_limit = False
+                if trade_side_potential == "long" and pivot_price_sim < proposed_limit_price < preceding_swing_price:
+                    valid_limit = True
+                elif trade_side_potential == "short" and preceding_swing_price < proposed_limit_price < pivot_price_sim:
+                    valid_limit = True
+                
+                if not valid_limit:
+                    print(f"{log_prefix} Proposed Fib limit price {proposed_limit_price} is outside the leg [{min(pivot_price_sim, preceding_swing_price)}, {max(pivot_price_sim, preceding_swing_price)}]. Skipping Fib proposal.")
+                    append_decision_log({"symbol": symbol, "event_type": "FIB_PROPOSAL_SKIP_LIMIT_OUT_OF_LEG", "side": trade_side_potential, "limit": proposed_limit_price})
+                    use_fib_logic = False # Fall through
+                else:
+                    proposal_validity_minutes = current_app_settings.get("fib_proposal_validity_minutes", 15)
+                    from datetime import datetime, timedelta # Ensure timedelta is available
+                    expiry_timestamp = pd.Timestamp.now(tz='UTC') + timedelta(minutes=proposal_validity_minutes)
+
+                    # Store proposal
+                    proposal_id = f"fib_{symbol}_{pd.Timestamp.now(tz='UTC').strftime('%Y%m%d%H%M%S%f')}"
+                    proposal_data = {
+                        "proposal_id": proposal_id,
+                        "symbol": symbol, 
+                        "side": trade_side_potential,
+                        "proposed_limit_price": proposed_limit_price, 
+                        "fib_ratio": 0.618,
+                        "pivot_score": p_swing_score_live, 
+                        "p_profit_score_initial": p_profit_live, # Store initial P_profit
+                        "timestamp_created": pd.Timestamp.now(tz='UTC'), 
+                        "valid_until": expiry_timestamp,
+                        "pivot_price_anchor": pivot_price_sim,
+                        "leg_other_anchor": preceding_swing_price,
+                        "original_sl_price": actual_sl_price, # SL based on original ML signal logic
+                        "original_tp1_price": actual_tp_price, # TP1 based on original ML signal logic
+                        "original_tp2_price": None, # Placeholder for potential multi-TP from original logic
+                        "original_tp3_price": None, # Placeholder
+                        "status": "PROPOSED",
+                        "last_market_price_checked": None, # For secondary condition checker
+                        "secondary_p_profit_score": None # For secondary condition checker
+                    }
+                    
+                    with app_fib_proposals_lock:
+                        app_fib_proposals[symbol] = proposal_data # Overwrites if symbol already has a proposal
+                    
+                    print(f"{log_prefix} Stored Fibonacci Limit Proposal for {symbol}: ID {proposal_id}, Limit {proposed_limit_price}")
+                    append_decision_log({"symbol": symbol, "event_type": "FIB_PROPOSAL_STORED", "details": proposal_data})
+                    
+                    # Send Telegram Message for Fib Proposal
+                    app_send_fib_proposal_telegram(
+                        current_app_settings=current_app_settings,
+                        symbol=symbol,
+                        direction=trade_side_potential,
+                        pivot_price=pivot_price_sim,
+                        leg_start_price=min(pivot_price_sim, preceding_swing_price), # For display
+                        leg_end_price=max(pivot_price_sim, preceding_swing_price),   # For display
+                        proposed_limit_price=proposed_limit_price,
+                        fib_ratio_used=0.618,
+                        valid_until_timestamp=expiry_timestamp,
+                        p_swing_score=p_swing_score_live,
+                        p_profit_score_initial=p_profit_live,
+                        symbol_info_for_prec=s_info_fib
+                    )
+                    return # IMPORTANT: Return here to prevent original execution logic
+            else:
+                print(f"{log_prefix} Failed to calculate 0.618 Fib level. Skipping Fib proposal.")
+                append_decision_log({"symbol": symbol, "event_type": "FIB_PROPOSAL_SKIP_LEVEL_CALC_FAIL", "side": trade_side_potential})
+                use_fib_logic = False # Fall through
+
+    # --- Original Execution Logic (if Fib logic not used or skipped) ---
+    if not use_fib_logic: # This condition is now re-evaluated
+        print(f"{log_prefix} Proceeding with original execution logic (Fib pre-order not used or skipped).")
+        if current_app_settings.get('app_operational_mode') == 'signal':
             # Send Telegram signal using the new rich wrapper
             symbol_info_for_signal = get_app_symbol_info(symbol) # Fetch for precision and other details
             if not symbol_info_for_signal:
@@ -2778,6 +3062,262 @@ def app_process_symbol_for_signal(symbol: str, client, current_app_settings: dic
         print(f"{log_prefix} Unknown operational mode: {current_app_settings.get('app_operational_mode')}")
 
     print(f"{log_prefix} Finished processing for symbol.")
+
+# --- Fibonacci Pre-Order Proposal Checker ---
+def app_check_fib_proposals(client, current_app_settings: dict, 
+                            pivot_model_loaded, entry_model_loaded, # Pass models if needed for re-evaluation
+                            current_best_hyperparams: dict):
+    """
+    Checks active Fibonacci proposals against current market conditions.
+    - Manages proposal expiry.
+    - Checks for price touch of the proposed limit.
+    - If price touched, re-evaluates entry signal using the ML entry model.
+    - If all conditions met, triggers trade execution (live or simulated) or sends signal.
+    Called periodically by the main trading loop.
+    """
+    global app_fib_proposals, app_fib_proposals_lock, app_active_trades_lock # app_active_trades used by execute_app_trade_signal
+
+    if not app_fib_proposals:
+    Manages proposal expiry.
+    """
+    global app_fib_proposals, app_fib_proposals_lock, app_active_trades_lock # app_active_trades used by execute_app_trade_signal
+
+    if not app_fib_proposals:
+        return"""
+
+    log_prefix_main_checker = "[AppFibChecker]"
+    print(f"{log_prefix_main_checker} Checking {len(app_fib_proposals)} active Fibonacci proposal(s)...")
+
+    proposals_to_remove = [] # List of symbols whose proposals should be removed
+    proposals_to_execute = [] # List of (symbol, proposal_data) for execution
+
+    # Iterate over a copy for safe modification of the original dictionary
+    with app_fib_proposals_lock:
+        current_proposals_snapshot = list(app_fib_proposals.items())
+
+    for symbol, proposal_data in current_proposals_snapshot:
+        log_prefix_checker = f"[AppFibChecker-{symbol}-{proposal_data.get('proposal_id','N/A')}]"
+        
+        # 1. Expiry Check
+        if pd.Timestamp.now(tz='UTC') > proposal_data['valid_until']:
+            print(f"{log_prefix_checker} Proposal for {symbol} has EXPIRED at {proposal_data['valid_until']}.")
+            proposals_to_remove.append(symbol)
+            append_decision_log({"symbol": symbol, "event_type": "FIB_PROPOSAL_EXPIRED", "proposal_id": proposal_data.get('proposal_id')})
+            # Optionally send Telegram notification for expiry
+            app_send_fib_proposal_update_telegram(current_app_settings, proposal_data, "EXPIRED", 
+                                                  f"Proposal expired at {proposal_data['valid_until'].strftime('%Y-%m-%d %H:%M:%S %Z')}.")
+            continue
+
+        # 2. Fetch Latest Market Data for Price Touch Check
+        try:
+            # Fetch last few candles to check high/low for price touch
+            # Kline interval for this check should be quick, e.g., 1m or same as proposal trigger (15m)
+            # For now, let's use the main trading kline interval for simplicity
+            kline_interval_check = current_app_settings.get("app_trading_kline_interval", Client.KLINE_INTERVAL_15MINUTE)
+            # Fetch enough for ATR calc if needed by entry features + a few for price touch
+            num_klines_for_check = current_best_hyperparams.get('model_training_atr_period_used', 14) + 55 
+            
+            df_check_raw = get_historical_bars(symbol, kline_interval_check, start_str=f"{num_klines_for_check + 5} days ago UTC")
+            if df_check_raw.empty or len(df_check_raw) < 3: # Need at least a few candles
+                print(f"{log_prefix_checker} Insufficient kline data for price touch check for {symbol}. Skipping.")
+                continue
+            
+            # Use the most recent closed candles for price touch logic
+            # For example, check the high/low of the last closed candle
+            last_closed_candle = df_check_raw.iloc[-2] # Second to last is the most recently fully closed
+            current_candle_for_touch = df_check_raw.iloc[-1] # Current, potentially incomplete candle
+
+            # Price touch logic:
+            price_touched = False
+            proposed_limit = proposal_data['proposed_limit_price']
+            
+            # Check if the proposed limit was touched by the low of the last closed candle OR current candle's low (for longs)
+            # or by the high of the last closed candle OR current candle's high (for shorts)
+            if proposal_data['side'] == "long":
+                if last_closed_candle['low'] <= proposed_limit or current_candle_for_touch['low'] <= proposed_limit:
+                    price_touched = True
+            elif proposal_data['side'] == "short":
+                if last_closed_candle['high'] >= proposed_limit or current_candle_for_touch['high'] >= proposed_limit:
+                    price_touched = True
+            
+            # Update last market price checked in proposal_data (even if not touched)
+            # This is a bit tricky as we are modifying a copy.
+            # We should update the main app_fib_proposals if we decide to keep the proposal.
+            # For now, this field is not critical path.
+
+        except Exception as e_fetch:
+            print(f"{log_prefix_checker} Error fetching market data for {symbol}: {e_fetch}. Skipping this check cycle.")
+            continue
+
+        if not price_touched:
+            # print(f"{log_prefix_checker} Price condition not met for {symbol}. Limit: {proposed_limit}, LastClosedLow: {last_closed_candle['low']}, CurrLow: {current_candle_for_touch['low']} (if long).")
+            continue # Move to next proposal
+
+        print(f"{log_prefix_checker} Price condition MET for {symbol}. Limit: {proposed_limit}. Checking secondary conditions...")
+        append_decision_log({"symbol": symbol, "event_type": "FIB_PROPOSAL_PRICE_TOUCHED", "proposal_id": proposal_data.get('proposal_id'), "limit": proposed_limit})
+
+        # 3. Secondary Gating Condition (Entry Model Profit Score)
+        # Re-evaluate entry model based on current conditions (or use stored initial p_profit)
+        # For this implementation, let's re-evaluate using current data (df_check_raw)
+        
+        atr_period_secondary = current_best_hyperparams.get('model_training_atr_period_used')
+        entry_features_base_secondary = current_best_hyperparams.get('entry_feature_names_base_used')
+        profit_thresh_secondary = current_best_hyperparams.get('profit_threshold')
+
+        # Features for entry model:
+        p_swing_secondary = proposal_data['pivot_score'] # Use initial pivot score
+        sim_entry_secondary = proposal_data['proposed_limit_price'] # Entry is the fib limit
+        # SL for feature calculation: Use the original SL calculated when proposal was made
+        sim_sl_secondary = proposal_data['original_sl_price']
+        pivot_price_anchor_secondary = proposal_data['pivot_price_anchor']
+
+        # Ensure df_check_raw is long enough for feature calculation
+        if len(df_check_raw) < atr_period_secondary + 50 :
+            print(f"{log_prefix_checker} Not enough data in df_check_raw ({len(df_check_raw)}) for secondary entry feature calculation. Skipping this check.")
+            continue
+
+        entry_features_secondary = app_calculate_live_entry_features(
+            df_check_raw, atr_period_secondary, entry_features_base_secondary,
+            p_swing_secondary, sim_entry_secondary, sim_sl_secondary,
+            pivot_price_anchor_secondary, current_app_settings
+        )
+
+        if entry_features_secondary is None:
+            print(f"{log_prefix_checker} Failed to calculate secondary entry features for {symbol}. Skipping.")
+            continue
+        
+        try:
+            entry_probs_secondary = entry_model_loaded.predict_proba(pd.DataFrame([entry_features_secondary.to_dict()]))[0]
+            p_profit_secondary_live = entry_probs_secondary[1]
+        except Exception as e_predict_secondary:
+            print(f"{log_prefix_checker} Error during secondary entry model prediction for {symbol}: {e_predict_secondary}")
+            continue
+        
+        print(f"{log_prefix_checker} Secondary Entry Model: P_Profit={p_profit_secondary_live:.3f} (Thresh: {profit_thresh_secondary:.2f})")
+
+        if p_profit_secondary_live >= profit_thresh_secondary:
+            print(f"{log_prefix_checker} ✅ All gating conditions MET for {symbol}!")
+            append_decision_log({"symbol": symbol, "event_type": "FIB_PROPOSAL_CONDITIONS_MET", 
+                                 "proposal_id": proposal_data.get('proposal_id'), "p_profit_secondary": p_profit_secondary_live})
+            proposals_to_execute.append((symbol, proposal_data))
+            proposals_to_remove.append(symbol) # Mark for removal after queuing for execution
+        else:
+            print(f"{log_prefix_checker} Secondary profit score ({p_profit_secondary_live:.3f}) for {symbol} did not meet threshold ({profit_thresh_secondary:.2f}). Proposal remains active.")
+            # Update proposal with this score for future reference if needed (optional)
+            # with app_fib_proposals_lock:
+            #    if symbol in app_fib_proposals:
+            #        app_fib_proposals[symbol]['last_market_price_checked'] = current_market_price # Example
+            #        app_fib_proposals[symbol]['secondary_p_profit_score'] = p_profit_secondary_live
+            append_decision_log({"symbol": symbol, "event_type": "FIB_PROPOSAL_SECONDARY_PROFIT_FAIL", 
+                                 "proposal_id": proposal_data.get('proposal_id'), "p_profit_secondary": p_profit_secondary_live})
+
+
+    # --- Process Removals ---
+    if proposals_to_remove:
+        with app_fib_proposals_lock:
+            for sym_rem in set(proposals_to_remove): # Use set to avoid issues if symbol added multiple times
+                if sym_rem in app_fib_proposals:
+                    print(f"{log_prefix_main_checker} Removing proposal for {sym_rem} (reason: executed, expired, or error).")
+                    del app_fib_proposals[sym_rem]
+    
+    # --- Process Executions (occurs after lock release for removals to avoid deadlock with execute_app_trade_signal) ---
+    for symbol_to_exec, proposal_data_to_exec in proposals_to_execute:
+        log_prefix_exec = f"[AppFibExecute-{symbol_to_exec}-{proposal_data_to_exec.get('proposal_id','N/A')}]"
+        print(f"{log_prefix_exec} Initiating execution for Fib proposal.")
+        
+        # Retrieve original SL/TP from proposal
+        exec_sl = proposal_data_to_exec['original_sl_price']
+        exec_tp1 = proposal_data_to_exec['original_tp1_price']
+        exec_tp2 = proposal_data_to_exec.get('original_tp2_price') # Might be None
+        exec_tp3 = proposal_data_to_exec.get('original_tp3_price') # Might be None
+
+        if current_app_settings.get('app_operational_mode') == 'signal':
+            # Send "Market Order Execution" style Telegram signal
+            # This indicates conditions were met and a paper trade would occur.
+            # Need to fetch current market price for this message.
+            s_info_exec = get_app_symbol_info(symbol_to_exec)
+            p_prec_exec = int(s_info_exec.get('pricePrecision',2)) if s_info_exec else 2
+            temp_mkt_price = get_app_symbol_info(symbol_to_exec) # This is wrong, need ticker
+            try:
+                ticker_exec = app_binance_client.futures_ticker(symbol=symbol_to_exec)
+                price_for_signal_msg = float(ticker_exec['lastPrice'])
+            except Exception: price_for_signal_msg = proposal_data_to_exec['proposed_limit_price'] # Fallback
+
+            # We don't have actual executed quantity for signal mode, can estimate or omit
+            # For now, let's use a placeholder for quantity in signal message or calculate based on fixed capital.
+            # Using the `send_app_trade_execution_telegram` which expects executed_quantity.
+            # Let's pass None for quantity in signal mode for Fib execution message.
+            send_app_trade_execution_telegram(
+                current_app_settings=current_app_settings,
+                symbol=symbol_to_exec,
+                side=proposal_data_to_exec['side'],
+                entry_price=price_for_signal_msg, # Effective "execution" price for signal
+                sl_price=exec_sl, tp1_price=exec_tp1, tp2_price=exec_tp2, tp3_price=exec_tp3,
+                order_type="MARKET (Fib Conditions Met)", # Indicate it's from Fib
+                executed_quantity=None, # No real quantity in signal mode for this step
+                mode="signal" 
+            )
+            append_decision_log({"symbol": symbol_to_exec, "event_type": "FIB_PROPOSAL_SIGNAL_MODE_EXECUTE_MSG_SENT", 
+                                 "proposal_id": proposal_data_to_exec.get('proposal_id')})
+
+        elif current_app_settings.get('app_operational_mode') == 'live':
+            # Call execute_app_trade_signal to place live market order
+            # `execute_app_trade_signal` will determine its own market entry price.
+            
+            is_simulation_mode = current_app_settings.get("app_simulate_limit_orders", False)
+
+            if is_simulation_mode:
+                print(f"{log_prefix_exec} SIMULATE MODE: Conditions met for Fib proposal. Logging simulated market execution.")
+                # In simulation mode, we don't call execute_app_trade_signal.
+                # We log and send a specific Telegram message.
+                
+                # Fetch current market price for the simulation log/message
+                sim_exec_price = proposal_data_to_exec['proposed_limit_price'] # Default to proposed
+                try:
+                    ticker_sim_exec = app_binance_client.futures_ticker(symbol=symbol_to_exec)
+                    sim_exec_price = float(ticker_sim_exec['lastPrice'])
+                except Exception as e_sim_tick:
+                    print(f"{log_prefix_exec} SIMULATE MODE: Error fetching ticker for sim exec price: {e_sim_tick}. Using proposed limit.")
+
+                s_info_sim_exec = get_app_symbol_info(symbol_to_exec)
+                p_prec_sim_exec = int(s_info_sim_exec.get('pricePrecision',2)) if s_info_sim_exec else 2
+                
+                # For simulated quantity, we'd need to calculate it as if a trade was happening.
+                # This requires balance, risk %, etc. For simplicity in this message, we can omit qty
+                # or state that it would be calculated based on standard risk params.
+                # Let's omit specific quantity from this "simulated execution" message for now,
+                # as it's about the *trigger* of the Fib condition.
+                
+                sim_exec_message = (
+                    f"PAPER TRADE: ✅ Fib Limit Conditions Met - Simulated Market Order ✅\n\n"
+                    f"Symbol: `{escape_app_markdown_v1(symbol_to_exec)}`\n"
+                    f"Direction: *{proposal_data_to_exec['side'].upper()}*\n"
+                    f"Original Proposed Limit: `{proposal_data_to_exec['proposed_limit_price']:.{p_prec_sim_exec}f}` (0.618 Fib)\n"
+                    f"Simulated Market Entry Price: `~{sim_exec_price:.{p_prec_sim_exec}f}`\n"
+                    f"Planned SL: `{exec_sl:.{p_prec_sim_exec}f}`, Planned TP1: `{exec_tp1:.{p_prec_sim_exec}f}`\n"
+                    f"_(This is a paper trade notification. No real order was placed.)_"
+                )
+                send_app_telegram_message(sim_exec_message)
+                append_decision_log({"symbol": symbol_to_exec, "event_type": "FIB_PROPOSAL_SIMULATED_EXECUTION", 
+                                     "proposal_id": proposal_data_to_exec.get('proposal_id'), 
+                                     "sim_exec_price": sim_exec_price, "side": proposal_data_to_exec['side']})
+            else: # Live mode
+                print(f"{log_prefix_exec} Live mode: Calling execute_app_trade_signal.")
+                execute_app_trade_signal(
+                    symbol=symbol_to_exec,
+                    side=proposal_data_to_exec['side'],
+                    sl_price=exec_sl,
+                    tp1_price=exec_tp1,
+                    tp2_price=exec_tp2,
+                    tp3_price=exec_tp3,
+                    entry_price_target=None, # Market order, execute_app_trade_signal will use current price
+                    order_type="MARKET" 
+                )
+            # `execute_app_trade_signal` already appends to decision log and sends Telegram for live.
+        
+        # Note: Proposal was already marked for removal.
+
+# --- End Fibonacci Pre-Order Proposal Checker ---
 
 
 # --- Pre-Signal Condition Checks ---
@@ -2929,6 +3469,18 @@ def app_trading_signal_loop(current_app_settings: dict, pivot_model_loaded, entr
                     )
                     # Optional: Short delay between processing symbols if multiple are listed
                     time.sleep(current_app_settings.get("app_delay_between_symbols_seconds", 2)) # Default 2s
+
+            # --- Check Fibonacci Pre-Order Proposals ---
+            if current_app_settings.get("use_fib_preorder", False): # Only run if feature is enabled
+                print(f"{log_prefix} Checking Fibonacci pre-order proposals...")
+                app_check_fib_proposals(
+                    client=app_binance_client,
+                    current_app_settings=current_app_settings,
+                    pivot_model_loaded=pivot_model_loaded, # Pass loaded models
+                    entry_model_loaded=entry_model_loaded,
+                    current_best_hyperparams=current_best_hyperparams
+                )
+            # --- End Fibonacci Pre-Order Proposal Check ---
 
             # Monitor existing trades/signals (if any were placed)
             # monitor_app_trades uses the global app_binance_client and app_active_trades
