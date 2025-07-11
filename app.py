@@ -2359,26 +2359,26 @@ def app_calculate_live_pivot_features(df_live: pd.DataFrame, atr_period: int, pi
     df = calculate_atr(df, period=atr_period) # This should add f'atr_{atr_period}'
     atr_col_name = f'atr_{atr_period}'
 
-    if atr_col_name not in df.columns or df[atr_col_name].iloc[-1] is None or pd.isna(df[atr_col_name].iloc[-1]):
-        print(f"{log_prefix} ATR calculation failed or resulted in NaN for the latest candle. ATR Column: '{atr_col_name}'.")
-        # Attempt to log more details about the ATR series end
-        if atr_col_name in df.columns:
-            print(f"{log_prefix} Last few ATR values: {df[atr_col_name].tail().to_dict()}")
-        else:
-            print(f"{log_prefix} ATR column '{atr_col_name}' was not even created.")
+    # --- Full ATR Column Cleaning ---
+    if atr_col_name in df.columns:
+        df[atr_col_name] = df[atr_col_name].replace(0, 1e-8) # Replace 0 with a very small number
+        df[atr_col_name] = df[atr_col_name].fillna(method='ffill') # Forward fill NaNs
+        df[atr_col_name] = df[atr_col_name].fillna(method='bfill') # Backward fill remaining NaNs (e.g., at the start)
+        # After ffill and bfill, check if any NaNs persist (e.g., if entire column was NaN)
+        if df[atr_col_name].isnull().all():
+            print(f"{log_prefix} CRITICAL: ATR column '{atr_col_name}' is all NaNs even after cleaning. Cannot proceed.")
+            return None
+        # Final check for the last value, though comprehensive cleaning should handle it.
+        if pd.isna(df[atr_col_name].iloc[-1]):
+             print(f"{log_prefix} CRITICAL: Last ATR value in '{atr_col_name}' is still NaN after cleaning. Values: {df[atr_col_name].tail()}")
+             return None
+    else:
+        print(f"{log_prefix} CRITICAL: ATR column '{atr_col_name}' was not created by calculate_atr. Cannot proceed.")
         return None
-    
-    # Ensure ATR is not zero to prevent division by zero errors for normalized features
-    if df[atr_col_name].iloc[-1] == 0:
-        print(f"{log_prefix} Warning: ATR for the latest candle is zero. Normalizing features might lead to inf. Using a small epsilon for ATR.")
-        # Replace zero ATR with a very small number to avoid division by zero
-        # This should only affect the last row for feature calculation.
-        # A more robust way might be to check and adjust df[atr_col_name].iloc[-1] before it's used in divisions.
-        # However, feature engineering functions below might use the whole column.
-        # For safety, let's ensure the last ATR value used in division is non-zero.
-        # The functions like engineer_pivot_features might need to be aware of this.
-        # The current engineer_pivot_features in app.py uses the atr_col_name directly.
-        # We will rely on it to handle or propagate NaNs/Infs if ATR is zero.
+    # --- End Full ATR Column Cleaning ---
+
+    # We no longer need to check df[atr_col_name].iloc[-1] for None/NaN/0 specifically here,
+    # as the full column cleaning should have addressed it or returned None if issues persist.
 
     # Re-call app.py's engineer_pivot_features function.
     # It's designed to add features to the DataFrame.
@@ -2403,16 +2403,48 @@ def app_calculate_live_pivot_features(df_live: pd.DataFrame, atr_period: int, pi
     # if 'is_swing_high' not in df.columns: df['is_swing_high'] = 0 # No longer needed here
     # if 'is_swing_low' not in df.columns: df['is_swing_low'] = 0 # No longer needed here
     
-    df_with_features, calculated_feature_names = engineer_pivot_features(df, atr_col_name=atr_col_name)
-    
-    # Verify that the `calculated_feature_names` from `engineer_pivot_features` match the expected `pivot_feature_names`.
-    # This is a sanity check. The `pivot_feature_names` list (from best_hyperparams) is the source of truth.
+    try:
+        # Note: Optuna and final training use force_live_bars_since_pivot_calc=True.
+        # Live prediction should also use this for consistency if that feature is important.
+        df_with_features, calculated_feature_names = engineer_pivot_features(df, atr_col_name=atr_col_name, force_live_bars_since_pivot_calc=True)
+    except RuntimeError as e:
+        print(f"{log_prefix} Error during engineer_pivot_features: {e}")
+        return None
 
-    # Select the required features for the latest candle
-    live_features_series = df_with_features.iloc[-1][pivot_feature_names].copy()
+    if df_with_features is None: # If engineer_pivot_features returns None explicitly
+        print(f"{log_prefix} engineer_pivot_features returned None. Cannot proceed.")
+        return None
+
+    # --- Feature Name Validation and Logging ---
+    # pivot_feature_names is the list passed into this function, expected by the model
+    print(f"[DEBUG] Expected Pivot Features (from params): {pivot_feature_names}")
+    print(f"[DEBUG] Actual Pivot Features (reported by engineer_pivot_features): {calculated_feature_names}")
+    print(f"[DEBUG] DataFrame columns after engineer_pivot_features: {df_with_features.columns.tolist()}")
+
+    # Check if all expected features (pivot_feature_names) are present in the DataFrame columns
+    missing_expected_in_df = [name for name in pivot_feature_names if name not in df_with_features.columns]
+    if missing_expected_in_df:
+        print(f"{log_prefix} CRITICAL WARNING: The following expected pivot features (from params) are MISSING from the DataFrame generated by engineer_pivot_features: {missing_expected_in_df}")
+        # This will likely cause a KeyError below. For now, let it proceed to the try-except for selection.
+
+    # Check if the list of features the model expects matches what engineer_pivot_features claims it produced
+    if set(pivot_feature_names) != set(calculated_feature_names):
+        print(f"{log_prefix} INFO: Mismatch between expected pivot features (params) and features reported by engineer_pivot_features. Will attempt to use expected list from params.")
+        print(f"    Params List (pivot_feature_names): {sorted(list(set(pivot_feature_names)))}")
+        print(f"    Engineered List (calculated_feature_names): {sorted(list(set(calculated_feature_names)))}")
+    # --- End Feature Name Validation ---
+
+    # Select the required features for the latest candle using pivot_feature_names from params
+    try:
+        live_features_series = df_with_features.iloc[-1][pivot_feature_names].copy()
+    except KeyError as e:
+        print(f"{log_prefix} CRITICAL ERROR: KeyError when selecting expected pivot features from DataFrame. This means some features in pivot_feature_names are not columns in df_with_features. Error: {e}")
+        print(f"    Expected features (pivot_feature_names): {pivot_feature_names}")
+        print(f"    Available columns in df_with_features: {df_with_features.columns.tolist()}")
+        return None
     
     # Replace Inf values (e.g., from division by zero if ATR was zero and not handled robustly)
-    live_features_series = live_features_series.replace([np.inf, -np.inf], np.nan) # Addressed FutureWarning
+    live_features_series = live_features_series.replace([np.inf, -np.inf], np.nan)
 
     if live_features_series.isnull().any():
         print(f"{log_prefix} NaN values found in live pivot features for the latest candle:")
@@ -2424,13 +2456,15 @@ def app_calculate_live_pivot_features(df_live: pd.DataFrame, atr_period: int, pi
     print(f"{log_prefix} Successfully calculated live pivot features for the latest candle.")
     
     # --- Enhanced Logging for Final Selected Live Features ---
-    print(f"\n--- Final Selected Live Pivot Feature Values (Series sent to model) ---")
+    # The plan requested .to_dict() for logging.
+    log_dict_str = "None or Empty"
     if live_features_series is not None and not live_features_series.empty:
-        for idx, val in live_features_series.items():
-            print(f"  {idx}: {val:.4f}")
-    else:
-        print("  Live features series is None or empty.")
-    print(f"--- End Final Selected Live Pivot Feature Values ---\n")
+        try:
+            log_dict_str = str({k: f"{v:.4f}" if isinstance(v, float) else v for k, v in live_features_series.to_dict().items()})
+        except AttributeError: # If live_features_series is not a Series (e.g. None already)
+            log_dict_str = str(live_features_series)
+
+    print(f"[DEBUG] Final Live Pivot Features Sent to Model ({df.name if hasattr(df, 'name') else 'N/A'} @ {df.index[-1]}): {log_dict_str}")
     # --- End Enhanced Logging ---
 
     return live_features_series
@@ -2455,17 +2489,36 @@ def app_calculate_live_entry_features(df_live: pd.DataFrame, atr_period: int, en
     atr_col_name = f'atr_{atr_period}'
 
     # Ensure ATR column from pivot feature calculation is present or recalculate
-    if atr_col_name not in df.columns or df[atr_col_name].iloc[-1] is None or pd.isna(df[atr_col_name].iloc[-1]):
-        print(f"{log_prefix} ATR column '{atr_col_name}' missing or NaN. Attempting recalculation for entry features.")
+    recalculated_atr_in_entry = False
+    if atr_col_name not in df.columns or df[atr_col_name].isnull().all() or pd.isna(df[atr_col_name].iloc[-1]):
+        print(f"{log_prefix} ATR column '{atr_col_name}' missing, all NaNs, or last value NaN. Attempting recalculation for entry features.")
         df = calculate_atr(df, period=atr_period) # Use app.py's version
-        if atr_col_name not in df.columns or df[atr_col_name].iloc[-1] is None or pd.isna(df[atr_col_name].iloc[-1]):
-            print(f"{log_prefix} Critical: ATR recalculation failed or resulted in NaN. Cannot proceed.")
+        recalculated_atr_in_entry = True
+
+    # --- Full ATR Column Cleaning (applied whether ATR was just recalculated or presumed to exist) ---
+    if atr_col_name in df.columns:
+        df[atr_col_name] = df[atr_col_name].replace(0, 1e-8) # Replace 0 with a very small number
+        df[atr_col_name] = df[atr_col_name].fillna(method='ffill') # Forward fill NaNs
+        df[atr_col_name] = df[atr_col_name].fillna(method='bfill') # Backward fill remaining NaNs
+        if df[atr_col_name].isnull().all():
+            print(f"{log_prefix} CRITICAL: ATR column '{atr_col_name}' is all NaNs even after cleaning (in entry features). Cannot proceed.")
             return None
+        if pd.isna(df[atr_col_name].iloc[-1]):
+             print(f"{log_prefix} CRITICAL: Last ATR value in '{atr_col_name}' is still NaN after cleaning (in entry features). Values: {df[atr_col_name].tail()}")
+             return None
+        if recalculated_atr_in_entry:
+            print(f"{log_prefix} ATR column '{atr_col_name}' was recalculated and cleaned for entry features.")
+    else:
+        print(f"{log_prefix} CRITICAL: ATR column '{atr_col_name}' was not created by calculate_atr (in entry features). Cannot proceed.")
+        return None
+    # --- End Full ATR Column Cleaning ---
 
     current_atr_value = df[atr_col_name].iloc[-1]
-    if current_atr_value == 0:
-        print(f"{log_prefix} Warning: Current ATR for entry features is zero. Using small epsilon.")
-        current_atr_value = 1e-9 # Avoid division by zero
+    # The check for current_atr_value == 0 is now less critical as .replace(0, 1e-8) handles it.
+    # However, keeping it doesn't hurt, or it can be removed. Let's keep for safety.
+    if current_atr_value == 0: # Should ideally not happen if replace(0, 1e-8) worked.
+        print(f"{log_prefix} Warning: Current ATR for entry features is zero even after cleaning. Using small epsilon.")
+        current_atr_value = 1e-8 # Use the same epsilon as replace for consistency
 
     # Add contextual features to the last row of the DataFrame (current candle)
     # These are calculated based on the current event/pivot.
@@ -2485,30 +2538,53 @@ def app_calculate_live_entry_features(df_live: pd.DataFrame, atr_period: int, en
 
     # Call app.py's engineer_entry_features to calculate the base features
     # It takes `entry_features_base_list_arg` which should be `entry_feature_names_base`
-    df_with_base_features, calculated_base_feature_names = engineer_entry_features(
-        df, 
-        atr_col_name=atr_col_name,
-        entry_features_base_list_arg=entry_feature_names_base
-    )
-
-    # The full list of features the entry model expects
-    # (base features + P_swing + normalized distances)
-    full_entry_feature_list = entry_feature_names_base + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']
-    
-    # Ensure all features in full_entry_feature_list are present in df_with_base_features.
-    # engineer_entry_features adds its columns. P_swing, norm_dist_... were added above.
-    missing_cols = [col for col in full_entry_feature_list if col not in df_with_base_features.columns]
-    if missing_cols:
-        print(f"{log_prefix} Error: The following expected entry features are missing from the DataFrame after calculation: {missing_cols}")
-        # This indicates a discrepancy between `entry_feature_names_base` (from params) and what `engineer_entry_features` produced,
-        # or an issue with adding the contextual features.
+    try:
+        df_with_base_features, calculated_base_feature_names = engineer_entry_features(
+            df, 
+            atr_col_name=atr_col_name,
+            entry_features_base_list_arg=entry_feature_names_base # This is entry_feature_names_base_list from params
+        )
+    except RuntimeError as e:
+        print(f"{log_prefix} Error during engineer_entry_features: {e}")
         return None
 
-    # Select the full feature set for the latest candle
-    live_features_series = df_with_base_features.iloc[-1][full_entry_feature_list].copy()
+    if df_with_base_features is None:
+        print(f"{log_prefix} engineer_entry_features returned None. Cannot proceed.")
+        return None
+
+    # The full list of features the entry model expects
+    full_entry_feature_list_expected = entry_feature_names_base + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']
+    
+    # --- Feature Name Validation and Logging for Entry Features ---
+    print(f"[DEBUG] Expected Full Entry Features (constructed from params): {full_entry_feature_list_expected}")
+    print(f"[DEBUG] Actual Base Entry Features (reported by engineer_entry_features): {calculated_base_feature_names}")
+    # Contextual features ('P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl') were added to df_with_base_features earlier in this function.
+    print(f"[DEBUG] DataFrame columns after engineer_entry_features & contextual additions: {df_with_base_features.columns.tolist()}")
+
+    # Check if all expected features are present in the DataFrame columns
+    missing_expected_in_df_entry = [name for name in full_entry_feature_list_expected if name not in df_with_base_features.columns]
+    if missing_expected_in_df_entry:
+        print(f"{log_prefix} CRITICAL WARNING: The following expected full entry features are MISSING from the DataFrame: {missing_expected_in_df_entry}")
+        # This will cause a KeyError below if not handled. For now, let it proceed to the try-except for selection.
+
+    # Check consistency between the base list from params and what engineer_entry_features produced
+    if set(entry_feature_names_base) != set(calculated_base_feature_names):
+        print(f"{log_prefix} INFO: Mismatch between expected base entry features (from params) and base features reported by engineer_entry_features.")
+        print(f"    Params Base List (entry_feature_names_base): {sorted(list(set(entry_feature_names_base)))}")
+        print(f"    Engineered Base List (calculated_base_feature_names): {sorted(list(set(calculated_base_feature_names)))}")
+    # --- End Feature Name Validation ---
+    
+    # Select the full feature set for the latest candle using full_entry_feature_list_expected
+    try:
+        live_features_series = df_with_base_features.iloc[-1][full_entry_feature_list_expected].copy()
+    except KeyError as e:
+        print(f"{log_prefix} CRITICAL ERROR: KeyError when selecting expected entry features from DataFrame. Error: {e}")
+        print(f"    Expected features (full_entry_feature_list_expected): {full_entry_feature_list_expected}")
+        print(f"    Available columns in df_with_base_features: {df_with_base_features.columns.tolist()}")
+        return None
 
     # Replace Inf values
-    live_features_series = live_features_series.replace([np.inf, -np.inf], np.nan) # Addressed FutureWarning
+    live_features_series = live_features_series.replace([np.inf, -np.inf], np.nan)
 
     if live_features_series.isnull().any():
         print(f"{log_prefix} NaN values found in live entry features for the latest candle:")
@@ -2517,6 +2593,18 @@ def app_calculate_live_entry_features(df_live: pd.DataFrame, atr_period: int, en
         print(f"{log_prefix} NaNs filled with -1.")
     
     print(f"{log_prefix} Successfully calculated live entry features.")
+
+    # --- Explicit Logging of Final Feature Vector ---
+    log_entry_dict_str = "None or Empty"
+    if live_features_series is not None and not live_features_series.empty:
+        try:
+            log_entry_dict_str = str({k: f"{v:.4f}" if isinstance(v, float) else v for k, v in live_features_series.to_dict().items()})
+        except AttributeError:
+            log_entry_dict_str = str(live_features_series)
+            
+    print(f"[DEBUG] Final Live Entry Features Sent to Model ({df.name if hasattr(df, 'name') else 'N/A'} @ {df.index[-1]}): {log_entry_dict_str}")
+    # --- End Explicit Logging ---
+
     return live_features_series
 
 # --- Symbol Loading Utilities ---
@@ -2578,58 +2666,94 @@ def app_process_symbol_for_signal(symbol: str, client, current_app_settings: dic
     # Dynamic threshold is the p_swing_threshold from Optuna/best_params.json
     dynamic_pivot_threshold = current_best_hyperparams.get('p_swing_threshold')
     # Fixed threshold is from app_settings.json
-    fixed_pivot_threshold = current_app_settings.get('app_fixed_pivot_threshold', 0.7) # Default if not in settings
+    fixed_pivot_threshold_config = current_app_settings.get('app_fixed_pivot_threshold', 0.7) # Default if not in settings
     use_dynamic_threshold_mode = current_app_settings.get('app_use_dynamic_threshold', True) # Default to dynamic
 
-    p_profit_thresh = current_best_hyperparams.get('profit_threshold') # For entry model
+    p_profit_thresh_config = current_best_hyperparams.get('profit_threshold') # For entry model
 
-    # Validate dynamic_pivot_threshold
-    if dynamic_pivot_threshold is None or not (0.0 < dynamic_pivot_threshold < 1.0):
-        print(f"{log_prefix} WARNING: Dynamic pivot threshold (p_swing_threshold from best_params.json: {dynamic_pivot_threshold}) is missing or invalid.")
-        if use_dynamic_threshold_mode:
-            print(f"{log_prefix} Dynamic mode was enabled but dynamic threshold is invalid. Falling back to fixed threshold: {fixed_pivot_threshold}.")
-            # Fallback to fixed threshold if dynamic was selected but invalid
-            p_swing_thresh_to_use = fixed_pivot_threshold
-            threshold_mode_in_use = f"Fixed (Fallback from invalid Dynamic: {dynamic_pivot_threshold})"
-            # Log the original dynamic threshold for reference if it was just out of range but not None
-            reference_threshold_val = dynamic_pivot_threshold if dynamic_pivot_threshold is not None else "N/A (Missing)"
+    # --- Validate Threshold Values ---
+    valid_dynamic_pivot_thresh = False
+    if dynamic_pivot_threshold is not None and isinstance(dynamic_pivot_threshold, (float, int)) and 0.0 < dynamic_pivot_threshold < 1.0:
+        valid_dynamic_pivot_thresh = True
+    else:
+        print(f"{log_prefix} ERROR: Invalid dynamic_pivot_threshold from best_params.json: {dynamic_pivot_threshold}. Must be float between 0 and 1 (exclusive).")
+
+    valid_fixed_pivot_thresh = False
+    if isinstance(fixed_pivot_threshold_config, (float, int)) and 0.0 < fixed_pivot_threshold_config < 1.0:
+        valid_fixed_pivot_thresh = True
+    else:
+        print(f"{log_prefix} ERROR: Invalid app_fixed_pivot_threshold from app_settings.json: {fixed_pivot_threshold_config}. Must be float between 0 and 1 (exclusive).")
+        # If fixed is invalid, and dynamic is chosen or also invalid, this could be an issue.
+        # For now, we'll rely on the fallback logic below but this error highlights a config problem.
+
+    valid_profit_thresh = False
+    if p_profit_thresh_config is not None and isinstance(p_profit_thresh_config, (float, int)) and 0.0 < p_profit_thresh_config < 1.0:
+        valid_profit_thresh = True
+    else:
+        print(f"{log_prefix} ERROR: Invalid profit_threshold from best_params.json: {p_profit_thresh_config}. Must be float between 0 and 1 (exclusive).")
+        # If this is invalid, entry model filtering will be problematic.
+        # Consider returning or using a safe default if invalid. For now, just log.
+        if p_profit_thresh_config is None: # If completely missing, it's a critical issue for entry model.
+            print(f"{log_prefix} CRITICAL: profit_threshold is MISSING from best_hyperparams. Entry model cannot function correctly. Skipping symbol.")
+            return
+
+
+    # --- Determine p_swing_thresh_to_use ---
+    if use_dynamic_threshold_mode:
+        if valid_dynamic_pivot_thresh:
+            p_swing_thresh_to_use = dynamic_pivot_threshold
+            threshold_mode_in_use = "Dynamic"
+            reference_threshold_val = fixed_pivot_threshold_config if valid_fixed_pivot_thresh else "N/A (Invalid Fixed)"
+            reference_threshold_type = "Fixed"
+        else: # Dynamic mode selected, but dynamic threshold is invalid. Fallback to fixed.
+            print(f"{log_prefix} WARNING: Dynamic mode selected, but dynamic_pivot_threshold is invalid. Falling back to fixed threshold.")
+            if valid_fixed_pivot_thresh:
+                p_swing_thresh_to_use = fixed_pivot_threshold_config
+                threshold_mode_in_use = f"Fixed (Fallback from invalid Dynamic: {dynamic_pivot_threshold})"
+            else: # Both dynamic and fixed are invalid! This is a critical config error.
+                print(f"{log_prefix} CRITICAL ERROR: Both dynamic and fixed pivot thresholds are invalid. Cannot determine a valid p_swing_thresh_to_use. Skipping symbol.")
+                return
+            reference_threshold_val = dynamic_pivot_threshold # Keep for logging the invalid dynamic value
             reference_threshold_type = "Dynamic (Invalid)"
-        else: # Fixed mode was already selected, dynamic threshold invalidity is just for logging comparison
-            p_swing_thresh_to_use = fixed_pivot_threshold
+    else: # Using fixed threshold mode
+        if valid_fixed_pivot_thresh:
+            p_swing_thresh_to_use = fixed_pivot_threshold_config
             threshold_mode_in_use = "Fixed"
-            reference_threshold_val = dynamic_pivot_threshold if dynamic_pivot_threshold is not None else "N/A (Missing)"
-            reference_threshold_type = "Dynamic (Invalid)"
-    elif use_dynamic_threshold_mode:
-        p_swing_thresh_to_use = dynamic_pivot_threshold
-        threshold_mode_in_use = "Dynamic"
-        reference_threshold_val = fixed_pivot_threshold
-        reference_threshold_type = "Fixed"
-    else: # Using fixed threshold mode, and dynamic_pivot_threshold is valid (for comparison logging)
-        p_swing_thresh_to_use = fixed_pivot_threshold
-        threshold_mode_in_use = "Fixed"
-        reference_threshold_val = dynamic_pivot_threshold
+        else: # Fixed mode selected, but fixed threshold is invalid. This is a critical config error.
+            print(f"{log_prefix} CRITICAL ERROR: Fixed threshold mode selected, but app_fixed_pivot_threshold is invalid ({fixed_pivot_threshold_config}). Cannot determine p_swing_thresh_to_use. Skipping symbol.")
+            return
+        reference_threshold_val = dynamic_pivot_threshold if valid_dynamic_pivot_thresh else "N/A (Invalid Dynamic)"
         reference_threshold_type = "Dynamic"
+    
+    # Re-assign p_profit_thresh for clarity, though it's already from config
+    p_profit_thresh = p_profit_thresh_config
+    if not valid_profit_thresh:
+        # If p_profit_thresh was invalid, the earlier error log would have shown.
+        # The logic later will use this potentially invalid value.
+        # A stricter approach would be to return here if !valid_profit_thresh.
+        print(f"{log_prefix} WARNING: Continuing with potentially invalid p_profit_thresh ({p_profit_thresh}). Entry model results may be unreliable.")
+
 
     print(f"{log_prefix} Pivot Threshold Selection: Mode Active='{threshold_mode_in_use}', Threshold Value Used={p_swing_thresh_to_use:.3f}")
     print(f"{log_prefix}   Reference Threshold: Type='{reference_threshold_type}', Value={reference_threshold_val if isinstance(reference_threshold_val, str) else f'{reference_threshold_val:.3f}'}")
+    print(f"{log_prefix} Entry Profit Threshold (from best_params): {p_profit_thresh if valid_profit_thresh else f'INVALID ({p_profit_thresh_config})'}")
 
-    # Check for None or empty for list parameters
+
+    # Check for None or empty for list parameters (essential model inputs)
     missing_params = False
     if atr_period_for_features is None:
-        print(f"{log_prefix} Missing: model_training_atr_period_used")
+        print(f"{log_prefix} CRITICAL Missing Param: model_training_atr_period_used")
         missing_params = True
-    if pivot_feature_names_list is None or not pivot_feature_names_list: # Check for None or empty list
-        print(f"{log_prefix} Missing or empty: pivot_feature_names_used")
+    if pivot_feature_names_list is None or not pivot_feature_names_list:
+        print(f"{log_prefix} CRITICAL Missing Param or Empty: pivot_feature_names_used")
         missing_params = True
-    if entry_feature_names_base_list is None or not entry_feature_names_base_list: # Check for None or empty list
-        print(f"{log_prefix} Missing or empty: entry_feature_names_base_used")
+    if entry_feature_names_base_list is None or not entry_feature_names_base_list:
+        print(f"{log_prefix} CRITICAL Missing Param or Empty: entry_feature_names_base_used")
         missing_params = True
-    if p_profit_thresh is None:
-        print(f"{log_prefix} Missing: profit_threshold (for entry model)")
-        missing_params = True
+    # p_profit_thresh missing is handled by the valid_profit_thresh check / critical log above.
     
     if missing_params:
-        print(f"{log_prefix} Critical parameters missing or empty from best_hyperparams or app_settings. Skipping.")
+        print(f"{log_prefix} Critical parameters for feature engineering or model structure are missing. Skipping symbol.")
         return
 
     # --- Data Fetching ---
@@ -2706,9 +2830,9 @@ def app_process_symbol_for_signal(symbol: str, client, current_app_settings: dic
         if p_swing_score_live >= dynamic_pivot_threshold and predicted_pivot_class_live != 0:
             would_trade_dynamic = True
     
-    # Fixed perspective (fixed_pivot_threshold is validated during load_app_settings)
+    # Fixed perspective (fixed_pivot_threshold_config is validated during load_app_settings)
     would_trade_fixed = False
-    if p_swing_score_live >= fixed_pivot_threshold and predicted_pivot_class_live != 0:
+    if valid_fixed_pivot_thresh and p_swing_score_live >= fixed_pivot_threshold_config and predicted_pivot_class_live != 0:
         would_trade_fixed = True
 
     pivot_decision_log_message += f"Trade Signal (Dynamic: {'YES' if would_trade_dynamic else 'NO'}, Fixed: {'YES' if would_trade_fixed else 'NO'})."
@@ -4339,11 +4463,9 @@ def engineer_pivot_features(df, atr_col_name, force_live_bars_since_pivot_calc: 
     # The caller is responsible for ensuring df contains the correct atr_col_name.
     # This function will use the provided atr_col_name.
     if atr_col_name not in df.columns:
-        print(f"Error (engineer_pivot_features): Required ATR column '{atr_col_name}' not found. Feature engineering may be incomplete or fail.")
-        # As a fallback, create a dummy ATR column with NaNs if not present, so code doesn't break, but features will be NaN.
-        # This is not ideal; caller should provide it.
-        df[atr_col_name] = np.nan 
-        # A better fallback might be to calculate it using a default period if an atr_period param was also passed.
+        raise RuntimeError(f"ATR column '{atr_col_name}' missing in engineer_pivot_features – aborting feature calculation. DataFrame columns: {df.columns.tolist()}")
+    if df[atr_col_name].isnull().all(): # Check if all values are NaN even if column exists
+        raise RuntimeError(f"ATR column '{atr_col_name}' contains all NaN values in engineer_pivot_features – aborting feature calculation.")
 
     # Volatility & Range
     # df['range_atr_norm'] = (df['high'] - df['low']) / df[atr_col_name]
@@ -4509,8 +4631,9 @@ def engineer_entry_features(df, atr_col_name, entry_features_base_list_arg=None)
     """
     # The caller is responsible for ensuring df contains the correct atr_col_name.
     if atr_col_name not in df.columns:
-        print(f"Error (engineer_entry_features): Required ATR column '{atr_col_name}' not found. Feature engineering may be incomplete or fail.")
-        df[atr_col_name] = np.nan # Fallback dummy column
+        raise RuntimeError(f"ATR column '{atr_col_name}' missing in engineer_entry_features – aborting feature calculation. DataFrame columns: {df.columns.tolist()}")
+    if df[atr_col_name].isnull().all(): # Check if all values are NaN even if column exists
+        raise RuntimeError(f"ATR column '{atr_col_name}' contains all NaN values in engineer_entry_features – aborting feature calculation.")
 
     # Features will be calculated at the time of the pivot.
     # `norm_dist_entry_pivot` and `norm_dist_entry_sl` are calculated *outside* this function,
