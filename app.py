@@ -3061,7 +3061,7 @@ def start_app_main_flow():
                     'ema20_ema50_norm_atr',
                     'return_entry_1b', 'return_entry_3b', 'return_entry_5b',
                     f'{atr_col_name_tuned}_change', # Uses tuned ATR column name
-                    'hour_of_day', 'day_of_week', 'vol_regime'
+                    'hour_of_day', 'day_of_week' # Removed 'vol_regime'
                 ]
                 # Note: 'P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl' are added later to form full entry features.
 
@@ -3112,32 +3112,47 @@ def start_app_main_flow():
 
             p_swing_train = temp_pivot_model.predict_proba(X_p_train)
             df_final_train['P_swing'] = np.max(p_swing_train[:,1:], axis=1)
-            entry_candidates = df_final_train[(df_final_train['pivot_label'].isin([1,2])) & (df_final_train['trade_outcome']!=-1) & (df_final_train['P_swing'] >= best_hyperparams['p_swing_threshold'])].copy()
             
-            if len(entry_candidates) >= 20: # Min candidates for entry model
-                atr_col_final = f"atr_{best_hyperparams.get('atr_period_opt', ATR_PERIOD)}" # ATR period from Optuna
+            # Filter for entry candidates
+            p_swing_thresh_for_entry_candidates = best_hyperparams.get('p_swing_threshold', 0.5) # Default if not in params
+            entry_candidates_condition = (
+                (df_final_train['pivot_label'].isin([1,2])) &
+                (df_final_train['trade_outcome'] != -1) &
+                (df_final_train['P_swing'] >= p_swing_thresh_for_entry_candidates)
+            )
+            entry_candidates = df_final_train[entry_candidates_condition].copy()
+            
+            MIN_ENTRY_CANDIDATES = 10 # Reduced from 20
+            
+            if len(entry_candidates) >= MIN_ENTRY_CANDIDATES:
+                print(f"{log_prefix} Sufficient entry candidates ({len(entry_candidates)}) found with P_swing >= {p_swing_thresh_for_entry_candidates:.2f}. Proceeding with entry model training.")
+                atr_col_final = f"atr_{best_hyperparams.get('atr_period_opt', ATR_PERIOD)}"
                 entry_candidates['norm_dist_entry_pivot'] = (entry_candidates['entry_price_sim'] - entry_candidates.apply(lambda r: r['low'] if r['is_swing_low'] == 1 else r['high'], axis=1)) / entry_candidates[atr_col_final]
                 entry_candidates['norm_dist_entry_sl'] = (entry_candidates['entry_price_sim'] - entry_candidates['sl_price_sim']).abs() / entry_candidates[atr_col_final]
                 
-                full_entry_feats = final_entry_base_feats_to_use + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl'] # Use names from params
+                full_entry_feats = final_entry_base_feats_to_use + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']
                 X_e_train = entry_candidates[full_entry_feats].fillna(-1)
-                y_e_train = (entry_candidates['trade_outcome'] > 0).astype(int) # Ensure y_e_train is binary
+                y_e_train = (entry_candidates['trade_outcome'] > 0).astype(int)
                 
                 if len(X_e_train) > 0 and len(y_e_train.unique()) > 1:
-                    # Define valid keys for train_entry_model based on its intended use with LGBM/RF
-                    valid_entry_model_arg_names = ['model_type', 'num_leaves', 'learning_rate', 'max_depth', 'n_estimators'] # Add more if Optuna tunes them
+                    valid_entry_model_arg_names = ['model_type', 'num_leaves', 'learning_rate', 'max_depth', 'n_estimators']
                     raw_entry_args = {k.replace('entry_', ''):v for k,v in best_hyperparams.items() if k.startswith('entry_')}
                     entry_model_args = {k: v for k, v in raw_entry_args.items() if k in valid_entry_model_arg_names}
                     
-                    print(f"DEBUG: Args passed to train_entry_model: {entry_model_args}") # Log the actual args
+                    print(f"DEBUG: Args passed to train_entry_model: {entry_model_args}")
                     temp_entry_model, _ = train_entry_model(X_e_train, y_e_train, X_e_train, y_e_train, **entry_model_args)
                     save_model(temp_entry_model, entry_model_path)
                     universal_entry_model = temp_entry_model
-                else: print("Entry model training skipped (insufficient data/variance).")
-            else: print("Entry model training skipped (not enough candidates after pivot filter).")
+                    print(f"{log_prefix} Entry model trained and saved.")
+                else:
+                    print(f"{log_prefix} Entry model training SKIPPED: Insufficient data diversity for training. X_e_train length: {len(X_e_train)}, y_e_train unique values: {y_e_train.unique() if len(X_e_train) > 0 else 'N/A'}.")
+                    universal_entry_model = None # Ensure it's None if skipped
+            else:
+                print(f"{log_prefix} Entry model training SKIPPED: Not enough candidates ({len(entry_candidates)}) after pivot filter (P_swing >= {p_swing_thresh_for_entry_candidates:.2f}). Minimum required: {MIN_ENTRY_CANDIDATES}.")
+                universal_entry_model = None # Ensure it's None if skipped
             
             print("ML Model training process complete.")
-            models_exist = True # Update status
+            models_exist = True
 
             # Generate and display backtest summary after training
             print("DEBUG: Preparing data for training summary backtest...")
@@ -3850,10 +3865,12 @@ def engineer_entry_features(df, atr_col_name, entry_features_base_list_arg=None)
             'ema20_ema50_norm_atr',
             'return_entry_1b', 'return_entry_3b', 'return_entry_5b',
             f'{atr_col_name}_change', # Dynamic ATR column name
-            'hour_of_day', 'day_of_week', 'vol_regime'
+            'hour_of_day', 'day_of_week' # Removed 'vol_regime'
         ]
     else:
         _entry_feature_cols_base = entry_features_base_list_arg
+        if 'vol_regime' in _entry_feature_cols_base: # Ensure it's removed if passed in
+            _entry_feature_cols_base.remove('vol_regime')
 
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     return df, _entry_feature_cols_base
@@ -3966,7 +3983,7 @@ def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot
     entry_learning_rate = trial.suggest_float('entry_learning_rate', 0.01, 0.1) if entry_model_type == 'lgbm' else None
     entry_max_depth = trial.suggest_int('entry_max_depth', 5, 10)
     # Thresholds
-    p_swing_threshold = trial.suggest_float('p_swing_threshold', 0.3, 0.9) # Lowered min
+    p_swing_threshold = trial.suggest_float('p_swing_threshold', 0.2, 0.9) # Lowered min further
     profit_threshold = trial.suggest_float('profit_threshold', 0.2, 0.9) # Lowered min (used as Expected R threshold)
 
     # --- Strategy/Data Processing Parameters to Tune ---
@@ -4584,6 +4601,7 @@ def run_backtest_scenario(scenario_name: str, df_processed: pd.DataFrame,
 
         for idx, trade_row in temp_final_trades.iterrows():
             details = {
+                "scenario": scenario_name, # Added scenario name
                 "trade_id": idx, # Using DataFrame index as trade_id for this backtest
                 "timestamp_pivot": trade_row.name if isinstance(trade_row.name, pd.Timestamp) else pd.NaT, # Pivot timestamp
                 "symbol": trade_row.get('symbol', 'N/A'), # If 'symbol' column was carried
@@ -4735,17 +4753,16 @@ def generate_training_backtest_summary(df_processed_full_dataset, # This is the 
 
     # --- Collect Feature Importances ---
     feature_importances_data = {}
-    if pivot_model and hasattr(pivot_model, 'feature_importances_'):
+    if pivot_model and hasattr(pivot_model, 'feature_importances_') and pivot_feature_names_list:
         feature_importances_data['pivot_model'] = pd.DataFrame({
-            'feature': pivot_feature_names_list, # These are the features model was trained on
+            'feature': pivot_feature_names_list,
             'importance': pivot_model.feature_importances_
         }).sort_values(by='importance', ascending=False)
+    else:
+        print(f"{log_prefix_summary} Pivot model importances not available or feature names missing. Creating empty DataFrame for pivot_model.")
+        feature_importances_data['pivot_model'] = pd.DataFrame(columns=['feature', 'importance'])
 
-    if entry_model and hasattr(entry_model, 'feature_importances_'):
-        # Construct the full list of features the entry model was trained on
-        # entry_features_base_list + P_swing + norm_dist_entry_pivot + norm_dist_entry_sl
-        # This list needs to be consistent with how X_e_train was created in start_app_main_flow
-        # Assuming 'P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl' are standard additions
+    if entry_model and hasattr(entry_model, 'feature_importances_') and entry_feature_names_base_list:
         full_entry_feature_names = entry_feature_names_base_list + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']
         if len(full_entry_feature_names) == len(entry_model.feature_importances_):
             feature_importances_data['entry_model'] = pd.DataFrame({
@@ -4753,8 +4770,12 @@ def generate_training_backtest_summary(df_processed_full_dataset, # This is the 
                 'importance': entry_model.feature_importances_
             }).sort_values(by='importance', ascending=False)
         else:
-            print(f"{log_prefix_summary} WARNING: Mismatch in length of entry feature names and importances. Skipping entry model importances.")
-            print(f"  Expected {len(full_entry_feature_names)} features, got {len(entry_model.feature_importances_)} importances.")
+            print(f"{log_prefix_summary} WARNING: Mismatch in length of entry feature names and importances. Creating empty DataFrame for entry_model.")
+            print(f"  Expected {len(full_entry_feature_names)} features (Features: {full_entry_feature_names}), got {len(entry_model.feature_importances_)} importances (Importances: {entry_model.feature_importances_}).")
+            feature_importances_data['entry_model'] = pd.DataFrame(columns=['feature', 'importance'])
+    else:
+        print(f"{log_prefix_summary} Entry model importances not available or base feature names missing. Creating empty DataFrame for entry_model.")
+        feature_importances_data['entry_model'] = pd.DataFrame(columns=['feature', 'importance'])
 
     # --- Optuna Best Parameters ---
     # best_params_from_optuna is already passed in.
@@ -4767,43 +4788,107 @@ def generate_training_backtest_summary(df_processed_full_dataset, # This is the 
     # The more detailed DataFrames (per-trade, feature importances) will be saved to separate CSVs.
     
     main_summary_metrics_list = [res['summary_metrics'] for res in all_scenario_results if 'summary_metrics' in res]
+    main_summary_df = pd.DataFrame(main_summary_metrics_list) if main_summary_metrics_list else pd.DataFrame()
     
-    output_filename_base = "training_summary_output" # Base for multiple files
+    # --- Prepare consolidated data structures ---
+    # 1. Consolidated Trade Details
+    all_trades_list = []
+    if all_scenario_results:
+        for res in all_scenario_results:
+            if res.get("per_trade_details") is not None and not res["per_trade_details"].empty:
+                # Scenario name is already added in run_backtest_scenario
+                all_trades_list.append(res["per_trade_details"])
+    all_trades_df = pd.concat(all_trades_list, ignore_index=True) if all_trades_list else pd.DataFrame()
 
+    # 2. Consolidated Equity Curves
+    all_equity_curves_data_list = []
+    if all_scenario_results:
+        for res in all_scenario_results:
+            scenario_name = res.get("summary_metrics", {}).get("scenario", "unknown_scenario")
+            equity_curve_r = res.get("equity_curve_r")
+            if equity_curve_r is not None: # Will be a list
+                for i, r_val in enumerate(equity_curve_r):
+                    all_equity_curves_data_list.append({
+                        "scenario": scenario_name,
+                        "trade_num": i,
+                        "cumulative_r": r_val
+                    })
+    all_equity_curves_df = pd.DataFrame(all_equity_curves_data_list) if all_equity_curves_data_list else pd.DataFrame()
+
+    # 3. Consolidated Segmented Performance
+    all_segmented_performance_data_list = []
+    if all_scenario_results:
+        for res in all_scenario_results:
+            scenario_name = res.get("summary_metrics", {}).get("scenario", "unknown_scenario")
+            segmented_perf = res.get("segmented_performance", {})
+            if segmented_perf: # Ensure it's not empty
+                for segment_name, metrics_dict in segmented_perf.items():
+                    for metric_key, metric_value in metrics_dict.items():
+                        all_segmented_performance_data_list.append({
+                            "scenario": scenario_name,
+                            "segment": segment_name,
+                            "metric_name": metric_key,
+                            "metric_value": metric_value
+                        })
+    all_segmented_performance_df = pd.DataFrame(all_segmented_performance_data_list) if all_segmented_performance_data_list else pd.DataFrame()
+    
+    # 4. Consolidated Score Distributions
+    all_score_distributions_data_list = []
+    if all_scenario_results:
+        for res in all_scenario_results:
+            scenario_name = res.get("summary_metrics", {}).get("scenario", "unknown_scenario")
+            score_dist = res.get("score_distributions", {})
+            if score_dist: # Ensure it's not empty
+                for score_type, stats_dict in score_dist.items():
+                    if isinstance(stats_dict, dict): 
+                        for stat_name, stat_value in stats_dict.items():
+                            all_score_distributions_data_list.append({
+                                "scenario": scenario_name,
+                                "score_type": score_type,
+                                "stat_name": stat_name,
+                                "stat_value": stat_value
+                            })
+    all_score_distributions_df = pd.DataFrame(all_score_distributions_data_list) if all_score_distributions_data_list else pd.DataFrame()
+
+    output_filename_base = "training_summary_output" 
+
+    # Pass the new consolidated DataFrames to display_summary_table
     display_summary_table(
-        main_summary_metrics_list, 
-        log_prefix_summary, 
-        save_to_csv_path=f"{output_filename_base}_overview.csv",
-        # Pass other data components to be saved separately by display_summary_table
-        all_results_data=all_scenario_results, # Contains everything
-        feature_importances=feature_importances_data,
-        optuna_params=best_params_from_optuna,
-        output_base_filename_for_details=output_filename_base
+        main_summary_df=main_summary_df, 
+        all_trades_df=all_trades_df,
+        all_equity_curves_df=all_equity_curves_df,
+        all_segmented_performance_df=all_segmented_performance_df,
+        all_score_distributions_df=all_score_distributions_df,
+        feature_importances_dict=feature_importances_data, # Renamed for clarity
+        optuna_params_dict=best_params_from_optuna,      # Renamed for clarity
+        log_prefix=log_prefix_summary,
+        output_base_filename=output_filename_base # Renamed for clarity
     )
     print(f"{log_prefix_summary} --- Training Backtest Summary Generation Complete ---")
 
-def display_summary_table(main_summary_list: list[dict], 
+def display_summary_table(main_summary_df: pd.DataFrame, 
+                          all_trades_df: pd.DataFrame,
+                          all_equity_curves_df: pd.DataFrame,
+                          all_segmented_performance_df: pd.DataFrame,
+                          all_score_distributions_df: pd.DataFrame,
+                          feature_importances_dict: dict,
+                          optuna_params_dict: dict,
                           log_prefix: str = "[SummaryTable]", 
-                          save_to_csv_path: str = None,
-                          all_results_data: list[dict] = None, # List of full dicts from run_backtest_scenario
-                          feature_importances: dict = None,   # Dict of DataFrames
-                          optuna_params: dict = None,         # Dict
-                          output_base_filename_for_details: str = "training_summary"):
+                          output_base_filename: str = "training_summary"):
     """
     Displays the main summary table and saves all detailed components to separate CSV files.
     """
-    if not main_summary_list:
+    if main_summary_df.empty:
         print(f"{log_prefix} No main summary results to display.")
-        return
+        # Still proceed to save other components if they exist
+        # return # Original: returned here. Now, continue to save other parts.
 
-    df_main_summary = pd.DataFrame(main_summary_list)
+    # df_main_summary = pd.DataFrame(main_summary_list) # Already a DataFrame
     
     columns_ordered = ['scenario', 'trades', 'win_rate', 'avg_r', 'profit_factor', 'max_dd_r', 'trade_frequency']
-    # 'symbol_context' was part of the dict but might not be needed if it's always "UniversalTestSet"
-    # If it varies, it can be added back. For now, focusing on scenario comparison.
     
-    display_columns = [col for col in columns_ordered if col in df_main_summary.columns]
-    df_display = df_main_summary[display_columns].copy()
+    display_columns = [col for col in columns_ordered if col in main_summary_df.columns]
+    df_display = main_summary_df[display_columns].copy() if not main_summary_df.empty else pd.DataFrame(columns=columns_ordered)
 
     # Apply formatting for console display
     formatters = {
@@ -4812,103 +4897,123 @@ def display_summary_table(main_summary_list: list[dict],
         'profit_factor': lambda x: f"{x:.2f}" if pd.notnull(x) else "N/A",
         'max_dd_r': lambda x: f"{x:.2f}R" if pd.notnull(x) else "N/A",
         'trade_frequency': lambda x: f"{x:.2f}" if pd.notnull(x) else "N/A",
-        'trades': lambda x: f"{int(x)}" if pd.notnull(x) else "N/A"
+        'trades': lambda x: f"{int(x)}" if pd.notnull(x) and x != '' else "N/A"
     }
-    for col, func in formatters.items():
-        if col in df_display:
-            df_display[col] = df_display[col].map(func)
+    if not df_display.empty:
+        for col, func in formatters.items():
+            if col in df_display:
+                df_display[col] = df_display[col].map(func)
 
     print(f"\n{log_prefix} === Main Backtest Summary Overview ===")
     table_string = df_display.to_string(index=False)
     print(table_string)
     print(f"{log_prefix} =====================================\n")
 
-    # Save main summary overview
-    if save_to_csv_path:
-        try:
-            df_main_summary.to_csv(save_to_csv_path, index=False) # Save raw numbers
-            print(f"{log_prefix} Main summary overview saved to {save_to_csv_path}")
-        except Exception as e:
-            print(f"{log_prefix} Error saving main summary overview to CSV '{save_to_csv_path}': {e}")
+    # --- Save Consolidated Files ---
 
-    # --- Save Detailed Components ---
-    if all_results_data:
-        for scenario_result in all_results_data:
-            scenario_name_safe = scenario_result.get("summary_metrics",{}).get("scenario","unknown_scenario").replace(" ", "_").lower()
-            
-            # Per-trade details
-            per_trade_df = scenario_result.get("per_trade_details")
-            if per_trade_df is not None and not per_trade_df.empty:
-                trade_details_path = f"{output_base_filename_for_details}_{scenario_name_safe}_per_trade.csv"
-                try:
-                    per_trade_df.to_csv(trade_details_path, index=False)
-                    print(f"{log_prefix} Per-trade details for '{scenario_name_safe}' saved to {trade_details_path}")
-                except Exception as e:
-                    print(f"{log_prefix} Error saving per-trade details for '{scenario_name_safe}': {e}")
-            
-            # Score distributions (example: save P_swing_trades_taken if exists)
-            # This part can be expanded to save all score distribution DataFrames/Series
-            score_dist = scenario_result.get("score_distributions", {})
-            if score_dist:
-                 scores_path = f"{output_base_filename_for_details}_{scenario_name_safe}_score_distributions.json"
-                 try:
-                     # Convert describe() outputs (which might be Series) to dict for JSON
-                     json_compatible_scores = {}
-                     for key, val in score_dist.items():
-                         if isinstance(val, dict): # Already a dict (from describe().to_dict())
-                             json_compatible_scores[key] = val
-                         elif hasattr(val, 'to_dict'): # Pandas Series
-                             json_compatible_scores[key] = val.to_dict()
-                         else:
-                             json_compatible_scores[key] = str(val) # Fallback
-                     with open(scores_path, 'w') as f:
-                         json.dump(json_compatible_scores, f, indent=4)
-                     print(f"{log_prefix} Score distributions for '{scenario_name_safe}' saved to {scores_path}")
-                 except Exception as e:
-                     print(f"{log_prefix} Error saving score distributions for '{scenario_name_safe}': {e}")
+    # File 1: Overview (already have main_summary_df)
+    overview_path = f"{output_base_filename}_overview.csv"
+    try:
+        if not main_summary_df.empty:
+            main_summary_df.to_csv(overview_path, index=False)
+            print(f"{log_prefix} Main summary overview saved to {overview_path}")
+        else:
+            print(f"{log_prefix} Main summary overview DataFrame is empty. Skipping save for {overview_path}.")
+    except Exception as e:
+        print(f"{log_prefix} Error saving main summary overview to CSV '{overview_path}': {e}")
 
-            # Equity curve data
-            equity_curve = scenario_result.get("equity_curve_r")
-            if equity_curve:
-                equity_path = f"{output_base_filename_for_details}_{scenario_name_safe}_equity_curve_r.csv"
-                try:
-                    pd.DataFrame(equity_curve, columns=['cumulative_r']).to_csv(equity_path, index_label="trade_num")
-                    print(f"{log_prefix} Equity curve data for '{scenario_name_safe}' saved to {equity_path}")
-                except Exception as e:
-                    print(f"{log_prefix} Error saving equity curve for '{scenario_name_safe}': {e}")
-            
-            # Segmented performance
-            segmented_perf = scenario_result.get("segmented_performance")
-            if segmented_perf:
-                segmented_path = f"{output_base_filename_for_details}_{scenario_name_safe}_segmented_performance.json"
-                try:
-                    with open(segmented_path, 'w') as f:
-                        json.dump(segmented_perf, f, indent=4)
-                    print(f"{log_prefix} Segmented performance for '{scenario_name_safe}' saved to {segmented_path}")
-                except Exception as e:
-                    print(f"{log_prefix} Error saving segmented performance for '{scenario_name_safe}': {e}")
+    # File 2: Trade Details Log
+    trade_details_log_path = f"{output_base_filename}_trade_details_log.csv"
+    try:
+        if not all_trades_df.empty:
+            all_trades_df.to_csv(trade_details_log_path, index=False)
+            print(f"{log_prefix} Consolidated trade details log saved to {trade_details_log_path}")
+        else:
+            print(f"{log_prefix} Consolidated trade details DataFrame is empty. Skipping save for {trade_details_log_path}.")
+    except Exception as e:
+        print(f"{log_prefix} Error saving consolidated trade details to CSV '{trade_details_log_path}': {e}")
 
-
-    # Feature Importances
-    if feature_importances:
-        for model_name, importance_df in feature_importances.items():
+    # File 3: Model Configs and Importances
+    model_configs_importances_list = []
+    # Optuna parameters
+    if optuna_params_dict:
+        for key, value in optuna_params_dict.items():
+            model_configs_importances_list.append({
+                "record_type": "optuna_parameter",
+                "parameter_name": key,
+                "parameter_value": value,
+                "model_context": "global",
+                "feature_name": None,
+                "importance_value": None
+            })
+    # Feature importances
+    if feature_importances_dict:
+        for model_name, importance_df in feature_importances_dict.items():
             if isinstance(importance_df, pd.DataFrame) and not importance_df.empty:
-                fi_path = f"{output_base_filename_for_details}_{model_name}_feature_importances.csv"
-                try:
-                    importance_df.to_csv(fi_path, index=False)
-                    print(f"{log_prefix} Feature importances for '{model_name}' saved to {fi_path}")
-                except Exception as e:
-                    print(f"{log_prefix} Error saving feature importances for '{model_name}': {e}")
+                for _, row in importance_df.iterrows():
+                    model_configs_importances_list.append({
+                        "record_type": "feature_importance",
+                        "parameter_name": None,
+                        "parameter_value": None,
+                        "model_context": model_name,
+                        "feature_name": row.get('feature'),
+                        "importance_value": row.get('importance')
+                    })
+            elif isinstance(importance_df, pd.DataFrame) and importance_df.empty:
+                 model_configs_importances_list.append({
+                        "record_type": "feature_importance", "parameter_name": None, "parameter_value": None,
+                        "model_context": model_name, "feature_name": "N/A (Empty Importances)", "importance_value": None
+                    })
 
-    # Optuna Parameters
-    if optuna_params:
-        optuna_path = f"{output_base_filename_for_details}_optuna_best_params.json"
-        try:
-            with open(optuna_path, 'w') as f:
-                json.dump(optuna_params, f, indent=4)
-            print(f"{log_prefix} Optuna best parameters saved to {optuna_path}")
-        except Exception as e:
-            print(f"{log_prefix} Error saving Optuna parameters: {e}")
+
+    model_configs_importances_df = pd.DataFrame(model_configs_importances_list)
+    model_configs_path = f"{output_base_filename}_model_configs_importances.csv"
+    try:
+        if not model_configs_importances_df.empty:
+            model_configs_importances_df.to_csv(model_configs_path, index=False)
+            print(f"{log_prefix} Model configs and importances saved to {model_configs_path}")
+        else:
+            print(f"{log_prefix} Model configs and importances DataFrame is empty. Skipping save for {model_configs_path}.")
+    except Exception as e:
+        print(f"{log_prefix} Error saving model configs and importances to CSV '{model_configs_path}': {e}")
+
+    # File 4: Performance Analytics (Equity Curves, Segmented Perf, Score Dists)
+    performance_analytics_list = []
+    # Equity curves
+    if not all_equity_curves_df.empty:
+        for _, row in all_equity_curves_df.iterrows():
+            performance_analytics_list.append({
+                "record_type": "equity_curve", "scenario": row["scenario"], "trade_num": row["trade_num"], 
+                "value1_name": "cumulative_r", "value1": row["cumulative_r"],
+                "value2_name": None, "value2": None, "category1": None, "category2": None
+            })
+    # Segmented performance
+    if not all_segmented_performance_df.empty:
+        for _, row in all_segmented_performance_df.iterrows():
+            performance_analytics_list.append({
+                "record_type": "segmented_performance", "scenario": row["scenario"], "trade_num": None,
+                "value1_name": row["metric_name"], "value1": row["metric_value"],
+                "value2_name": None, "value2": None, "category1": "segment", "category2": row["segment"]
+            })
+    # Score distributions
+    if not all_score_distributions_df.empty:
+        for _, row in all_score_distributions_df.iterrows():
+            performance_analytics_list.append({
+                "record_type": "score_distribution", "scenario": row["scenario"], "trade_num": None,
+                "value1_name": row["stat_name"], "value1": row["stat_value"],
+                "value2_name": None, "value2": None, "category1": "score_type", "category2": row["score_type"]
+            })
+            
+    performance_analytics_df = pd.DataFrame(performance_analytics_list)
+    perf_analytics_path = f"{output_base_filename}_performance_analytics.csv"
+    try:
+        if not performance_analytics_df.empty:
+            performance_analytics_df.to_csv(perf_analytics_path, index=False)
+            print(f"{log_prefix} Performance analytics saved to {perf_analytics_path}")
+        else:
+            print(f"{log_prefix} Performance analytics DataFrame is empty. Skipping save for {perf_analytics_path}.")
+    except Exception as e:
+        print(f"{log_prefix} Error saving performance analytics to CSV '{perf_analytics_path}': {e}")
 
 
 # --- Main Orchestration ---
