@@ -3106,7 +3106,7 @@ def start_app_main_flow():
             pivot_model_args = {k: v for k, v in raw_pivot_args.items() if k in valid_pivot_model_arg_names}
             
             print(f"DEBUG: Args passed to train_pivot_model: {pivot_model_args}") # Log the actual args
-            temp_pivot_model = train_pivot_model(X_p_train, y_p_train, X_p_train, y_p_train, **pivot_model_args)
+            temp_pivot_model, _ = train_pivot_model(X_p_train, y_p_train, X_p_train, y_p_train, **pivot_model_args)
             save_model(temp_pivot_model, pivot_model_path)
             universal_pivot_model = temp_pivot_model
 
@@ -3121,7 +3121,7 @@ def start_app_main_flow():
                 
                 full_entry_feats = final_entry_base_feats_to_use + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl'] # Use names from params
                 X_e_train = entry_candidates[full_entry_feats].fillna(-1)
-                y_e_train = entry_candidates['trade_outcome'].astype(int)
+                y_e_train = (entry_candidates['trade_outcome'] > 0).astype(int) # Ensure y_e_train is binary
                 
                 if len(X_e_train) > 0 and len(y_e_train.unique()) > 1:
                     # Define valid keys for train_entry_model based on its intended use with LGBM/RF
@@ -3130,7 +3130,7 @@ def start_app_main_flow():
                     entry_model_args = {k: v for k, v in raw_entry_args.items() if k in valid_entry_model_arg_names}
                     
                     print(f"DEBUG: Args passed to train_entry_model: {entry_model_args}") # Log the actual args
-                    temp_entry_model = train_entry_model(X_e_train, y_e_train, X_e_train, y_e_train, **entry_model_args)
+                    temp_entry_model, _ = train_entry_model(X_e_train, y_e_train, X_e_train, y_e_train, **entry_model_args)
                     save_model(temp_entry_model, entry_model_path)
                     universal_entry_model = temp_entry_model
                 else: print("Entry model training skipped (insufficient data/variance).")
@@ -3759,7 +3759,7 @@ def engineer_pivot_features(df, atr_col_name): # Added atr_col_name
         # If no candidates found, 'bars_since_last_pivot' remains MAX_BARS_NO_PIVOT_CONSTANT
 
     # Ensure any NaNs that might have slipped through (e.g. if df.index was very unusual) are defaulted
-    df['bars_since_last_pivot'].fillna(MAX_BARS_NO_PIVOT_CONSTANT, inplace=True)
+    df['bars_since_last_pivot'] = df['bars_since_last_pivot'].fillna(MAX_BARS_NO_PIVOT_CONSTANT)
 
 
     # Volume
