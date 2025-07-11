@@ -446,7 +446,17 @@ def load_app_settings(filepath=APP_CONFIG_FILE):
         "app_symbols_csv_path": "app_symbols.csv", # Default path for symbols CSV
         "app_training_symbols_source_type": "list", # "list" or "csv"
         "app_training_symbols_list_str": "BTCUSDT,ETHUSDT", # Comma-separated list if source_type is "list"
-        "app_notify_on_trade": True # New: Toggle for trade/signal execution messages
+        "app_notify_on_trade": True, # New: Toggle for trade/signal execution messages
+        "app_min_volume_spike_ratio": 1.5, # New setting for Volume-Based Trend-Strength Filter
+        "app_atr_period_sl_tp": 14, # ATR period for SL/TP lifecycle management (also used for RSI period for now)
+        "app_tp3_atr_multiplier": 2.0, # ATR multiplier for floating TP3
+        "app_breakeven_buffer_pct": 0.001, # 0.1% buffer for breakeven SL
+        "app_max_trade_duration_hours": 24, # Max hours a trade can remain open
+        "app_rsi_max_long": 70.0, # Max RSI for LONG entry
+        "app_rsi_min_long": 0.0,  # Min RSI for LONG entry (0 effectively means no lower bound)
+        "app_rsi_min_short": 30.0, # Min RSI for SHORT entry
+        "app_rsi_max_short": 100.0, # Max RSI for SHORT entry (100 effectively means no upper bound)
+        "app_reject_notify_telegram": True # Toggle for sending Telegram notifications for pre-check rejections
     }
 
     loaded_json_settings = {}
@@ -1053,11 +1063,22 @@ def execute_app_trade_signal(symbol: str, side: str,
             mode="signal"
         )
         # In signal mode, after sending the message, we don't proceed to place orders.
+        append_decision_log({
+            "symbol": symbol, "event_type": "SIGNAL_MODE_NOTIFICATION_SENT", "side": side, 
+            "order_type": order_type.upper(), "entry_target": effective_entry_price_for_sizing, 
+            "sl": sl_price, "tp1": tp1_price, "quantity_calculated": quantity
+        })
         return True # Indicate signal processed successfully
 
 
     # --- Live Mode: Place Orders ---
     print(f"{log_prefix} Live Mode: Proceeding to place orders.")
+    append_decision_log({
+        "symbol": symbol, "event_type": "LIVE_MODE_PLACE_ENTRY_ATTEMPT", "side": side, 
+        "order_type": order_type.upper(), "quantity": quantity, 
+        "entry_target": entry_price_target if order_type.upper() == "LIMIT" else effective_entry_price_for_sizing,
+        "sl": sl_price, "tp1": tp1_price
+    })
     entry_order_result, error_msg = place_app_new_order(
         symbol_info_app, api_order_side, order_type.upper(), quantity,
         price=entry_price_target if order_type.upper() == "LIMIT" else None,
@@ -1066,6 +1087,10 @@ def execute_app_trade_signal(symbol: str, side: str,
 
     if entry_order_result:
         entry_order_id = entry_order_result.get('orderId')
+        append_decision_log({
+            "symbol": symbol, "event_type": "LIVE_ENTRY_ORDER_PLACED", "order_id": entry_order_id,
+            "side": side, "order_type": order_type.upper(), "status": entry_order_result.get('status')
+        })
         actual_filled_price = effective_entry_price_for_sizing # Default for LIMIT or if avgPrice not available
         total_filled_quantity = quantity # Assume full quantity filled for now, will be updated for MARKET fills
 
@@ -1106,9 +1131,19 @@ def execute_app_trade_signal(symbol: str, side: str,
                     "symbol_info": symbol_info_app,
                     "open_timestamp": pd.Timestamp.now(tz='UTC'), 
                     "strategy_type": "APP_ML_TRADE", 
-                    "intended_sl": sl_price, "intended_tp1": tp1_price, 
-                    "intended_tp2": tp2_price, "intended_tp3": tp3_price,
-                    "order_type": "LIMIT"
+                    "intended_sl": sl_price, # Store intended SL for pre-fill cancellation logic
+                    "intended_tp1": tp1_price, 
+                    "intended_tp2": tp2_price, 
+                    "intended_tp3": tp3_price,
+                    "order_type": "LIMIT",
+                    # Store context for trend reversal check.
+                    # For an ML setup, the 'pivot_price_sim' from app_process_symbol_for_signal
+                    # could be a good proxy for the swing point that defined the setup.
+                    # However, execute_app_trade_signal doesn't currently receive that.
+                    # For now, we'll rely on the 'intended_sl' for a simpler invalidation check.
+                    # A more advanced version would pass and store more detailed setup context.
+                    # "setup_pivot_price": pivot_price_sim, # Example if available
+                    # "setup_expected_pullback_direction": "DOWN" if side.upper() == "LONG" else "UP" # Example
                 }
             return True # Limit order placed, SL/TP pending fill
 
@@ -1183,10 +1218,45 @@ def execute_app_trade_signal(symbol: str, side: str,
             # Decide handling: close position? For now, log and continue to TPs.
 
         # Place TP orders
+        # --- TP3 ATR-based calculation (if tp3_price is None) ---
+        calculated_tp3_price = tp3_price # Use provided tp3_price by default
+        is_tp3_floating_atr = False
+        tp3_atr_multiplier_used = None
+
+        if tp3_price is None and qty_tp3 > 0: # Only calculate if TP3 has quantity and no explicit price
+            atr_period_for_tp3 = app_settings.get("app_atr_period_sl_tp", 14)
+            # Need kline data to calculate ATR. Fetch recent klines.
+            # This adds an API call during trade execution. Consider if ATR can be passed in.
+            # For now, let's fetch.
+            print(f"{log_prefix} TP3 price not provided, calculating ATR-based TP3 (ATR period: {atr_period_for_tp3}).")
+            df_for_atr, atr_err = get_historical_bars(symbol, app_settings.get("app_trading_kline_interval"), f"{atr_period_for_tp3 + 50} days ago UTC"), None # Simplified fetch
+            
+            if atr_err is None and not df_for_atr.empty and len(df_for_atr) >= atr_period_for_tp3:
+                df_for_atr = calculate_atr(df_for_atr, period=atr_period_for_tp3) # calculate_atr is from app.py
+                atr_val_for_tp3 = df_for_atr[f'atr_{atr_period_for_tp3}'].iloc[-1]
+                
+                if pd.notna(atr_val_for_tp3) and atr_val_for_tp3 > 0:
+                    tp3_atr_mult = app_settings.get('app_tp3_atr_multiplier', 2.0)
+                    tp3_atr_multiplier_used = tp3_atr_mult # Store the multiplier used
+                    if side.upper() == "LONG":
+                        calculated_tp3_price = actual_filled_price + (atr_val_for_tp3 * tp3_atr_mult)
+                    else: # SHORT
+                        calculated_tp3_price = actual_filled_price - (atr_val_for_tp3 * tp3_atr_mult)
+                    calculated_tp3_price = round(calculated_tp3_price, p_prec)
+                    is_tp3_floating_atr = True
+                    print(f"{log_prefix} ATR-based TP3 calculated: {calculated_tp3_price:.{p_prec}f} (ATR: {atr_val_for_tp3:.{p_prec}f}, Multiplier: {tp3_atr_mult})")
+                else:
+                    print(f"{log_prefix} Failed to get valid ATR for TP3 calculation. TP3 will not be placed if it had no explicit price.")
+                    calculated_tp3_price = None # Ensure it's None if ATR calc failed
+            else:
+                print(f"{log_prefix} Failed to fetch data for ATR TP3 calculation. TP3 will not be placed if it had no explicit price. Error: {atr_err}")
+                calculated_tp3_price = None # Ensure it's None
+        # --- End TP3 ATR-based calculation ---
+
         tp_targets = [
             {"price": tp1_price, "quantity": qty_tp1, "name": "TP1"},
             {"price": tp2_price, "quantity": qty_tp2, "name": "TP2"},
-            {"price": tp3_price, "quantity": qty_tp3, "name": "TP3"}
+            {"price": calculated_tp3_price, "quantity": qty_tp3, "name": "TP3"} # Use calculated_tp3_price
         ]
 
         for tp_info in tp_targets:
@@ -1221,7 +1291,9 @@ def execute_app_trade_signal(symbol: str, side: str,
                 "symbol_info": symbol_info_app,
                 "open_timestamp": pd.Timestamp.now(tz='UTC'), # Time trade became active with SL/TP
                 "strategy_type": "APP_ML_TRADE", # Example
-                "sl_management_stage": "initial"
+                "sl_management_stage": "initial",
+                "is_tp3_floating_atr": is_tp3_floating_atr, # Store if TP3 was ATR based
+                "tp3_atr_multiplier_used": tp3_atr_multiplier_used # Store multiplier if used
             }
         print(f"{log_prefix} Trade {entry_order_id} with SL/TPs stored in app_active_trades.")
         return True
@@ -1235,44 +1307,50 @@ def execute_app_trade_signal(symbol: str, side: str,
 def monitor_app_trades():
     """
     Monitors active trades initiated by app.py.
-    Handles limit order fills, SL/TP hits, and staged SL adjustments.
+    Handles limit order fills, SL/TP hits, staged SL adjustments,
+    floating TP3 updates, and timed force-closures.
+    Logs decisions to the decision log.
     """
-    global app_binance_client, app_trading_configs, app_active_trades, app_active_trades_lock
+    global app_binance_client, app_trading_configs, app_active_trades, app_active_trades_lock, app_settings
 
-    if not app_active_trades:
+    if not app_active_trades: # No trades to monitor
         return
 
-    current_operational_mode = app_trading_configs.get("app_operational_mode", "signal") # Get mode for monitor
+    current_operational_mode = app_trading_configs.get("app_operational_mode", "signal")
     log_prefix_monitor = f"[AppTradeMonitor ({current_operational_mode.upper()})]"
-    # print(f"\n{log_prefix_monitor} Checking {len(app_active_trades)} app-managed trade(s)/signal(s)...")
-
+    
     trades_to_remove = []
     active_trades_snapshot = {}
     with app_active_trades_lock:
         active_trades_snapshot = app_active_trades.copy()
 
+    if not active_trades_snapshot: return # Double check after lock
+
     for symbol, trade_details in active_trades_snapshot.items():
-        log_sym_prefix = f"{log_prefix_monitor} [{symbol} ID:{trade_details.get('entry_order_id','N/A')}]"
-        
-        # Ensure client is initialized
+        trade_id_log = trade_details.get('entry_order_id', 'N/A') # Use for logging
+        log_sym_prefix = f"{log_prefix_monitor} [{symbol} ID:{trade_id_log}]"
+
         if app_binance_client is None:
-            print(f"{log_sym_prefix} Binance client not available. Skipping monitoring for this cycle.")
-            continue # Skip this trade if client is down
+            print(f"{log_sym_prefix} Binance client not available. Skipping monitoring cycle.")
+            append_decision_log({"symbol": symbol, "trade_id": trade_id_log, "event_type": "MONITOR_SKIP_NO_CLIENT"})
+            continue
 
         s_info = trade_details.get('symbol_info')
-        if not s_info: # Should always have symbol_info if trade was stored
-            print(f"{log_sym_prefix} Missing symbol_info. Skipping trade.")
+        if not s_info:
+            print(f"{log_sym_prefix} Missing symbol_info. Removing trade.")
+            append_decision_log({"symbol": symbol, "trade_id": trade_id_log, "event_type": "MONITOR_ERROR_NO_SYM_INFO"})
             trades_to_remove.append(symbol)
             continue
         
         p_prec = int(s_info.get('pricePrecision', 2))
         q_prec = int(s_info.get('quantityPrecision', 0))
 
-        # --- Stage 1: Handle Limit Orders Pending SL/TP Placement ---
+        # --- 1. Handle PENDING_FILL_FOR_SLTP (Limit Order Fill Check) ---
         if trade_details.get('status') == "PENDING_FILL_FOR_SLTP":
             entry_order_id = trade_details.get('entry_order_id')
             if not entry_order_id:
-                print(f"{log_sym_prefix} PENDING_FILL_FOR_SLTP status but no entry_order_id. Removing.")
+                print(f"{log_sym_prefix} PENDING_FILL_FOR_SLTP but no entry_order_id. Removing.")
+                append_decision_log({"symbol": symbol, "trade_id": "N/A", "event_type": "MONITOR_ERROR_PENDING_NO_ID"})
                 trades_to_remove.append(symbol)
                 continue
             
@@ -1282,23 +1360,25 @@ def monitor_app_trades():
                 if limit_order_status['status'] == 'FILLED':
                     actual_filled_price = float(limit_order_status.get('avgPrice', trade_details.get('entry_price_target')))
                     total_filled_quantity = float(limit_order_status.get('executedQty', trade_details.get('total_quantity')))
+                    fill_time_ms = limit_order_status.get('updateTime', int(time.time() * 1000))
+                    fill_timestamp = pd.Timestamp(fill_time_ms, unit='ms', tz='UTC')
                     print(f"{log_sym_prefix} LIMIT entry order {entry_order_id} FILLED. AvgPrice: {actual_filled_price:.{p_prec}f}, Qty: {total_filled_quantity}")
+                    append_decision_log({
+                        "symbol": symbol, "trade_id": entry_order_id, "event_type": "LIMIT_ORDER_FILLED",
+                        "fill_price": actual_filled_price, "fill_qty": total_filled_quantity, "fill_time": fill_timestamp.isoformat()
+                    })
 
-                    # Retrieve intended SL/TPs
                     sl_price = trade_details['intended_sl']
                     tp1_price = trade_details['intended_tp1']
                     tp2_price = trade_details.get('intended_tp2')
-                    tp3_price = trade_details.get('intended_tp3')
+                    tp3_price = trade_details.get('intended_tp3') # This is the initial target if set
                     
-                    # --- Place SL/TPs (logic copied and adapted from execute_app_trade_signal) ---
-                    api_order_side = "BUY" if trade_details['side'].upper() == "LONG" else "SELL" # This is for SL/TP orders, so opposite of trade side
                     api_position_side = trade_details['side'].upper()
-
-                    # Quantity Distribution
+                    
+                    # Calculate TP quantities
                     tp1_pct = app_trading_configs.get("app_tp1_qty_pct", 0.25)
                     tp2_pct = app_trading_configs.get("app_tp2_qty_pct", 0.50)
                     min_qty_val = float(next((f['minQty'] for f in s_info.get('filters', []) if f['filterType'] == 'LOT_SIZE'), '0.001'))
-
                     qty_tp1 = round(total_filled_quantity * tp1_pct, q_prec)
                     qty_tp2 = round(total_filled_quantity * tp2_pct, q_prec)
                     if tp1_pct > 0 and qty_tp1 < min_qty_val: qty_tp1 = min_qty_val
@@ -1308,172 +1388,270 @@ def monitor_app_trades():
                     if qty_tp2 < 0: qty_tp2 = 0.0
                     qty_tp3 = round(total_filled_quantity - qty_tp1 - qty_tp2, q_prec)
                     if qty_tp3 < 0: qty_tp3 = 0.0
-                    if (1 - tp1_pct - tp2_pct) > 1e-5 and 0 < qty_tp3 < min_qty_val:
+                    if (1 - tp1_pct - tp2_pct) > 1e-5 and 0 < qty_tp3 < min_qty_val: # TP3 intended but dust
                         if qty_tp2 > 0: qty_tp2 = round(qty_tp2 + qty_tp3, q_prec)
                         elif qty_tp1 > 0: qty_tp1 = round(qty_tp1 + qty_tp3, q_prec)
                         if not (qty_tp1 == 0 and qty_tp2 == 0): qty_tp3 = 0.0
                     
-                    print(f"{log_sym_prefix} TP Qtys for filled limit: TP1={qty_tp1}, TP2={qty_tp2}, TP3={qty_tp3}")
-
-                    placed_sl_order_obj, placed_tp_orders_list = None, []
+                    # Place SL
                     placed_sl_order_obj, sl_err_msg = place_app_new_order(s_info, "SELL" if api_position_side == "LONG" else "BUY", 
-                                                                        "STOP_MARKET", total_filled_quantity, 
-                                                                        stop_price=sl_price, position_side=api_position_side, 
-                                                                        is_closing_order=True)
-                    if not placed_sl_order_obj: print(f"{log_sym_prefix} CRITICAL: FAILED SL for filled LIMIT! Err: {sl_err_msg}")
+                                                                        "STOP_MARKET", total_filled_quantity, stop_price=sl_price, 
+                                                                        position_side=api_position_side, is_closing_order=True)
+                    if not placed_sl_order_obj:
+                        append_decision_log({"symbol": symbol, "trade_id": entry_order_id, "event_type": "SL_PLACEMENT_FAILED_POST_LIMIT_FILL", "error": sl_err_msg})
+                    else:
+                        append_decision_log({"symbol": symbol, "trade_id": entry_order_id, "event_type": "SL_PLACED_POST_LIMIT_FILL", "sl_order_id": placed_sl_order_obj.get('orderId'), "sl_price": sl_price})
 
-                    tp_targets_filled_limit = [
+                    # --- TP3 ATR-based calculation (if tp3_price is None from original signal AND qty_tp3 > 0) ---
+                    is_tp3_floating_atr_limit = False
+                    tp3_atr_multiplier_used_limit = None
+                    calculated_tp3_price_limit = tp3_price # Start with what was intended (could be None)
+
+                    if tp3_price is None and qty_tp3 > 0: # Only if TP3 had no price and has quantity
+                        atr_period_tp3 = app_settings.get("app_atr_period_sl_tp", 14)
+                        df_atr, _ = get_historical_bars(symbol, app_settings.get("app_trading_kline_interval"), f"{atr_period_tp3 + 50} days ago UTC")
+                        if df_atr is not None and not df_atr.empty and len(df_atr) >= atr_period_tp3:
+                            df_atr = calculate_atr(df_atr, period=atr_period_tp3)
+                            atr_val = df_atr[f'atr_{atr_period_tp3}'].iloc[-1]
+                            if pd.notna(atr_val) and atr_val > 0:
+                                mult = app_settings.get('app_tp3_atr_multiplier', 2.0)
+                                tp3_atr_multiplier_used_limit = mult
+                                if api_position_side == "LONG": calculated_tp3_price_limit = actual_filled_price + (atr_val * mult)
+                                else: calculated_tp3_price_limit = actual_filled_price - (atr_val * mult)
+                                calculated_tp3_price_limit = round(calculated_tp3_price_limit, p_prec)
+                                is_tp3_floating_atr_limit = True
+                                append_decision_log({"symbol":symbol, "trade_id":entry_order_id, "event_type":"TP3_ATR_CALC_POST_LIMIT_FILL", "atr_val":atr_val, "mult":mult, "calc_tp3_price":calculated_tp3_price_limit})
+                            else: calculated_tp3_price_limit = None # Failed ATR calc
+                        else: calculated_tp3_price_limit = None # Failed data fetch
+                    
+                    # Place TPs
+                    placed_tp_orders_list = []
+                    tp_targets_def = [
                         {"price": tp1_price, "quantity": qty_tp1, "name": "TP1"},
                         {"price": tp2_price, "quantity": qty_tp2, "name": "TP2"},
-                        {"price": tp3_price, "quantity": qty_tp3, "name": "TP3"}
+                        {"price": calculated_tp3_price_limit, "quantity": qty_tp3, "name": "TP3"} # Use potentially updated TP3 price
                     ]
-                    for tp_info_fill in tp_targets_filled_limit:
-                        if tp_info_fill["price"] is not None and tp_info_fill["quantity"] > 0:
-                            tp_ord_obj_fill, tp_err_msg_fill = place_app_new_order(s_info, "SELL" if api_position_side == "LONG" else "BUY",
-                                                                         "TAKE_PROFIT_MARKET", tp_info_fill["quantity"],
-                                                                         stop_price=tp_info_fill["price"], position_side=api_position_side,
-                                                                         is_closing_order=True)
-                            if not tp_ord_obj_fill: print(f"{log_sym_prefix} WARN: Failed {tp_info_fill['name']} for filled LIMIT. Err: {tp_err_msg_fill}")
-                            placed_tp_orders_list.append({"id": tp_ord_obj_fill.get('orderId') if tp_ord_obj_fill else None, 
-                                                          "price": tp_info_fill["price"], "quantity": tp_info_fill["quantity"], 
-                                                          "status": "OPEN" if tp_ord_obj_fill else "FAILED", "name": tp_info_fill["name"]})
-                    
+                    for tp_info in tp_targets_def:
+                        if tp_info["price"] is not None and tp_info["quantity"] > 0:
+                            tp_ord, tp_err = place_app_new_order(s_info, "SELL" if api_position_side == "LONG" else "BUY",
+                                                                 "TAKE_PROFIT_MARKET", tp_info["quantity"], stop_price=tp_info["price"],
+                                                                 position_side=api_position_side, is_closing_order=True)
+                            status_log = "OPEN" if tp_ord else "FAILED"
+                            tp_id_log = tp_ord.get('orderId') if tp_ord else None
+                            append_decision_log({"symbol":symbol, "trade_id":entry_order_id, "event_type":f"{tp_info['name']}_PLACEMENT_POST_LIMIT_FILL", "tp_order_id":tp_id_log, "price":tp_info['price'], "qty":tp_info['quantity'], "status":status_log, "error":tp_err})
+                            placed_tp_orders_list.append({"id": tp_id_log, "price": tp_info["price"], "quantity": tp_info["quantity"], "status": status_log, "name": tp_info["name"]})
+
                     # Update app_active_trades
                     with app_active_trades_lock:
-                        if symbol in app_active_trades: # Ensure it wasn't removed by another thread
+                        if symbol in app_active_trades:
                             app_active_trades[symbol].update({
-                                "status": "ACTIVE", # Trade is now fully active
-                                "entry_price": actual_filled_price, # Actual fill price
-                                "total_quantity": total_filled_quantity, # Actual filled quantity
+                                "status": "ACTIVE", "entry_price": actual_filled_price, "total_quantity": total_filled_quantity,
                                 "sl_order_id": placed_sl_order_obj.get('orderId') if placed_sl_order_obj else None,
-                                "tp_orders": placed_tp_orders_list,
-                                "current_sl_price": sl_price, "initial_sl_price": sl_price,
-                                "open_timestamp": pd.Timestamp(limit_order_status['updateTime'], unit='ms', tz='UTC'), # Time of fill
-                                "sl_management_stage": "initial"
+                                "tp_orders": placed_tp_orders_list, "current_sl_price": sl_price, "initial_sl_price": sl_price,
+                                "open_timestamp": fill_timestamp, "sl_management_stage": "initial",
+                                "is_tp3_floating_atr": is_tp3_floating_atr_limit, # If TP3 became ATR based
+                                "tp3_atr_multiplier_used": tp3_atr_multiplier_used_limit
                             })
-                            print(f"{log_sym_prefix} Limit order filled, SL/TPs placed. Trade now ACTIVE.")
-                        else:
-                             print(f"{log_sym_prefix} Limit order filled, but trade was removed from app_active_trades concurrently. SL/TPs may be orphaned.")
-                             # TODO: Cancel newly placed SL/TPs if trade entry vanished. This is an edge case.
-
-                elif limit_order_status['status'] in ['CANCELED', 'EXPIRED', 'REJECTED', 'PENDING_CANCEL']:
-                    print(f"{log_sym_prefix} Limit entry order {entry_order_id} is {limit_order_status['status']}. Removing from app_active_trades.")
-                    trades_to_remove.append(symbol)
-                # else: Order is still 'NEW' or 'PARTIALLY_FILLED' (partially filled needs more complex handling not in scope for this step)
-                # Timeout check for limit orders can also be added here.
+                            print(f"{log_sym_prefix} Limit order filled, SL/TPs placed. Trade ACTIVE.")
+                        else: # Edge case: trade removed concurrently
+                            append_decision_log({"symbol": symbol, "trade_id": entry_order_id, "event_type": "MONITOR_ERROR_LIMIT_FILL_TRADE_GONE"})
                 
-            except BinanceAPIException as e_api:
-                if e_api.code == -2013: # Order does not exist
-                    print(f"{log_sym_prefix} Limit entry order {entry_order_id} NOT FOUND on exchange. Removing from app_active_trades.")
+                elif limit_order_status['status'] in ['CANCELED', 'EXPIRED', 'REJECTED', 'PENDING_CANCEL']:
+                    print(f"{log_sym_prefix} Limit entry order {entry_order_id} is {limit_order_status['status']}. Removing.")
+                    append_decision_log({"symbol": symbol, "trade_id": entry_order_id, "event_type": "LIMIT_ORDER_FINAL_STATUS_NOT_FILLED", "status": limit_order_status['status']})
                     trades_to_remove.append(symbol)
-                else:
-                    print(f"{log_sym_prefix} API Error checking limit order {entry_order_id}: {e_api}")
-            except Exception as e_gen:
-                print(f"{log_sym_prefix} Unexpected error checking limit order {entry_order_id}: {e_gen}")
-            
-            continue # Move to the next symbol after processing a PENDING_FILL_FOR_SLTP trade (live mode)
+                
+                elif limit_order_status['status'] in ['NEW', 'PARTIALLY_FILLED']: # Still pending, check for SL hit pre-fill
+                    intended_sl = trade_details.get('intended_sl')
+                    pending_side = trade_details.get('side')
+                    if intended_sl and pending_side:
+                        mkt_price = float(app_binance_client.futures_ticker(symbol=symbol)['lastPrice'])
+                        invalidated = False
+                        if pending_side == "LONG" and mkt_price <= intended_sl: invalidated = True
+                        elif pending_side == "SHORT" and mkt_price >= intended_sl: invalidated = True
+                        
+                        if invalidated:
+                            print(f"{log_sym_prefix} Pending LIMIT {entry_order_id} INVALIDATED pre-fill (SL: {intended_sl:.{p_prec}f} vs Mkt: {mkt_price:.{p_prec}f}). Cancelling.")
+                            try:
+                                app_binance_client.futures_cancel_order(symbol=symbol, orderId=entry_order_id)
+                                send_app_telegram_message(f"⚠️ PENDING ORDER CANCELLED ⚠️\nSymbol: `{symbol}` Side: `{pending_side}`\nReason: _Intended SL hit before fill._")
+                                append_decision_log({"symbol": symbol, "trade_id": entry_order_id, "event_type": "LIMIT_ORDER_CANCELLED_PRE_FILL_SL_HIT", "intended_sl": intended_sl, "market_price": mkt_price})
+                                trades_to_remove.append(symbol)
+                            except Exception as e_cancel:
+                                append_decision_log({"symbol": symbol, "trade_id": entry_order_id, "event_type": "LIMIT_ORDER_CANCEL_FAILED_PRE_FILL_SL_HIT", "error": str(e_cancel)})
+            except Exception as e_check_limit:
+                print(f"{log_sym_prefix} Error checking limit order {entry_order_id}: {e_check_limit}")
+                append_decision_log({"symbol": symbol, "trade_id": entry_order_id, "event_type": "MONITOR_ERROR_CHECKING_LIMIT_ORDER", "error": str(e_check_limit)})
+            continue # Next symbol
 
-        # --- Stage 1b: Handle VIRTUAL Limit Signals Pending Fill (Signal Mode) ---
-        if trade_details.get('mode') == "signal" and trade_details.get('status') == "SIGNAL_PENDING_LIMIT_FILL":
-            limit_price_signal = trade_details.get('entry_price_target')
-            signal_side_virtual = trade_details.get('side')
-            
-            current_market_price_virtual = None
-            try:
-                ticker_virtual = app_binance_client.futures_ticker(symbol=symbol)
-                current_market_price_virtual = float(ticker_virtual['lastPrice'])
-            except Exception as e_fetch_signal:
-                print(f"{log_sym_prefix} Could not fetch market price for virtual signal trigger: {e_fetch_signal}")
-                continue
-
-            price_triggered_virtual_limit = False
-            if signal_side_virtual == "LONG" and current_market_price_virtual <= limit_price_signal:
-                price_triggered_virtual_limit = True
-            elif signal_side_virtual == "SHORT" and current_market_price_virtual >= limit_price_signal:
-                price_triggered_virtual_limit = True
-
-            if price_triggered_virtual_limit:
-                print(f"{log_sym_prefix} Virtual LIMIT signal TRIGGERED. Limit: {limit_price_signal:.{p_prec}f}, Market: {current_market_price_virtual:.{p_prec}f}")
-                with app_active_trades_lock:
-                    if symbol in app_active_trades:
-                        app_active_trades[symbol]['status'] = "SIGNAL_ACTIVE"
-                        app_active_trades[symbol]['entry_price'] = current_market_price_virtual # Effective entry for simulation
-                        app_active_trades[symbol]['open_timestamp'] = pd.Timestamp.now(tz='UTC')
-                # TODO: Send Telegram update for virtual limit fill
-            # TODO: Add timeout for virtual pending limit signals
-            continue # Move to next symbol
-
-        # --- Stage 2: Monitor Active Trades/Signals ---
-        trade_is_live = trade_details.get('mode') == "live" and trade_details.get('status') == "ACTIVE"
-        trade_is_signal_active = trade_details.get('mode') == "signal" and trade_details.get('status') == "SIGNAL_ACTIVE"
-
-        if not (trade_is_live or trade_is_signal_active):
-            if trade_details.get('status') not in ["PENDING_FILL_FOR_SLTP", "SIGNAL_PENDING_LIMIT_FILL"]: # Avoid logging for already handled pending states
-                 print(f"{log_sym_prefix} Trade status is '{trade_details.get('status')}', not ACTIVE or SIGNAL_ACTIVE. Monitor skipping detailed checks.")
+        # --- 2. Monitor ACTIVE Live Trades ---
+        if not (trade_details.get('status') == "ACTIVE" and current_operational_mode == "live"):
+            if trade_details.get('status') != "PENDING_FILL_FOR_SLTP": # Don't log for pending, it's handled above
+                 append_decision_log({"symbol": symbol, "trade_id": trade_id_log, "event_type": "MONITOR_SKIP_NOT_ACTIVE_LIVE", "current_status": trade_details.get('status')})
             continue
-            
-        current_market_price_for_active = None
+
+        # Fetch current market price for active trade checks
+        current_market_price = None
         try:
-            ticker_active = app_binance_client.futures_ticker(symbol=symbol)
-            current_market_price_for_active = float(ticker_active['lastPrice'])
-        except Exception as e_active:
-            print(f"{log_sym_prefix} Could not fetch market price for active trade/signal monitoring: {e_active}. Skipping.")
+            current_market_price = float(app_binance_client.futures_ticker(symbol=symbol)['lastPrice'])
+        except Exception as e_fetch_active_price:
+            print(f"{log_sym_prefix} Could not fetch market price for active trade: {e_fetch_active_price}")
+            append_decision_log({"symbol": symbol, "trade_id": trade_id_log, "event_type": "MONITOR_ERROR_FETCH_ACTIVE_PRICE", "error": str(e_fetch_active_price)})
             continue
 
-        # Check SL Hit (Virtual or Real)
-        current_sl_price = trade_details.get('current_sl_price')
-        sl_order_id = trade_details.get('sl_order_id') # Will be None for signals
-        trade_side = trade_details.get('side')
-
-        sl_hit_flag = False
-        if current_sl_price:
-            if trade_side == "LONG" and current_market_price_for_active <= current_sl_price: sl_hit_flag = True
-            elif trade_side == "SHORT" and current_market_price_for_active >= current_sl_price: sl_hit_flag = True
-        
-        if sl_hit_flag:
-            print(f"{log_sym_prefix} STOP LOSS HIT ({trade_details.get('mode')}) at ~{current_sl_price:.{p_prec}f} (Market: {current_market_price_for_active:.{p_prec}f}).")
-            if trade_is_live and sl_order_id:
-                # For live trades, SL order fill confirmation would ideally come from checking the SL order status.
-                # This market price check is a proactive measure.
-                # If SL order is confirmed filled, then proceed to cancel TPs.
-                print(f"{log_sym_prefix} Live SL hit. Assuming SL order {sl_order_id} will fill/has filled.")
-                for tp_order_info in trade_details.get('tp_orders', []):
-                    if tp_order_info.get('id') and tp_order_info.get('status') == 'OPEN':
-                        try:
-                            app_binance_client.futures_cancel_order(symbol=symbol, orderId=tp_order_info['id'])
-                            print(f"{log_sym_prefix} Canceled TP order {tp_order_info['id']} due to SL hit.")
-                        except Exception as e_cancel_tp_live:
-                            print(f"{log_sym_prefix} Failed to cancel TP order {tp_order_info['id']} (live SL hit): {e_cancel_tp_live}")
-            # TODO: Log P&L for live trade SL hit
-            # TODO: Send Telegram for SL hit (live or signal)
+        # --- 2a. Timed Force-Close ---
+        max_hours = app_settings.get('app_max_trade_duration_hours', 24)
+        open_ts = trade_details.get('open_timestamp')
+        if isinstance(open_ts, pd.Timestamp) and (pd.Timestamp.now(tz='UTC') - open_ts).total_seconds() > max_hours * 3600:
+            print(f"{log_sym_prefix} Trade open > {max_hours}h. Force-closing.")
+            append_decision_log({"symbol": symbol, "trade_id": trade_id_log, "event_type": "FORCE_CLOSE_INITIATED_TIMEOUT", "max_hours": max_hours, "open_since": open_ts.isoformat()})
+            # Cancel SL/TPs
+            if trade_details.get('sl_order_id'):
+                try: app_binance_client.futures_cancel_order(symbol=symbol, orderId=trade_details['sl_order_id'])
+                except Exception as e_fc_sl: append_decision_log({"symbol":symbol,"trade_id":trade_id_log,"event_type":"FORCE_CLOSE_CANCEL_SL_ERROR","error":str(e_fc_sl)})
+            for tp in trade_details.get('tp_orders', []):
+                if tp.get('id') and tp.get('status') == 'OPEN':
+                    try: app_binance_client.futures_cancel_order(symbol=symbol, orderId=tp['id'])
+                    except Exception as e_fc_tp: append_decision_log({"symbol":symbol,"trade_id":trade_id_log,"event_type":"FORCE_CLOSE_CANCEL_TP_ERROR","tp_id":tp['id'],"error":str(e_fc_tp)})
+            # Market close position
+            pos_amt_fc = float(app_binance_client.futures_position_information(symbol=symbol)[0].get('positionAmt',0.0)) # Simplified fetch
+            if abs(pos_amt_fc) > 0:
+                fc_side = "SELL" if pos_amt_fc > 0 else "BUY"
+                fc_ord, fc_err = place_app_new_order(s_info, fc_side, "MARKET", abs(pos_amt_fc), position_side=trade_details['side'].upper())
+                if fc_ord: send_app_telegram_message(f"✅ FORCE-CLOSED: {symbol} {trade_details['side']} after {max_hours}h. Qty: {abs(pos_amt_fc)}")
+                else: send_app_telegram_message(f"🆘 FAILED Force-Close: {symbol} {trade_details['side']}. Err: {fc_err}")
+                append_decision_log({"symbol":symbol,"trade_id":trade_id_log,"event_type":"FORCE_CLOSE_MARKET_ORDER_RESULT","order_id":fc_ord.get('orderId') if fc_ord else None,"error":fc_err, "qty":abs(pos_amt_fc)})
             trades_to_remove.append(symbol)
             continue
 
-        # Check TP Hits (Virtual or Real)
-        # For live trades, this means checking status of actual TP orders.
-        # For signal trades, this means checking market price against virtual TP levels.
-        # This will be complex and is a placeholder for now.
-        # The logic needs to iterate `trade_details['tp_orders']`, check status/price,
-        # handle partial fills, and trigger SL adjustments.
+        # --- 2b. SL Hit Check (Market Price vs. Stored SL) ---
+        current_sl = trade_details.get('current_sl_price')
+        trade_side = trade_details.get('side')
+        sl_hit = False
+        if current_sl:
+            if trade_side == "LONG" and current_market_price <= current_sl: sl_hit = True
+            elif trade_side == "SHORT" and current_market_price >= current_sl: sl_hit = True
         
-        if trade_is_live:
-            # print(f"{log_sym_prefix} Monitoring LIVE trade TPs. SL: {current_sl_price}, Market: {current_market_price_for_active:.{p_prec}f}")
-            # TODO: Logic to check actual TP order statuses for live trades
-            pass
-        elif trade_is_signal_active:
-            # print(f"{log_sym_prefix} Monitoring VIRTUAL signal TPs. SL: {current_sl_price}, Market: {current_market_price_for_active:.{p_prec}f}")
-            # TODO: Logic to check market price against virtual TP levels for signals
-            # And simulate SL adjustments (BE, TP1 trail)
-            pass
+        if sl_hit:
+            print(f"{log_sym_prefix} STOP LOSS HIT by market price. SL: {current_sl:.{p_prec}f}, Market: {current_market_price:.{p_prec}f}")
+            append_decision_log({"symbol": symbol, "trade_id": trade_id_log, "event_type": "SL_HIT_MARKET_PRICE", "sl_price": current_sl, "market_price": current_market_price, "side": trade_side})
+            # SL order should fill. Cancel remaining TPs.
+            for tp in trade_details.get('tp_orders', []):
+                if tp.get('id') and tp.get('status') == 'OPEN':
+                    try: app_binance_client.futures_cancel_order(symbol=symbol, orderId=tp['id'])
+                    except Exception as e_sl_tp_cancel: append_decision_log({"symbol":symbol,"trade_id":trade_id_log,"event_type":"SL_HIT_CANCEL_TP_ERROR","tp_id":tp['id'],"error":str(e_sl_tp_cancel)})
+            send_app_telegram_message(f"❌ SL HIT: {symbol} {trade_side} @ ~{current_sl:.{p_prec}f}")
+            trades_to_remove.append(symbol)
+            continue
+            
+        # --- 2c. TP Hit Checks & SL Management ---
+        sl_management_stage = trade_details.get('sl_management_stage', 'initial')
+        tp_orders_snapshot = list(trade_details.get('tp_orders', [])) # Iterate over a copy
+        any_tp_hit_this_cycle = False
 
+        for idx, tp_order_info in enumerate(tp_orders_snapshot):
+            if tp_order_info.get('status') == 'OPEN' and tp_order_info.get('id'):
+                try:
+                    tp_order_status = app_binance_client.futures_get_order(symbol=symbol, orderId=tp_order_info['id'])
+                    if tp_order_status['status'] == 'FILLED':
+                        any_tp_hit_this_cycle = True
+                        filled_tp_name = tp_order_info['name']
+                        filled_tp_price = float(tp_order_status['avgPrice'])
+                        print(f"{log_sym_prefix} {filled_tp_name} FILLED @ {filled_tp_price:.{p_prec}f}")
+                        append_decision_log({"symbol":symbol,"trade_id":trade_id_log,"event_type":f"{filled_tp_name}_HIT","order_id":tp_order_info['id'],"fill_price":filled_tp_price, "qty":tp_order_status['executedQty']})
+                        send_app_telegram_message(f"✅ {filled_tp_name} HIT: {symbol} {trade_side} @ {filled_tp_price:.{p_prec}f}")
+                        
+                        with app_active_trades_lock: # Update TP status and SL stage
+                            if symbol in app_active_trades and idx < len(app_active_trades[symbol]['tp_orders']):
+                                app_active_trades[symbol]['tp_orders'][idx]['status'] = 'FILLED'
+                                current_sl_stage_locked = app_active_trades[symbol]['sl_management_stage']
+                                if filled_tp_name == 'TP1' and current_sl_stage_locked == 'initial':
+                                    app_active_trades[symbol]['sl_management_stage'] = 'after_tp1'
+                                elif filled_tp_name == 'TP2' and current_sl_stage_locked in ['initial', 'after_tp1']:
+                                    app_active_trades[symbol]['sl_management_stage'] = 'after_tp2'
+                                sl_management_stage = app_active_trades[symbol]['sl_management_stage'] # Refresh for current cycle use
+                except Exception as e_tp_check:
+                    append_decision_log({"symbol":symbol,"trade_id":trade_id_log,"event_type":"MONITOR_ERROR_CHECKING_TP","tp_id":tp_order_info['id'],"error":str(e_tp_check)})
+        
+        if any_tp_hit_this_cycle: # If a TP was hit, re-evaluate SL
+            new_sl_price_target = None
+            sl_adj_reason = None
+            current_entry_price = trade_details['entry_price']
+            initial_sl = trade_details['initial_sl_price'] # Should be current_sl_price from trade_details
 
-    # Remove trades marked for deletion
+            if sl_management_stage == 'after_tp1':
+                buffer = app_settings.get('app_breakeven_buffer_pct', 0.001)
+                new_sl_price_target = current_entry_price * (1 + buffer) if trade_side == "LONG" else current_entry_price * (1 - buffer)
+                sl_adj_reason = "TP1 Hit: SL to Breakeven+"
+            elif sl_management_stage == 'after_tp2':
+                tp1_data = next((tp for tp in trade_details.get('tp_orders', []) if tp['name'] == 'TP1' and tp.get('price') is not None), None)
+                if tp1_data: new_sl_price_target = tp1_data['price']
+                sl_adj_reason = "TP2 Hit: SL to TP1 Price"
+            
+            if new_sl_price_target is not None:
+                new_sl_price_target = round(new_sl_price_target, p_prec)
+                is_improvement = (trade_side == "LONG" and new_sl_price_target > trade_details['current_sl_price']) or \
+                                 (trade_side == "SHORT" and new_sl_price_target < trade_details['current_sl_price'])
+                
+                if is_improvement:
+                    # Calculate remaining quantity for new SL order
+                    remaining_qty_sl_adj = 0
+                    with app_active_trades_lock:
+                        if symbol in app_active_trades: # Read fresh TP states
+                            for tp_o in app_active_trades[symbol]['tp_orders']:
+                                if tp_o.get('status') == 'OPEN' and tp_o.get('quantity',0) > 0 : remaining_qty_sl_adj += tp_o['quantity']
+                    remaining_qty_sl_adj = round(remaining_qty_sl_adj, q_prec)
+
+                    if remaining_qty_sl_adj > 0 :
+                        print(f"{log_sym_prefix} Adjusting SL: {sl_adj_reason} to {new_sl_price_target:.{p_prec}f} for Qty: {remaining_qty_sl_adj}")
+                        if trade_details.get('sl_order_id'): # Cancel old SL
+                            try: app_binance_client.futures_cancel_order(symbol=symbol, orderId=trade_details['sl_order_id'])
+                            except Exception as e_cancel_old_sl_adj: append_decision_log({"symbol":symbol,"trade_id":trade_id_log,"event_type":"SL_ADJUST_CANCEL_OLD_ERROR","error":str(e_cancel_old_sl_adj)})
+                        
+                        # Place new SL
+                        new_sl_obj, new_sl_err = place_app_new_order(s_info, "SELL" if trade_side == "LONG" else "BUY", "STOP_MARKET", 
+                                                                     remaining_qty_sl_adj, stop_price=new_sl_price_target, 
+                                                                     position_side=trade_side, is_closing_order=True)
+                        if new_sl_obj:
+                            with app_active_trades_lock:
+                                if symbol in app_active_trades:
+                                    app_active_trades[symbol]['sl_order_id'] = new_sl_obj.get('orderId')
+                                    app_active_trades[symbol]['current_sl_price'] = new_sl_price_target
+                            send_app_telegram_message(f"⚙️ SL ADJUSTED: {symbol} {trade_side}. {sl_adj_reason} to {new_sl_price_target:.{p_prec}f}")
+                            append_decision_log({"symbol":symbol,"trade_id":trade_id_log,"event_type":"SL_ADJUSTED_SUCCESS","new_sl_price":new_sl_price_target,"new_sl_id":new_sl_obj.get('orderId'),"reason":sl_adj_reason})
+                        else:
+                            send_app_telegram_message(f"🆘 FAILED SL ADJUSTMENT: {symbol} {trade_side}. {sl_adj_reason}. Err: {new_sl_err}")
+                            append_decision_log({"symbol":symbol,"trade_id":trade_id_log,"event_type":"SL_ADJUST_FAILED","target_price":new_sl_price_target,"error":new_sl_err})
+                    else: # No remaining quantity for SL adjustment
+                        append_decision_log({"symbol":symbol,"trade_id":trade_id_log,"event_type":"SL_ADJUST_NO_REMAINING_QTY","reason":"All TPs hit or quantities zeroed."})
+                        if trade_details.get('sl_order_id'): # Cancel final SL if it exists
+                            try: app_binance_client.futures_cancel_order(symbol=symbol, orderId=trade_details['sl_order_id'])
+                            except Exception: pass # Ignore error if already gone
+                        trades_to_remove.append(symbol) # Mark for removal as all TPs seem closed
+
+        # --- 2d. Check if all TPs finalized (for trade removal) ---
+        all_tps_done = True
+        with app_active_trades_lock:
+            if symbol in app_active_trades: # Re-check existence
+                for tp_o in app_active_trades[symbol]['tp_orders']:
+                    if tp_o.get('quantity', 0) > 0 and tp_o.get('status') == 'OPEN':
+                        all_tps_done = False; break
+        if all_tps_done:
+            print(f"{log_sym_prefix} All TPs finalized or have zero quantity. Removing trade.")
+            append_decision_log({"symbol": symbol, "trade_id": trade_id_log, "event_type": "ALL_TPS_FINALIZED_REMOVING_TRADE"})
+            if trade_details.get('sl_order_id'): # Ensure final SL is cancelled if somehow still open
+                 try: app_binance_client.futures_cancel_order(symbol=symbol, orderId=trade_details['sl_order_id'])
+                 except Exception: pass
+            trades_to_remove.append(symbol)
+
+    # --- Final Removal of Trades ---
     if trades_to_remove:
         with app_active_trades_lock:
-            for sym_remove in trades_to_remove:
-                if sym_remove in app_active_trades:
-                    print(f"{log_prefix_monitor} Removing trade for {sym_remove} from app_active_trades.")
-                    del app_active_trades[sym_remove]
+            for sym_rem in trades_to_remove:
+                if sym_rem in app_active_trades:
+                    removed_trade_details = app_active_trades.pop(sym_rem) # Use pop to get details if needed for final log
+                    print(f"{log_prefix_monitor} Removed trade for {sym_rem} from app_active_trades. Final status: {removed_trade_details.get('status','N/A')}")
+                    append_decision_log({"symbol": sym_rem, "trade_id": removed_trade_details.get('entry_order_id','N/A'), "event_type": "TRADE_REMOVED_FROM_ACTIVE_LIST", "final_recorded_status": removed_trade_details.get('status','N/A')})
 
 # --- End Trade Monitoring Logic ---
 
@@ -1942,6 +2120,50 @@ def check_ml_models_exist():
 
 # --- End ML Model File Utilities ---
 
+# --- Logging Utilities ---
+APP_DECISION_LOG_FILE = "app_decision_log.csv"
+app_decision_log_entries = [] # Global list to store log entries
+app_decision_log_lock = threading.Lock()
+
+def append_decision_log(log_entry: dict):
+    """Appends a structured log entry to the global list."""
+    global app_decision_log_entries, app_decision_log_lock
+    with app_decision_log_lock:
+        log_entry['timestamp_utc'] = pd.Timestamp.now(tz='UTC').isoformat()
+        app_decision_log_entries.append(log_entry)
+
+def save_decision_log_to_csv(force_save=False):
+    """Saves the collected decision log entries to a CSV file.
+    Can be forced or save based on buffer size."""
+    global app_decision_log_entries, app_decision_log_lock, APP_DECISION_LOG_FILE
+    
+    # Define a buffer size, e.g., save every 100 entries or if forced
+    LOG_BUFFER_SIZE_TO_SAVE = 100 
+    
+    with app_decision_log_lock:
+        if not app_decision_log_entries:
+            return # Nothing to save
+
+        if not force_save and len(app_decision_log_entries) < LOG_BUFFER_SIZE_TO_SAVE:
+            return # Wait for more entries unless forced
+
+        try:
+            log_df = pd.DataFrame(app_decision_log_entries)
+            # Ensure consistent column order, add new columns if they appear
+            # For simplicity, let pandas handle column order for now, or define a fixed set
+            
+            if os.path.exists(APP_DECISION_LOG_FILE):
+                log_df.to_csv(APP_DECISION_LOG_FILE, mode='a', header=False, index=False)
+            else:
+                log_df.to_csv(APP_DECISION_LOG_FILE, mode='w', header=True, index=False)
+            
+            print(f"[AppDecisionLog] Saved {len(app_decision_log_entries)} entries to {APP_DECISION_LOG_FILE}")
+            app_decision_log_entries.clear() # Clear after saving
+        except Exception as e:
+            print(f"[AppDecisionLog] Error saving decision log: {e}")
+# --- End Logging Utilities ---
+
+
 # --- Live Feature Calculation Functions ---
 def app_calculate_live_pivot_features(df_live: pd.DataFrame, atr_period: int, pivot_feature_names: list, current_app_settings: dict):
     """
@@ -2303,9 +2525,65 @@ def app_process_symbol_for_signal(symbol: str, client, current_app_settings: dic
     
     # If pivot passes, log the full decision message
     print(f"{log_prefix} Pivot passes {threshold_mode_in_use} threshold. {pivot_decision_log_message}")
+    append_decision_log({
+        "symbol": symbol, "event_type": "PIVOT_MODEL_PASS",
+        "p_swing_score": p_swing_score_live, "threshold_used": p_swing_thresh_to_use,
+        "predicted_pivot_class": predicted_pivot_class_live, "details": pivot_decision_log_message
+    })
+
+    # --- Volume Spike Check ---
+    min_volume_spike_ratio = current_app_settings.get("app_min_volume_spike_ratio", 1.5) # Default 1.5 if not set
+    volume_spike_feature_name = 'volume_spike_vs_avg' # This must match the name in PIVOT_FEATURE_NAMES and live_pivot_features
+    
+    current_volume_spike_value = np.nan # Default to NaN
+    if live_pivot_features is not None and volume_spike_feature_name in live_pivot_features:
+        current_volume_spike_value = live_pivot_features[volume_spike_feature_name]
+    
+    if pd.isna(current_volume_spike_value):
+        print(f"{log_prefix} Volume spike value is NaN. Skipping volume check or treating as insufficient.")
+        # Depending on strictness, could reject here. For now, let's say if it's NaN, it doesn't pass.
+        # Or, if a very low default (e.g. 0) is used for min_volume_spike_ratio, NaN < 0 would be false.
+        # Let's assume NaN fails the check if min_volume_spike_ratio > 0
+        if min_volume_spike_ratio > 0: # Only fail if a positive threshold is expected
+            print(f"{log_prefix} Signal REJECTED due to NaN volume spike value (threshold: {min_volume_spike_ratio}).")
+            append_decision_log({"symbol": symbol, "event_type": "REJECT_VOLUME_SPIKE_NAN", "min_ratio": min_volume_spike_ratio})
+            return # Reject signal
+    elif current_volume_spike_value < min_volume_spike_ratio:
+        print(f"{log_prefix} Signal REJECTED: Volume spike ({current_volume_spike_value:.2f}) is below threshold ({min_volume_spike_ratio}).")
+        append_decision_log({"symbol": symbol, "event_type": "REJECT_VOLUME_SPIKE_LOW", "volume_spike": current_volume_spike_value, "min_ratio": min_volume_spike_ratio})
+        # Optionally send a specific Telegram rejection message for volume
+        # app_send_trade_rejection_notification(...)
+        return # Reject signal
+    
+    print(f"{log_prefix} Volume Spike Check PASSED: Value {current_volume_spike_value:.2f} >= Threshold {min_volume_spike_ratio}")
+    append_decision_log({"symbol": symbol, "event_type": "PASS_VOLUME_SPIKE", "volume_spike": current_volume_spike_value, "min_ratio": min_volume_spike_ratio})
+    # --- End Volume Spike Check ---
 
     # --- Debug message for Pivot Signal Passed ---
-    print(f"{log_prefix} ✅ Pivot Signal Passed - Score: {p_swing_score_live:.3f} (≥ {p_swing_thresh_to_use:.3f}), Class: {predicted_pivot_class_live}")
+    print(f"{log_prefix} ✅ Pivot Signal Passed (Score & Volume) - PScore: {p_swing_score_live:.3f}, VolSpike: {current_volume_spike_value:.2f}, Class: {predicted_pivot_class_live}")
+    
+    # --- Perform Additional Pre-Checks (RSI, etc.) ---
+    # trade_side_potential is "long" or "short"
+    preconditions_ok, reject_reason = check_signal_preconditions(
+        symbol, 
+        trade_side_potential,  # "long" or "short"
+        df_live_raw, # Full klines DataFrame for RSI calculation
+        current_app_settings, 
+        live_pivot_features # Pass the already calculated pivot features
+    )
+
+    if not preconditions_ok:
+        print(f"{log_prefix} Signal REJECTED by pre-conditions: {reject_reason}")
+        if current_app_settings.get('app_reject_notify_telegram', True):
+            send_app_telegram_message(
+                f"⚠️ [REJECT] {symbol} {trade_side_potential.upper()} – Reason: {escape_app_markdown_v1(reject_reason)}"
+            )
+        append_decision_log({"symbol": symbol, "event_type": "REJECT_PRECONDITION", "side": trade_side_potential, "reason": reject_reason})
+        return # Reject signal
+    print(f"{log_prefix} Additional Pre-checks (RSI) PASSED.")
+    append_decision_log({"symbol": symbol, "event_type": "PASS_PRECONDITION", "side": trade_side_potential, "reason": "RSI OK"})
+    # --- End Additional Pre-Checks ---
+
     # Optional: Send Telegram alert for pivot detection (for testing, can be removed or made configurable)
     # send_app_telegram_message(f"⚠️ DEBUG PIVOT: {symbol} Pivot detected. Score: {p_swing_score_live:.3f} (Class: {predicted_pivot_class_live})")
 
@@ -2365,10 +2643,16 @@ def app_process_symbol_for_signal(symbol: str, client, current_app_settings: dic
 
     if p_profit_live < p_profit_thresh:
         print(f"{log_prefix} Entry signal not strong enough (P_Profit {p_profit_live:.3f} < {p_profit_thresh:.2f}).")
+        append_decision_log({"symbol": symbol, "event_type": "REJECT_ENTRY_MODEL_LOW_PROFIT", "p_profit": p_profit_live, "threshold": p_profit_thresh})
         return
 
     # --- Entry Confirmed by Both Models ---
     print(f"{log_prefix} ✅ ENTRY SIGNAL CONFIRMED: {trade_side_potential.upper()} for {symbol}. P_Swing={p_swing_score_live:.2f}, P_Profit={p_profit_live:.2f}")
+    append_decision_log({
+        "symbol": symbol, "event_type": "ENTRY_MODEL_PASS", 
+        "p_swing": p_swing_score_live, "p_profit": p_profit_live, 
+        "side": trade_side_potential
+    })
 
     # Determine actual entry price, SL, TP for trade/signal
     # Entry: Current market price (last close for simulation, or fetch live ticker for live)
@@ -2477,6 +2761,88 @@ def app_process_symbol_for_signal(symbol: str, client, current_app_settings: dic
 
     print(f"{log_prefix} Finished processing for symbol.")
 
+
+# --- Pre-Signal Condition Checks ---
+def check_signal_preconditions(symbol: str, side: str, klines_df: pd.DataFrame, 
+                               current_app_settings: dict, live_pivot_features: pd.Series) -> tuple[bool, str]:
+    """
+    Checks pre-conditions like RSI and Volume before proceeding with entry model evaluation.
+    Args:
+        symbol (str): Trading symbol.
+        side (str): "long" or "short".
+        klines_df (pd.DataFrame): DataFrame with historical klines for RSI calculation.
+        current_app_settings (dict): Current application settings.
+        live_pivot_features (pd.Series): Series containing calculated pivot features, including 'volume_spike_vs_avg'.
+
+    Returns:
+        tuple[bool, str]: (True, "OK") if all checks pass, otherwise (False, "Reason for rejection").
+    """
+    log_prefix = f"[PreCheck-{symbol}-{side.upper()}]"
+
+    # --- RSI Check ---
+    rsi_period = current_app_settings.get('app_atr_period_sl_tp', 14) # Using existing ATR period for RSI for now
+    rsi_values = calculate_rsi(klines_df.copy(), period=rsi_period, column='close') # calculate_rsi is from app.py
+    
+    if rsi_values is None or rsi_values.empty or pd.isna(rsi_values.iloc[-1]):
+        reason = "RSI calculation failed or unavailable."
+        print(f"{log_prefix} {reason}")
+        return False, reason
+    
+    current_rsi = rsi_values.iloc[-1]
+    
+    if side == "long":
+        min_rsi_long = current_app_settings.get('app_rsi_min_long', 0.0)
+        max_rsi_long = current_app_settings.get('app_rsi_max_long', 70.0)
+        if not (min_rsi_long <= current_rsi <= max_rsi_long):
+            reason = f"RSI ({current_rsi:.2f}) out of bounds for LONG (Min: {min_rsi_long}, Max: {max_rsi_long})."
+            print(f"{log_prefix} {reason}")
+            return False, reason
+    elif side == "short":
+        min_rsi_short = current_app_settings.get('app_rsi_min_short', 30.0)
+        max_rsi_short = current_app_settings.get('app_rsi_max_short', 100.0)
+        if not (min_rsi_short <= current_rsi <= max_rsi_short):
+            reason = f"RSI ({current_rsi:.2f}) out of bounds for SHORT (Min: {min_rsi_short}, Max: {max_rsi_short})."
+            print(f"{log_prefix} {reason}")
+            return False, reason
+    
+    print(f"{log_prefix} RSI Check PASSED: {current_rsi:.2f}")
+
+    # --- Volume Check (already done in app_process_symbol_for_signal, but can be centralized here) ---
+    # This part is redundant if the call to this function is placed after the volume check in app_process_symbol_for_signal.
+    # However, for true centralization, it should be here. Assuming it might be called independently or volume check moved here.
+    min_vol_spike_ratio_setting = current_app_settings.get('app_min_volume_spike_ratio', 1.5)
+    vol_spike_feat_name = 'volume_spike_vs_avg'
+    
+    current_vol_spike = np.nan
+    if live_pivot_features is not None and vol_spike_feat_name in live_pivot_features:
+        current_vol_spike = live_pivot_features[vol_spike_feat_name]
+    
+    if pd.isna(current_vol_spike):
+        if min_vol_spike_ratio_setting > 0: # Only fail if a positive threshold is expected
+            reason = f"Volume spike value is NaN (Threshold: {min_vol_spike_ratio_setting})."
+            print(f"{log_prefix} {reason}")
+            return False, reason
+    elif current_vol_spike < min_vol_spike_ratio_setting:
+        reason = f"Volume spike ({current_vol_spike:.2f}) below threshold ({min_vol_spike_ratio_setting})."
+        print(f"{log_prefix} {reason}")
+        return False, reason
+        
+    print(f"{log_prefix} Volume Spike Check PASSED (or already passed): {current_vol_spike:.2f} >= {min_vol_spike_ratio_setting}")
+    
+    # --- Trend Check ---
+    # The primary trend/setup confirmation comes from ML model scores (p_swing_score_live, p_profit_live).
+    # This function is called *after* pivot model score is checked.
+    # If p_swing_score_live was too low, app_process_symbol_for_signal would have already returned.
+    # So, "Trend couldn't be identified (ML score pending/low)" due to pivot score is not applicable here.
+    # If this function is called, it means the pivot model part of the "trend" was okay.
+    # We could add a placeholder reason if we expect more rule-based trend checks here later.
+    # For now, if RSI and Volume pass, this pre-check is okay regarding trend from its perspective.
+    # print(f"{log_prefix} Trend Check (ML Pivot score already passed). OK.")
+
+    return True, "OK"
+# --- End Pre-Signal Condition Checks ---
+
+
 def app_trading_signal_loop(current_app_settings: dict, pivot_model_loaded, entry_model_loaded, current_best_hyperparams: dict):
     """
     Main continuous loop for live trading or signal generation.
@@ -2562,6 +2928,9 @@ def app_trading_signal_loop(current_app_settings: dict, pivot_model_loaded, entr
                  # If `app_process_symbol_for_signal` were to add signals to a list for tracking,
                  # a `monitor_app_signals` function would go here.
                  pass
+            
+            # Save decision log periodically (e.g., every cycle if new entries, or based on buffer)
+            save_decision_log_to_csv() # Will save if buffer is full or if forced (not forced here)
 
 
             # Loop delay
@@ -2585,8 +2954,9 @@ def app_trading_signal_loop(current_app_settings: dict, pivot_model_loaded, entr
         error_message = f"🆘 CRITICAL ERROR in AppTradingLoop 🆘\nSymbol: {symbol_to_trade if 'symbol_to_trade' in locals() else 'N/A'}\nError: {str(e)[:1000]}"
         send_app_telegram_message(error_message) # Uses global app_trading_configs for token/chat_id
     finally:
-        print(f"{log_prefix} Trading/signal loop stopped.")
-        # Potential cleanup logic here if needed (e.g. ensuring client connections are closed if managed locally)
+        print(f"{log_prefix} Trading/signal loop stopped. Saving final decision log...")
+        save_decision_log_to_csv(force_save=True) # Force save any remaining entries on shutdown
+        # Potential cleanup logic here if needed
 
 # --- Main Orchestration & Startup Logic ---
 def start_app_main_flow():
@@ -3083,11 +3453,20 @@ def simulate_fib_entries(df, atr_col_name): # Added atr_col_name
     df['tp1_price_sim'] = np.nan
     df['tp2_price_sim'] = np.nan
     df['tp3_price_sim'] = np.nan
+    # New columns for detailed trade data
+    df['trade_direction_sim'] = None # "long" or "short"
+    df['entry_bar_idx_sim'] = pd.NA # Bar index of entry
+    df['exit_bar_idx_sim'] = pd.NA   # Bar index of exit
+    df['exit_price_sim'] = np.nan    # Actual exit price
+    df['r_multiple_sim'] = np.nan    # P&L in R-multiples
+    df['duration_sim'] = pd.NA       # Duration in bars
+
 
     # --- Parameters for Time Exit ---
     # Default max_holding_bars, can be made a parameter of simulate_fib_entries if needed for tuning
     MAX_HOLDING_BARS_DEFAULT = 75 # Example: approx 3 days on 15min chart if continuous trading
                                   # This should ideally be passed as an argument or tuned.
+    # MAX_HOLDING_BARS_DEFAULT = 100 # As used in loop condition below, ensure consistency or pass as param
 
     # Ensure the dynamic ATR column (atr_col_name) is present.
     if atr_col_name not in df.columns:
@@ -3167,62 +3546,106 @@ def simulate_fib_entries(df, atr_col_name): # Added atr_col_name
         df.loc[i, 'tp1_price_sim'] = tp1_price
         df.loc[i, 'tp2_price_sim'] = tp2_price
         df.loc[i, 'tp3_price_sim'] = tp3_price
+        df.loc[i, 'trade_direction_sim'] = "long" if is_long_trade else "short"
 
-        # Simulate trade progression in subsequent bars
-        outcome = 0 # Default to stopped-out
+        # Simulate trade progression
+        outcome = -1 # Default to No Entry/Unresolved
+        final_exit_price = np.nan
+        initial_risk_per_unit = abs(entry_price - sl_price) if entry_price != sl_price else np.nan
+        r_multiple = np.nan
+        
         entered_trade = False
+        entry_bar_k = -1
+        exit_bar_k = -1
+
         for k in range(i + 1, len(df)):
+            exit_bar_k = k # Tentative exit bar, updated if SL/TP hit earlier
             bar_low = df['low'].iloc[k]
             bar_high = df['high'].iloc[k]
 
-            if is_long_trade:
-                if not entered_trade and bar_low <= entry_price: # Entry triggered
+            # Entry Logic
+            if not entered_trade:
+                if is_long_trade and bar_low <= entry_price:
                     entered_trade = True
-                if entered_trade:
-                    if bar_low <= sl_price: # Stop loss hit
-                        outcome = 0
-                        break
-                    if bar_high >= tp3_price: # TP3 hit
-                        outcome = 3
-                        break
-                    if bar_high >= tp2_price and outcome < 2: # TP2 hit
-                        outcome = 2
-                    if bar_high >= tp1_price and outcome < 1: # TP1 hit
-                        outcome = 1
-            else: # Short trade
-                if not entered_trade and bar_high >= entry_price: # Entry triggered
+                    entry_bar_k = k
+                    # Actual entry is 'entry_price', not bar_low, for simulation consistency
+                elif not is_long_trade and bar_high >= entry_price:
                     entered_trade = True
-                if entered_trade:
-                    if bar_high >= sl_price: # Stop loss hit
+                    entry_bar_k = k
+            
+            if entered_trade:
+                # Exit Logic
+                if is_long_trade:
+                    if bar_low <= sl_price: # SL Hit
                         outcome = 0
-                        break
-                    if bar_low <= tp3_price: # TP3 hit
+                        final_exit_price = sl_price
+                        break 
+                    if bar_high >= tp3_price: # TP3 Hit
                         outcome = 3
+                        final_exit_price = tp3_price
                         break
-                    if bar_low <= tp2_price and outcome < 2: # TP2 hit
+                    if bar_high >= tp2_price and outcome < 2: # TP2 Hit (potentially, can still hit TP3)
                         outcome = 2
-                    if bar_low <= tp1_price and outcome < 1: # TP1 hit
+                        final_exit_price = tp2_price # Tentative exit if TP3 not hit
+                    if bar_high >= tp1_price and outcome < 1: # TP1 Hit
                         outcome = 1
-            # What if trade doesn't hit SL or TP within a certain number of bars?
-            # For now, assume it resolves or we'd need a max trade duration.
-            if k > i + 100 and entered_trade and outcome == 0 : # Max holding period, still SL if no TP
-                 # If no TP hit after X bars, and not SL, consider it unresolved or some default.
-                 # For this labeling, if it hasn't hit SL or TP, it might be considered SL if not exited.
-                 # This part needs refinement based on strategy rules (e.g., time-based exit).
-                 # For now, if it doesn't hit a TP and is still open, it's not counted as a win.
-                 # If it hits SL, it's 0. If it hits TPs, it's 1,2,3.
-                 # If it's still open after many bars without hitting SL, it's still outcome 0 for this labeling.
-                 pass
+                        final_exit_price = tp1_price # Tentative exit
+                else: # Short trade
+                    if bar_high >= sl_price: # SL Hit
+                        outcome = 0
+                        final_exit_price = sl_price
+                        break
+                    if bar_low <= tp3_price: # TP3 Hit
+                        outcome = 3
+                        final_exit_price = tp3_price
+                        break
+                    if bar_low <= tp2_price and outcome < 2: # TP2 Hit
+                        outcome = 2
+                        final_exit_price = tp2_price
+                    if bar_low <= tp1_price and outcome < 1: # TP1 Hit
+                        outcome = 1
+                        final_exit_price = tp1_price
+                
+                # Max Holding Period Check (if trade is still open)
+                # Note: k is 0-indexed from start of df, i is pivot index.
+                # entry_bar_k is also 0-indexed from start of df.
+                # Duration is (k - entry_bar_k + 1) bars if k is current bar.
+                if entry_bar_k != -1 and (k - entry_bar_k) >= MAX_HOLDING_BARS_DEFAULT:
+                    if outcome <= 0: # If no TP hit yet, exit at current bar's close as SL
+                        outcome = 0 # Consider it a time-based stop
+                        final_exit_price = df['close'].iloc[k]
+                    # If a TP was hit (outcome > 0), it would have broken or will break above.
+                    # If it hit TP1/TP2 and then time exit, final_exit_price is already set to that TP.
+                    break 
+            
+            # If trade not entered yet and current bar is too far from pivot (e.g., > N bars, maybe 5-10)
+            # then consider it a missed entry.
+            if not entered_trade and (k > i + 10): # Example: if entry not triggered within 10 bars of pivot
+                outcome = -1 # Explicitly mark as no entry
+                break
 
-
-        if entered_trade: # Only record outcome if trade was entered
+        if entered_trade:
             df.loc[i, 'trade_outcome'] = outcome
-        else: # Trade not triggered
-            df.loc[i, 'trade_outcome'] = -1 # Reset to -1 if entry not triggered
+            df.loc[i, 'entry_bar_idx_sim'] = entry_bar_k
+            df.loc[i, 'exit_bar_idx_sim'] = exit_bar_k # k at break or end of loop
+            df.loc[i, 'exit_price_sim'] = final_exit_price
+            df.loc[i, 'duration_sim'] = exit_bar_k - entry_bar_k + 1 if entry_bar_k != -1 and exit_bar_k != -1 else pd.NA
+            
+            if pd.notna(initial_risk_per_unit) and initial_risk_per_unit > 0 and pd.notna(final_exit_price):
+                if is_long_trade:
+                    r_multiple = (final_exit_price - entry_price) / initial_risk_per_unit
+                else: # Short
+                    r_multiple = (entry_price - final_exit_price) / initial_risk_per_unit
+                df.loc[i, 'r_multiple_sim'] = r_multiple
+            else: # If risk is zero or exit price is NaN (e.g. not entered)
+                df.loc[i, 'r_multiple_sim'] = 0.0 if outcome == 0 else np.nan # 0R for SL if risk was 0, else NaN
+        else:
+            df.loc[i, 'trade_outcome'] = -1 # No entry triggered or resolved
             entries_not_triggered +=1
+            # Other sim fields remain NaN/None
 
     print(f"DEBUG (simulate_fib_entries): Attempted {simulated_trades} simulations. "
-          f"Skipped for bad ATR: {skipped_due_to_bad_atr}. Entries not triggered: {entries_not_triggered}.")
+          f"Skipped for bad ATR: {skipped_due_to_bad_atr}. Entries not triggered/resolved: {entries_not_triggered}.")
     return df
 
 # --- 2. Feature Engineering ---
@@ -3477,12 +3900,18 @@ def train_pivot_model(X_train, y_train, X_val, y_val, model_type='lgbm', **kwarg
     print(f"Pivot Model ({model_type}) Validation:")
     print(f"  Precision (High): {precision_high:.3f}, Recall (High): {recall_high:.3f}")
     print(f"  Precision (Low): {precision_low:.3f}, Recall (Low): {recall_low:.3f}")
-    # print(confusion_matrix(y_val, preds_val))
-    return model
+    
+    pivot_val_metrics = {
+        "precision_high": precision_high, "recall_high": recall_high,
+        "precision_low": precision_low, "recall_low": recall_low,
+        # Add F1 or other metrics if needed
+    }
+    # print(confusion_matrix(y_val, preds_val)) # Keep for debug if needed
+    return model, pivot_val_metrics
 
 def train_entry_model(X_train, y_train, X_val, y_val, model_type='lgbm', **kwargs):
-    """Trains entry profitability model, accepting kwargs for model parameters."""
-    # y_train is currently binary (profitable or not) due to objective_optuna's y_entry_train processing.
+    """Trains entry profitability model, accepting kwargs for model parameters.
+       Returns the trained model and its validation metrics."""
     print(f"DEBUG (train_entry_model): Received kwargs: {kwargs}")
 
     model_params = {'class_weight': 'balanced', 'random_state': 42}
@@ -3493,7 +3922,6 @@ def train_entry_model(X_train, y_train, X_val, y_val, model_type='lgbm', **kwarg
         if 'n_estimators' not in model_params: model_params['n_estimators'] = 100
         
         model = lgb.LGBMClassifier(**model_params)
-        # Fit with the y_train (binary) and y_val (binary)
         model.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[early_stopping(stopping_rounds=10, verbose=-1)])
     elif model_type == 'rf':
         rf_valid_keys = ['n_estimators', 'max_depth', 'min_samples_split', 'min_samples_leaf', 'max_features']
@@ -3507,8 +3935,23 @@ def train_entry_model(X_train, y_train, X_val, y_val, model_type='lgbm', **kwarg
     else:
         raise ValueError("Unsupported model type for entry evaluation.")
     
-    print(f"Entry Model ({model_type}) trained (y_train shape: {y_train.shape}, unique values: {np.unique(y_train)})")
-    return model
+    # Evaluate (example for binary classification)
+    preds_val_entry = model.predict(X_val)
+    # y_val is binary (0 for not profitable, 1 for profitable)
+    precision_profit = precision_score(y_val, preds_val_entry, pos_label=1, zero_division=0)
+    recall_profit = recall_score(y_val, preds_val_entry, pos_label=1, zero_division=0)
+    precision_not_profit = precision_score(y_val, preds_val_entry, pos_label=0, zero_division=0)
+    recall_not_profit = recall_score(y_val, preds_val_entry, pos_label=0, zero_division=0)
+
+    print(f"Entry Model ({model_type}) Validation (y_val shape: {y_val.shape}, unique: {np.unique(y_val)}):")
+    print(f"  Precision (Profitable): {precision_profit:.3f}, Recall (Profitable): {recall_profit:.3f}")
+    print(f"  Precision (Not Profitable): {precision_not_profit:.3f}, Recall (Not Profitable): {recall_not_profit:.3f}")
+
+    entry_val_metrics = {
+        "precision_profit": precision_profit, "recall_profit": recall_profit,
+        "precision_not_profit": precision_not_profit, "recall_not_profit": recall_not_profit
+    }
+    return model, entry_val_metrics
 
 
 def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot_features, entry_features_base
@@ -4108,19 +4551,116 @@ def run_backtest_scenario(scenario_name: str, df_processed: pd.DataFrame,
     print(f"  Profit Factor: {profit_factor:.3f}")
     print(f"  Max Drawdown (in R units): {max_drawdown_r:.3f}R")
 
-    # Return a dictionary of results
-    results_dict = {
-        "scenario": scenario_name,
-        "trades": num_trades,
-        "win_rate": win_rate,
-        "avg_r": avg_r,
-        "profit_factor": profit_factor,
-        "max_dd_r": max_drawdown_r,
-        "trade_frequency": trade_frequency,
-        # Potentially add symbol if this function is to be used per symbol for summary
-        # "symbol": df_test.name if hasattr(df_test, 'name') else 'N/A' 
+    # --- Enhanced Data Collection for Return ---
+    per_trade_details_list = []
+    if not final_trades_for_metrics.empty:
+        # Ensure relevant columns from simulate_fib_entries are present
+        # (entry_bar_idx_sim, exit_bar_idx_sim, trade_direction_sim, exit_price_sim, r_multiple_sim)
+        # Also P_swing and P_profit scores need to be aligned with these trades.
+        
+        # Align P_profit scores (p_profit_test_ml) with final_trades_for_metrics
+        # This assumes final_trades_for_metrics is a subset of potential_pivots_ml,
+        # and p_profit_test_ml was calculated on potential_pivots_ml.
+        # We need to ensure correct indexing if they are not directly aligned.
+        # For "Full ML Pipeline", final_trades_for_metrics is potential_pivots_ml[p_profit_test_ml >= profit_threshold]
+        # So, we can add p_profit_test_ml as a column to potential_pivots_ml first.
+        
+        # This section needs careful alignment of P_swing and P_profit scores with the final trades.
+        # 'P_swing' is already in df_test, so it's in final_trades_for_metrics.
+        # For 'P_profit', it's calculated on X_entry_test_ml (derived from potential_pivots_ml).
+        # We need to map these scores back or ensure they are columns in final_trades_for_metrics.
+        
+        # Let's assume 'P_swing' is available. For 'P_profit', if scenario is "Full ML Pipeline",
+        # we can try to add it.
+        temp_final_trades = final_trades_for_metrics.copy()
+        if scenario_name == "Full ML Pipeline" and 'p_profit_test_ml' in locals() and len(p_profit_test_ml) == len(X_entry_test_ml):
+             # This assumes X_entry_test_ml has the same index as potential_pivots_ml
+             # And final_trades_for_metrics is a filtered version of potential_pivots_ml
+             if X_entry_test_ml.index.equals(potential_pivots_ml.index): # Check index alignment
+                 potential_pivots_ml['P_profit_score_calc'] = p_profit_test_ml
+                 # Merge this back to temp_final_trades based on index
+                 temp_final_trades = temp_final_trades.join(potential_pivots_ml[['P_profit_score_calc']])
+
+
+        for idx, trade_row in temp_final_trades.iterrows():
+            details = {
+                "trade_id": idx, # Using DataFrame index as trade_id for this backtest
+                "timestamp_pivot": trade_row.name if isinstance(trade_row.name, pd.Timestamp) else pd.NaT, # Pivot timestamp
+                "symbol": trade_row.get('symbol', 'N/A'), # If 'symbol' column was carried
+                "direction": trade_row.get('trade_direction_sim', ("long" if trade_row.get('is_swing_low') == 1 else "short") if pd.notna(trade_row.get('is_swing_low')) else "N/A"),
+                "entry_price_sim": trade_row.get('entry_price_sim'),
+                "sl_price_sim": trade_row.get('sl_price_sim'),
+                "tp1_price_sim": trade_row.get('tp1_price_sim'),
+                "tp2_price_sim": trade_row.get('tp2_price_sim'),
+                "tp3_price_sim": trade_row.get('tp3_price_sim'),
+                "outcome_label": trade_row.get('trade_outcome'),
+                "exit_price_sim": trade_row.get('exit_price_sim'),
+                "r_multiple": trade_row.get('r_multiple_sim'),
+                "duration_bars": trade_row.get('duration_sim'),
+                "p_swing_score": trade_row.get('P_swing'),
+                "p_profit_score": trade_row.get('P_profit_score_calc', np.nan), # From merged data
+                # Add key feature values (example, customize based on pivot_features list)
+                # This needs pivot_features list to be available here.
+            }
+            # Add first few pivot features as an example
+            for i, feat_name in enumerate(pivot_features[:3]): # Top 3 pivot features
+                 details[f"pivot_feat_{i+1}_{feat_name}"] = trade_row.get(feat_name)
+            
+            per_trade_details_list.append(details)
+    
+    per_trade_details_df = pd.DataFrame(per_trade_details_list)
+
+    # Score Distributions (Simplified for now, can be expanded)
+    score_distributions = {
+        "p_swing_all_considered": df_test['P_swing'].dropna().describe().to_dict() if 'P_swing' in df_test else {},
+        "p_swing_trades_taken": final_trades_for_metrics['P_swing'].dropna().describe().to_dict() if 'P_swing' in final_trades_for_metrics and not final_trades_for_metrics.empty else {}
     }
-    return results_dict
+    if scenario_name == "Full ML Pipeline" and 'p_profit_test_ml' in locals():
+        # Describe p_profit_test_ml (scores for trades considered by entry model)
+        score_distributions["p_profit_all_considered_by_entry_model"] = pd.Series(p_profit_test_ml).dropna().describe().to_dict()
+        # Describe p_profit scores for trades actually taken (those that passed profit_threshold)
+        if 'P_profit_score_calc' in temp_final_trades and not temp_final_trades.empty: # Use the merged P_profit
+             score_distributions["p_profit_trades_taken"] = temp_final_trades['P_profit_score_calc'].dropna().describe().to_dict()
+
+
+    # Segmented Performance (Long/Short)
+    segmented_performance = {}
+    if not final_trades_for_metrics.empty and 'trade_direction_sim' in final_trades_for_metrics.columns:
+        for direction in ['long', 'short']:
+            dir_trades = final_trades_for_metrics[final_trades_for_metrics['trade_direction_sim'] == direction]
+            if not dir_trades.empty:
+                num_dir_trades = len(dir_trades)
+                num_dir_wins = len(dir_trades[dir_trades['trade_outcome'] > 0])
+                dir_win_rate = num_dir_wins / num_dir_trades if num_dir_trades > 0 else 0
+                
+                dir_r_values = dir_trades['r_multiple_sim'].dropna().tolist()
+                dir_avg_r = np.mean(dir_r_values) if dir_r_values else 0
+                dir_profit_sum_r = sum(r for r in dir_r_values if r > 0)
+                dir_loss_sum_r_abs = sum(abs(r) for r in dir_r_values if r < 0)
+                dir_profit_factor = dir_profit_sum_r / dir_loss_sum_r_abs if dir_loss_sum_r_abs > 0 else (dir_profit_sum_r if dir_profit_sum_r > 0 else 0)
+                
+                segmented_performance[direction] = {
+                    "trades": num_dir_trades, "win_rate": dir_win_rate, 
+                    "avg_r": dir_avg_r, "profit_factor": dir_profit_factor
+                }
+    
+    # Base summary metrics
+    summary_metrics_dict = {
+        "scenario": scenario_name, "trades": num_trades, "win_rate": win_rate,
+        "avg_r": avg_r, "profit_factor": profit_factor, "max_dd_r": max_drawdown_r,
+        "trade_frequency": trade_frequency
+    }
+
+    # Combine all results
+    full_results_dict = {
+        "summary_metrics": summary_metrics_dict,
+        "per_trade_details": per_trade_details_df, # This is a DataFrame
+        "score_distributions": score_distributions, # Dict of Series.describe() dicts
+        "equity_curve_r": equity_curve_r, # List
+        "segmented_performance": segmented_performance # Dict of dicts
+        # "symbol_context": df_test.name if hasattr(df_test, 'name') else 'N/A' # Already in summary_metrics
+    }
+    return full_results_dict
 
 # --- Backtest Summary Generation ---
 def generate_training_backtest_summary(df_processed_full_dataset, # This is the full dataset used for training/val/test split
@@ -4193,58 +4733,182 @@ def generate_training_backtest_summary(df_processed_full_dataset, # This is the 
         print(f"{log_prefix_summary} No results generated for summary.")
         return
 
-    # Display the summary table (implement display_summary_table next)
-    summary_csv_path = "training_backtest_summary.csv"
-    display_summary_table(all_scenario_results, log_prefix_summary, save_to_csv_path=summary_csv_path)
+    # --- Collect Feature Importances ---
+    feature_importances_data = {}
+    if pivot_model and hasattr(pivot_model, 'feature_importances_'):
+        feature_importances_data['pivot_model'] = pd.DataFrame({
+            'feature': pivot_feature_names_list, # These are the features model was trained on
+            'importance': pivot_model.feature_importances_
+        }).sort_values(by='importance', ascending=False)
+
+    if entry_model and hasattr(entry_model, 'feature_importances_'):
+        # Construct the full list of features the entry model was trained on
+        # entry_features_base_list + P_swing + norm_dist_entry_pivot + norm_dist_entry_sl
+        # This list needs to be consistent with how X_e_train was created in start_app_main_flow
+        # Assuming 'P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl' are standard additions
+        full_entry_feature_names = entry_feature_names_base_list + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']
+        if len(full_entry_feature_names) == len(entry_model.feature_importances_):
+            feature_importances_data['entry_model'] = pd.DataFrame({
+                'feature': full_entry_feature_names,
+                'importance': entry_model.feature_importances_
+            }).sort_values(by='importance', ascending=False)
+        else:
+            print(f"{log_prefix_summary} WARNING: Mismatch in length of entry feature names and importances. Skipping entry model importances.")
+            print(f"  Expected {len(full_entry_feature_names)} features, got {len(entry_model.feature_importances_)} importances.")
+
+    # --- Optuna Best Parameters ---
+    # best_params_from_optuna is already passed in.
+
+    # --- Package all data for display/saving ---
+    # all_scenario_results now contains dictionaries with DataFrames and other structures.
+    # display_summary_table will need to be significantly reworked to handle this.
+    
+    # For now, display_summary_table will just handle the main summary metrics DataFrame.
+    # The more detailed DataFrames (per-trade, feature importances) will be saved to separate CSVs.
+    
+    main_summary_metrics_list = [res['summary_metrics'] for res in all_scenario_results if 'summary_metrics' in res]
+    
+    output_filename_base = "training_summary_output" # Base for multiple files
+
+    display_summary_table(
+        main_summary_metrics_list, 
+        log_prefix_summary, 
+        save_to_csv_path=f"{output_filename_base}_overview.csv",
+        # Pass other data components to be saved separately by display_summary_table
+        all_results_data=all_scenario_results, # Contains everything
+        feature_importances=feature_importances_data,
+        optuna_params=best_params_from_optuna,
+        output_base_filename_for_details=output_filename_base
+    )
     print(f"{log_prefix_summary} --- Training Backtest Summary Generation Complete ---")
 
-def display_summary_table(results_list: list[dict], log_prefix: str = "[SummaryTable]", save_to_csv_path: str = None):
+def display_summary_table(main_summary_list: list[dict], 
+                          log_prefix: str = "[SummaryTable]", 
+                          save_to_csv_path: str = None,
+                          all_results_data: list[dict] = None, # List of full dicts from run_backtest_scenario
+                          feature_importances: dict = None,   # Dict of DataFrames
+                          optuna_params: dict = None,         # Dict
+                          output_base_filename_for_details: str = "training_summary"):
     """
-    Displays a list of backtest result dictionaries as a formatted table.
-    Optionally saves the raw results to a CSV file.
+    Displays the main summary table and saves all detailed components to separate CSV files.
     """
-    if not results_list:
-        print(f"{log_prefix} No results to display.")
+    if not main_summary_list:
+        print(f"{log_prefix} No main summary results to display.")
         return
 
-    df_results = pd.DataFrame(results_list)
+    df_main_summary = pd.DataFrame(main_summary_list)
     
-    # Define desired column order and formatting
-    # (symbol_context was added in generate_training_backtest_summary)
-    columns_ordered = ['symbol_context', 'scenario', 'trades', 'win_rate', 'avg_r', 'profit_factor', 'max_dd_r', 'trade_frequency']
+    columns_ordered = ['scenario', 'trades', 'win_rate', 'avg_r', 'profit_factor', 'max_dd_r', 'trade_frequency']
+    # 'symbol_context' was part of the dict but might not be needed if it's always "UniversalTestSet"
+    # If it varies, it can be added back. For now, focusing on scenario comparison.
     
-    # Filter for existing columns to prevent errors if some are missing
-    display_columns = [col for col in columns_ordered if col in df_results.columns]
-    df_display = df_results[display_columns].copy()
+    display_columns = [col for col in columns_ordered if col in df_main_summary.columns]
+    df_display = df_main_summary[display_columns].copy()
 
-    # Apply formatting for readability
-    if 'win_rate' in df_display:
-        df_display['win_rate'] = df_display['win_rate'].map(lambda x: f"{x:.2%}" if pd.notnull(x) else "N/A")
-    if 'avg_r' in df_display:
-        df_display['avg_r'] = df_display['avg_r'].map(lambda x: f"{x:.2f}R" if pd.notnull(x) else "N/A")
-    if 'profit_factor' in df_display:
-        df_display['profit_factor'] = df_display['profit_factor'].map(lambda x: f"{x:.2f}" if pd.notnull(x) else "N/A")
-    if 'max_dd_r' in df_display:
-        df_display['max_dd_r'] = df_display['max_dd_r'].map(lambda x: f"{x:.2f}R" if pd.notnull(x) else "N/A")
-    if 'trade_frequency' in df_display:
-        df_display['trade_frequency'] = df_display['trade_frequency'].map(lambda x: f"{x:.2f}" if pd.notnull(x) else "N/A")
-    if 'trades' in df_display:
-        df_display['trades'] = df_display['trades'].map(lambda x: f"{int(x)}" if pd.notnull(x) else "N/A")
+    # Apply formatting for console display
+    formatters = {
+        'win_rate': lambda x: f"{x:.2%}" if pd.notnull(x) else "N/A",
+        'avg_r': lambda x: f"{x:.2f}R" if pd.notnull(x) else "N/A",
+        'profit_factor': lambda x: f"{x:.2f}" if pd.notnull(x) else "N/A",
+        'max_dd_r': lambda x: f"{x:.2f}R" if pd.notnull(x) else "N/A",
+        'trade_frequency': lambda x: f"{x:.2f}" if pd.notnull(x) else "N/A",
+        'trades': lambda x: f"{int(x)}" if pd.notnull(x) else "N/A"
+    }
+    for col, func in formatters.items():
+        if col in df_display:
+            df_display[col] = df_display[col].map(func)
 
-    print(f"\n{log_prefix} === Backtest Summary Table ===")
-    # Convert to string and print; using to_string() for better console display
+    print(f"\n{log_prefix} === Main Backtest Summary Overview ===")
     table_string = df_display.to_string(index=False)
     print(table_string)
-    print(f"{log_prefix} ============================\n")
+    print(f"{log_prefix} =====================================\n")
 
-    # Save to CSV if path is provided
+    # Save main summary overview
     if save_to_csv_path:
         try:
-            # Use the original df_results for CSV to keep raw numbers if needed, or df_display for formatted
-            df_results.to_csv(save_to_csv_path, index=False)
-            print(f"{log_prefix} Summary table saved to {save_to_csv_path}")
+            df_main_summary.to_csv(save_to_csv_path, index=False) # Save raw numbers
+            print(f"{log_prefix} Main summary overview saved to {save_to_csv_path}")
         except Exception as e:
-            print(f"{log_prefix} Error saving summary table to CSV '{save_to_csv_path}': {e}")
+            print(f"{log_prefix} Error saving main summary overview to CSV '{save_to_csv_path}': {e}")
+
+    # --- Save Detailed Components ---
+    if all_results_data:
+        for scenario_result in all_results_data:
+            scenario_name_safe = scenario_result.get("summary_metrics",{}).get("scenario","unknown_scenario").replace(" ", "_").lower()
+            
+            # Per-trade details
+            per_trade_df = scenario_result.get("per_trade_details")
+            if per_trade_df is not None and not per_trade_df.empty:
+                trade_details_path = f"{output_base_filename_for_details}_{scenario_name_safe}_per_trade.csv"
+                try:
+                    per_trade_df.to_csv(trade_details_path, index=False)
+                    print(f"{log_prefix} Per-trade details for '{scenario_name_safe}' saved to {trade_details_path}")
+                except Exception as e:
+                    print(f"{log_prefix} Error saving per-trade details for '{scenario_name_safe}': {e}")
+            
+            # Score distributions (example: save P_swing_trades_taken if exists)
+            # This part can be expanded to save all score distribution DataFrames/Series
+            score_dist = scenario_result.get("score_distributions", {})
+            if score_dist:
+                 scores_path = f"{output_base_filename_for_details}_{scenario_name_safe}_score_distributions.json"
+                 try:
+                     # Convert describe() outputs (which might be Series) to dict for JSON
+                     json_compatible_scores = {}
+                     for key, val in score_dist.items():
+                         if isinstance(val, dict): # Already a dict (from describe().to_dict())
+                             json_compatible_scores[key] = val
+                         elif hasattr(val, 'to_dict'): # Pandas Series
+                             json_compatible_scores[key] = val.to_dict()
+                         else:
+                             json_compatible_scores[key] = str(val) # Fallback
+                     with open(scores_path, 'w') as f:
+                         json.dump(json_compatible_scores, f, indent=4)
+                     print(f"{log_prefix} Score distributions for '{scenario_name_safe}' saved to {scores_path}")
+                 except Exception as e:
+                     print(f"{log_prefix} Error saving score distributions for '{scenario_name_safe}': {e}")
+
+            # Equity curve data
+            equity_curve = scenario_result.get("equity_curve_r")
+            if equity_curve:
+                equity_path = f"{output_base_filename_for_details}_{scenario_name_safe}_equity_curve_r.csv"
+                try:
+                    pd.DataFrame(equity_curve, columns=['cumulative_r']).to_csv(equity_path, index_label="trade_num")
+                    print(f"{log_prefix} Equity curve data for '{scenario_name_safe}' saved to {equity_path}")
+                except Exception as e:
+                    print(f"{log_prefix} Error saving equity curve for '{scenario_name_safe}': {e}")
+            
+            # Segmented performance
+            segmented_perf = scenario_result.get("segmented_performance")
+            if segmented_perf:
+                segmented_path = f"{output_base_filename_for_details}_{scenario_name_safe}_segmented_performance.json"
+                try:
+                    with open(segmented_path, 'w') as f:
+                        json.dump(segmented_perf, f, indent=4)
+                    print(f"{log_prefix} Segmented performance for '{scenario_name_safe}' saved to {segmented_path}")
+                except Exception as e:
+                    print(f"{log_prefix} Error saving segmented performance for '{scenario_name_safe}': {e}")
+
+
+    # Feature Importances
+    if feature_importances:
+        for model_name, importance_df in feature_importances.items():
+            if isinstance(importance_df, pd.DataFrame) and not importance_df.empty:
+                fi_path = f"{output_base_filename_for_details}_{model_name}_feature_importances.csv"
+                try:
+                    importance_df.to_csv(fi_path, index=False)
+                    print(f"{log_prefix} Feature importances for '{model_name}' saved to {fi_path}")
+                except Exception as e:
+                    print(f"{log_prefix} Error saving feature importances for '{model_name}': {e}")
+
+    # Optuna Parameters
+    if optuna_params:
+        optuna_path = f"{output_base_filename_for_details}_optuna_best_params.json"
+        try:
+            with open(optuna_path, 'w') as f:
+                json.dump(optuna_params, f, indent=4)
+            print(f"{log_prefix} Optuna best parameters saved to {optuna_path}")
+        except Exception as e:
+            print(f"{log_prefix} Error saving Optuna parameters: {e}")
 
 
 # --- Main Orchestration ---
