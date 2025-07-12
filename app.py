@@ -2498,25 +2498,26 @@ def app_calculate_live_pivot_features(df_live: pd.DataFrame, atr_period: int, pi
     # --- Apply Scaling ---
     # Load the pivot scaler (path should be in app_settings, set during training)
     # Global app_settings should be populated by now.
-    pivot_scaler = None  # Initialize pivot_scaler to None
+    pivot_scaler_loaded = None  # Initialize pivot_scaler_loaded to None
     pivot_scaler_path = app_settings.get("app_pivot_scaler_path")
     if pivot_scaler_path and os.path.exists(pivot_scaler_path):
         try:
-            pivot_scaler = load_model(pivot_scaler_path) # Reusing load_model for scalers
-            if pivot_scaler:  # Check if scaler is loaded successfully
+            pivot_scaler_loaded = load_model(pivot_scaler_path) # Reusing load_model for scalers
+            if pivot_scaler_loaded:  # Check if scaler is loaded successfully
                 # Ensure live_features_series is a DataFrame for scaler
                 live_features_df_for_scaling = pd.DataFrame([live_features_series])
-                scaled_features_array = pivot_scaler.transform(live_features_df_for_scaling)
+                scaled_features_array = pivot_scaler_loaded.transform(live_features_df_for_scaling)
                 live_features_series = pd.Series(scaled_features_array[0], index=live_features_df_for_scaling.columns)
                 print(f"{log_prefix} Live pivot features scaled successfully using {pivot_scaler_path}.")
             else:
                 print(f"{log_prefix} WARNING: Pivot scaler loaded as None from '{pivot_scaler_path}'. Using unscaled features.")
         except Exception as e_scale:
             print(f"{log_prefix} WARNING: Failed to load or apply pivot scaler from '{pivot_scaler_path}': {e_scale}. Using unscaled features.")
-            pivot_scaler = None # Ensure pivot_scaler is None on error
+            pivot_scaler_loaded = None # Ensure pivot_scaler_loaded is None on error
             # Fall through to use unscaled features if scaling fails
     else:
         print(f"{log_prefix} WARNING: Pivot scaler path not found or not configured ('{pivot_scaler_path}'). Using unscaled features for pivot model.")
+        pivot_scaler_loaded = None # Ensure pivot_scaler_loaded is None if path not found
 
 
     if live_features_series is not None and not live_features_series.empty:
@@ -2658,23 +2659,24 @@ def app_calculate_live_entry_features(df_live: pd.DataFrame, atr_period: int, en
     # --- Explicit Logging of Final Feature Vector ---
     log_entry_dict_str = "None or Empty"
     # --- Apply Scaling for Entry Model ---
-    entry_scaler = None  # Initialize entry_scaler to None
+    entry_scaler_loaded = None  # Initialize entry_scaler_loaded to None
     entry_scaler_path = app_settings.get("app_entry_scaler_path")
     if entry_scaler_path and os.path.exists(entry_scaler_path):
         try:
-            entry_scaler = load_model(entry_scaler_path)
-            if entry_scaler:  # Check if scaler is loaded successfully
+            entry_scaler_loaded = load_model(entry_scaler_path)
+            if entry_scaler_loaded:  # Check if scaler is loaded successfully
                 live_entry_features_df_for_scaling = pd.DataFrame([live_features_series])
-                scaled_entry_features_array = entry_scaler.transform(live_entry_features_df_for_scaling)
+                scaled_entry_features_array = entry_scaler_loaded.transform(live_entry_features_df_for_scaling)
                 live_features_series = pd.Series(scaled_entry_features_array[0], index=live_entry_features_df_for_scaling.columns)
                 print(f"{log_prefix} Live entry features scaled successfully using {entry_scaler_path}.")
             else:
                 print(f"{log_prefix} WARNING: Entry scaler loaded as None from '{entry_scaler_path}'. Using unscaled features.")
         except Exception as e_scale_entry:
             print(f"{log_prefix} WARNING: Failed to load or apply entry scaler from '{entry_scaler_path}': {e_scale_entry}. Using unscaled features.")
-            entry_scaler = None # Ensure entry_scaler is None on error
+            entry_scaler_loaded = None # Ensure entry_scaler_loaded is None on error
     else:
         print(f"{log_prefix} WARNING: Entry scaler path not found or not configured ('{entry_scaler_path}'). Using unscaled features for entry model.")
+        entry_scaler_loaded = None # Ensure entry_scaler_loaded is None if path not found
 
 
     if live_features_series is not None and not live_features_series.empty:
@@ -5687,6 +5689,8 @@ def run_backtest_scenario(scenario_name: str, df_processed: pd.DataFrame,
                           pivot_model, entry_model, best_params,
                           pivot_features, entry_features_base,
                           atr_col_name=f'atr_{ATR_PERIOD}',
+                          pivot_scaler = globals().get("pivot_scaler", None),
+                          entry_scaler = globals().get("entry_scaler", None),
                           use_full_df_as_test: bool = False):
     """
     Runs a backtest for a specific scenario (Rule-based, ML Stage 1, Full ML).
@@ -5708,7 +5712,7 @@ def run_backtest_scenario(scenario_name: str, df_processed: pd.DataFrame,
         print(f"No data in (derived) test set for {scenario_name} backtest.")
         return {"scenario": scenario_name, "trades": 0, "win_rate": 0, "avg_r": 0, "profit_factor": 0, "max_dd_r": 0, "trade_frequency":0}
 
-    # Ensure df_test has a DatetimeIndex from 'timestamp' column for period calculation
+    # Ensure df_test has a DatetimeIndex from 'timestamp' column for period calculation 
     if 'timestamp' in df_test.columns:
         df_test['timestamp'] = pd.to_datetime(df_test['timestamp'])
         df_test.set_index('timestamp', inplace=True)
@@ -5732,7 +5736,7 @@ def run_backtest_scenario(scenario_name: str, df_processed: pd.DataFrame,
             return {"scenario": scenario_name, "trades": 0, "win_rate": 0, "avg_r": 0, "profit_factor": 0, "max_dd_r": 0, "trade_frequency":0}
 
         X_pivot_test_raw = df_test[pivot_features].fillna(-1)
-        if pivot_scaler:
+        if 'pivot_scaler' in locals():
             try:
                 X_pivot_test = pivot_scaler.transform(X_pivot_test_raw)
             except Exception as e:
@@ -5759,7 +5763,7 @@ def run_backtest_scenario(scenario_name: str, df_processed: pd.DataFrame,
             return {"scenario": scenario_name, "trades": 0, "win_rate": 0, "avg_r": 0, "profit_factor": 0, "max_dd_r": 0, "trade_frequency":0}
 
         X_pivot_test_full_ml_raw = df_test[pivot_features].fillna(-1)
-        if pivot_scaler:
+        if 'pivot_scaler' in locals():
             try:
                 X_pivot_test_full_ml = pivot_scaler.transform(X_pivot_test_full_ml_raw)
             except Exception as e:
@@ -5794,7 +5798,7 @@ def run_backtest_scenario(scenario_name: str, df_processed: pd.DataFrame,
             print("Full ML: No data for entry model evaluation.")
             return {"scenario": scenario_name, "trades": 0, "win_rate": 0, "avg_r": 0, "profit_factor": 0, "max_dd_r": 0, "trade_frequency":0}
 
-        if entry_scaler:
+        if 'entry_scaler' in locals():
             try:
                 X_entry_test_ml = entry_scaler.transform(X_entry_test_ml_raw)
             except Exception as e:
@@ -5802,12 +5806,13 @@ def run_backtest_scenario(scenario_name: str, df_processed: pd.DataFrame,
                 X_entry_test_ml = X_entry_test_ml_raw.to_numpy()
         else:
             X_entry_test_ml = X_entry_test_ml_raw.to_numpy()
-            
+
         p_profit_test_ml = entry_model.predict_proba(X_entry_test_ml)[:, 1]
         final_trades_for_metrics = potential_pivots_ml[p_profit_test_ml >= profit_threshold].copy()
         print(f"Full ML: Identified {len(final_trades_for_metrics)} full ML pipeline trade setups.")
     else:
         raise ValueError(f"Unknown scenario: {scenario_name}")
+
 
     if final_trades_for_metrics.empty:
         print(f"{scenario_name}: No trades to evaluate metrics for.")
