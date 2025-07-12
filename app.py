@@ -2430,12 +2430,22 @@ def app_calculate_live_pivot_features(df_live: pd.DataFrame, atr_period: int, pi
     # if 'is_swing_high' not in df.columns: df['is_swing_high'] = 0 # No longer needed here
     # if 'is_swing_low' not in df.columns: df['is_swing_low'] = 0 # No longer needed here
     
+    # Add symbol context to df.name if it doesn't exist, for engineer_pivot_features logging
+    symbol_for_logging = "UnknownSymbol"
+    if hasattr(df, 'name') and df.name: # If df already has a name (e.g., from get_processed_data_for_symbol)
+        symbol_for_logging = df.name
+    elif 'symbol' in df.columns and not df['symbol'].empty: # Check if 'symbol' column exists and is not empty
+        symbol_for_logging = df['symbol'].iloc[0] # Use the first symbol found in the column
+        df.name = symbol_for_logging # Assign to df.name for consistency if engineer_pivot_features uses it
+
+    print(f"{log_prefix} Calling engineer_pivot_features for symbol: {symbol_for_logging} (ATR: {atr_col_name})")
+    
     try:
         # Note: Optuna and final training use force_live_bars_since_pivot_calc=True.
         # Live prediction should also use this for consistency if that feature is important.
         df_with_features, calculated_feature_names = engineer_pivot_features(df, atr_col_name=atr_col_name, force_live_bars_since_pivot_calc=True)
     except RuntimeError as e:
-        print(f"{log_prefix} Error during engineer_pivot_features: {e}")
+        print(f"{log_prefix} Error during engineer_pivot_features for {symbol_for_logging}: {e}")
         return None
 
     if df_with_features is None: # If engineer_pivot_features returns None explicitly
@@ -2485,6 +2495,25 @@ def app_calculate_live_pivot_features(df_live: pd.DataFrame, atr_period: int, pi
     # --- Enhanced Logging for Final Selected Live Features ---
     # The plan requested .to_dict() for logging.
     log_dict_str = "None or Empty"
+    # --- Apply Scaling ---
+    # Load the pivot scaler (path should be in app_settings, set during training)
+    # Global app_settings should be populated by now.
+    pivot_scaler_path = app_settings.get("app_pivot_scaler_path")
+    if pivot_scaler_path and os.path.exists(pivot_scaler_path):
+        try:
+            pivot_scaler = load_model(pivot_scaler_path) # Reusing load_model for scalers
+            # Ensure live_features_series is a DataFrame for scaler
+            live_features_df_for_scaling = pd.DataFrame([live_features_series])
+            scaled_features_array = pivot_scaler.transform(live_features_df_for_scaling)
+            live_features_series = pd.Series(scaled_features_array[0], index=live_features_df_for_scaling.columns)
+            print(f"{log_prefix} Live pivot features scaled successfully using {pivot_scaler_path}.")
+        except Exception as e_scale:
+            print(f"{log_prefix} WARNING: Failed to load or apply pivot scaler from '{pivot_scaler_path}': {e_scale}. Using unscaled features.")
+            # Fall through to use unscaled features if scaling fails
+    else:
+        print(f"{log_prefix} WARNING: Pivot scaler path not found or not configured ('{pivot_scaler_path}'). Using unscaled features for pivot model.")
+
+
     if live_features_series is not None and not live_features_series.empty:
         try:
             log_dict_str = str({k: f"{v:.4f}" if isinstance(v, float) else v for k, v in live_features_series.to_dict().items()})
@@ -2623,6 +2652,21 @@ def app_calculate_live_entry_features(df_live: pd.DataFrame, atr_period: int, en
 
     # --- Explicit Logging of Final Feature Vector ---
     log_entry_dict_str = "None or Empty"
+    # --- Apply Scaling for Entry Model ---
+    entry_scaler_path = app_settings.get("app_entry_scaler_path")
+    if entry_scaler_path and os.path.exists(entry_scaler_path):
+        try:
+            entry_scaler = load_model(entry_scaler_path)
+            live_entry_features_df_for_scaling = pd.DataFrame([live_features_series])
+            scaled_entry_features_array = entry_scaler.transform(live_entry_features_df_for_scaling)
+            live_features_series = pd.Series(scaled_entry_features_array[0], index=live_entry_features_df_for_scaling.columns)
+            print(f"{log_prefix} Live entry features scaled successfully using {entry_scaler_path}.")
+        except Exception as e_scale_entry:
+            print(f"{log_prefix} WARNING: Failed to load or apply entry scaler from '{entry_scaler_path}': {e_scale_entry}. Using unscaled features.")
+    else:
+        print(f"{log_prefix} WARNING: Entry scaler path not found or not configured ('{entry_scaler_path}'). Using unscaled features for entry model.")
+
+
     if live_features_series is not None and not live_features_series.empty:
         try:
             log_entry_dict_str = str({k: f"{v:.4f}" if isinstance(v, float) else v for k, v in live_features_series.to_dict().items()})
@@ -3992,23 +4036,31 @@ def start_app_main_flow():
             raw_pivot_args = {k.replace('pivot_', ''):v for k,v in best_hyperparams.items() if k.startswith('pivot_')}
             pivot_model_args = {k: v for k, v in raw_pivot_args.items() if k in valid_pivot_model_arg_names}
             
-            print(f"DEBUG: Args passed to train_pivot_model: {pivot_model_args}") # Log the actual args
-            # Train pivot model with resampled data
-            temp_pivot_model, _ = train_pivot_model(X_p_train_resampled, y_p_train_resampled, 
-                                                    X_p_train_resampled, y_p_train_resampled, # Using resampled for validation during this fit
+            # --- Pivot Model Scaling & Training (Final) ---
+            final_pivot_scaler = StandardScaler()
+            X_p_train_resampled_scaled = final_pivot_scaler.fit_transform(X_p_train_resampled)
+            # Save the scaler
+            pivot_scaler_basename = "pivot_scaler.joblib" # Define a basename for the scaler
+            current_version_pivot_scaler_path = os.path.join(current_versioned_artifact_dir, pivot_scaler_basename)
+            save_model(final_pivot_scaler, current_version_pivot_scaler_path)
+            app_settings["app_pivot_scaler_path"] = current_version_pivot_scaler_path # Store path in settings
+            print(f"Pivot scaler for '{current_study_version_for_loop}' saved to {current_version_pivot_scaler_path}")
+
+            print(f"DEBUG: Args passed to train_pivot_model (final): {pivot_model_args}")
+            temp_pivot_model, _ = train_pivot_model(X_p_train_resampled_scaled, y_p_train_resampled, 
+                                                    X_p_train_resampled_scaled, y_p_train_resampled, # Using scaled for validation
                                                     **pivot_model_args)
             if temp_pivot_model is None: print("CRITICAL: Pivot model training failed. Exiting."); sys.exit(1)
             
-            # Save model to versioned path
-            os.makedirs(current_versioned_artifact_dir, exist_ok=True) # Ensure directory exists
+            os.makedirs(current_versioned_artifact_dir, exist_ok=True)
             save_model(temp_pivot_model, current_version_pivot_path) 
-            app_settings["app_pivot_model_path"] = current_version_pivot_path # Update setting to new path
+            app_settings["app_pivot_model_path"] = current_version_pivot_path
             universal_pivot_model = temp_pivot_model
             print(f"Pivot model for '{current_study_version_for_loop}' saved to {current_version_pivot_path}")
 
-            # For calculating P_swing on the original (non-resampled) df_final_train for entry candidate filtering:
-            # This is important because we want to evaluate P_swing on the original data distribution.
-            p_swing_on_original_train_data = temp_pivot_model.predict_proba(X_p_train) # X_p_train is original
+            # For P_swing on original data, scale X_p_train (non-resampled) with the fitted pivot_scaler
+            X_p_train_scaled_for_pswing = final_pivot_scaler.transform(X_p_train)
+            p_swing_on_original_train_data = temp_pivot_model.predict_proba(X_p_train_scaled_for_pswing)
             df_final_train['P_swing'] = np.max(p_swing_on_original_train_data[:,1:], axis=1)
             
             # Filter for entry candidates
@@ -4030,27 +4082,39 @@ def start_app_main_flow():
                 
                 full_entry_feats = final_entry_base_feats_to_use + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']
                 X_e_train = entry_candidates[full_entry_feats].fillna(-1)
-                y_e_train = (entry_candidates['trade_outcome'] > 0).astype(int)
+                y_e_train = (entry_candidates['trade_outcome'] > 0).astype(int) # Target variable for entry model
                 
-                if len(X_e_train) > 0 and len(y_e_train.unique()) > 1:
+                if len(X_e_train) > 0 and len(y_e_train.unique()) > 1: # Ensure data and class diversity
+                    # --- Entry Model Scaling & Training (Final) ---
+                    final_entry_scaler = StandardScaler()
+                    X_e_train_scaled = final_entry_scaler.fit_transform(X_e_train)
+                    # Save the entry scaler
+                    entry_scaler_basename = "entry_scaler.joblib"
+                    current_version_entry_scaler_path = os.path.join(current_versioned_artifact_dir, entry_scaler_basename)
+                    save_model(final_entry_scaler, current_version_entry_scaler_path)
+                    app_settings["app_entry_scaler_path"] = current_version_entry_scaler_path # Store path
+                    print(f"Entry scaler for '{current_study_version_for_loop}' saved to {current_version_entry_scaler_path}")
+
                     valid_entry_model_arg_names = ['model_type', 'num_leaves', 'learning_rate', 'max_depth', 'n_estimators']
                     raw_entry_args = {k.replace('entry_', ''):v for k,v in best_hyperparams.items() if k.startswith('entry_')}
                     entry_model_args = {k: v for k, v in raw_entry_args.items() if k in valid_entry_model_arg_names}
                     
-                    print(f"DEBUG: Args passed to train_entry_model: {entry_model_args}")
-                    temp_entry_model, _ = train_entry_model(X_e_train, y_e_train, X_e_train, y_e_train, **entry_model_args)
+                    print(f"DEBUG: Args passed to train_entry_model (final): {entry_model_args}")
+                    # Train with scaled data
+                    temp_entry_model, _ = train_entry_model(X_e_train_scaled, y_e_train, 
+                                                            X_e_train_scaled, y_e_train, # Using scaled for validation
+                                                            **entry_model_args)
                     if temp_entry_model is None: 
-                        print(f"{log_prefix} Entry model training returned None. Marking as not trained."); 
-                        universal_entry_model = None
+                        print(f"{log_prefix} Entry model training returned None. Marking as not trained.")
+                        universal_entry_model = None # Ensure it's None
                     else: 
-                        # Save entry model to versioned path
-                        os.makedirs(current_versioned_artifact_dir, exist_ok=True) # Ensure directory exists
+                        os.makedirs(current_versioned_artifact_dir, exist_ok=True)
                         save_model(temp_entry_model, current_version_entry_path)
-                        app_settings["app_entry_model_path"] = current_version_entry_path # Update setting
+                        app_settings["app_entry_model_path"] = current_version_entry_path
                         universal_entry_model = temp_entry_model
                         print(f"{log_prefix} Entry model for '{current_study_version_for_loop}' trained and saved to {current_version_entry_path}.")
                 else:
-                    print(f"{log_prefix} Entry model training SKIPPED: Insufficient data diversity for training. X_e_train length: {len(X_e_train)}, y_e_train unique values: {y_e_train.unique() if len(X_e_train) > 0 else 'N/A'}.")
+                    print(f"{log_prefix} Entry model training SKIPPED: Insufficient data or class diversity for training. X_e_train length: {len(X_e_train)}, y_e_train unique values: {y_e_train.unique() if len(X_e_train) > 0 else 'N/A'}.")
                     universal_entry_model = None # Ensure it's None if skipped
             else:
                 print(f"{log_prefix} Entry model training SKIPPED: Not enough candidates ({len(entry_candidates)}) after pivot filter (P_swing >= {p_swing_thresh_for_entry_candidates:.2f}). Minimum required: {MIN_ENTRY_CANDIDATES}.")
@@ -4069,14 +4133,33 @@ def start_app_main_flow():
                final_pivot_feats_to_use is not None and \
                final_entry_base_feats_to_use is not None and \
                app_settings is not None:
+
+                # Load the scalers that were just saved during the final training phase
+                pivot_scaler_path = app_settings.get("app_pivot_scaler_path")
+                entry_scaler_path = app_settings.get("app_entry_scaler_path")
+                
+                final_pivot_scaler_loaded = None
+                if pivot_scaler_path and os.path.exists(pivot_scaler_path):
+                    final_pivot_scaler_loaded = load_model(pivot_scaler_path)
+                else:
+                    print(f"WARNING: Pivot scaler not found at '{pivot_scaler_path}' for summary generation.")
+
+                final_entry_scaler_loaded = None
+                if entry_scaler_path and os.path.exists(entry_scaler_path):
+                    final_entry_scaler_loaded = load_model(entry_scaler_path)
+                else:
+                    print(f"WARNING: Entry scaler not found at '{entry_scaler_path}' for summary generation.")
+
                 generate_training_backtest_summary(
                     df_processed_full_dataset=df_final_train, 
                     pivot_model=universal_pivot_model,
                     entry_model=universal_entry_model,
-                    best_params_from_optuna=best_hyperparams, # This contains all tuned params including thresholds
-                    pivot_feature_names_list=final_pivot_feats_to_use, # Features used for pivot model
-                    entry_feature_names_base_list=final_entry_base_feats_to_use, # Base features for entry model
-                    app_settings_dict=app_settings
+                    best_params_from_optuna=best_hyperparams,
+                    pivot_feature_names_list=final_pivot_feats_to_use,
+                    entry_feature_names_base_list=final_entry_base_feats_to_use,
+                    app_settings_dict=app_settings,
+                    pivot_scaler_for_summary=final_pivot_scaler_loaded,
+                    entry_scaler_for_summary=final_entry_scaler_loaded
                 )
             else:
                 print("Skipping training summary generation due to missing data or models from training process.")
@@ -4638,25 +4721,34 @@ def engineer_pivot_features(df, atr_col_name, force_live_bars_since_pivot_calc: 
         raise RuntimeError(f"ATR column '{atr_col_name}' contains all NaN values in engineer_pivot_features – aborting feature calculation.")
 
     # Volatility & Range
-    # df['range_atr_norm'] = (df['high'] - df['low']) / df[atr_col_name]
-    df['range_atr_norm'] = np.where(df[atr_col_name] == 0, 0, (df['high'] - df['low']) / df[atr_col_name])
+    # Calculate effective ATR for normalization
+    # Ensure 'close' price is positive to avoid issues with price_based_min_atr
+    df['close_safe'] = df['close'].replace(0, 1e-9) # Replace 0 close with a tiny number
+    price_based_min_atr = df['close_safe'] * 0.00005 # 0.005% of close price as a dynamic floor
+    
+    # df[atr_col_name] should already be positive due to replace(0, 1e-8) in the caller.
+    # We use np.maximum to ensure effective_atr is at least price_based_min_atr or the calculated atr_col_name.
+    effective_atr = np.maximum(df[atr_col_name], price_based_min_atr)
+    # Handle cases where effective_atr might still be zero or NaN (e.g., if price_based_min_atr was NaN due to NaN close)
+    effective_atr = effective_atr.replace(0, 1e-8).fillna(1e-8)
+
+
+    df['range_atr_norm'] = (df['high'] - df['low']) / effective_atr
 
 
     # Trend & Momentum
     df['ema12'] = calculate_ema(df, 12)
     df['ema26'] = calculate_ema(df, 26)
     df['macd_line'] = df['ema12'] - df['ema26']
-    # Use dynamic atr_col_name for normalization
-    # df['macd_slope_atr_norm'] = df['macd_line'].diff() / df[atr_col_name]
     macd_slope = df['macd_line'].diff()
-    df['macd_slope_atr_norm'] = np.where(df[atr_col_name] == 0, 0, macd_slope / df[atr_col_name])
+    df['macd_slope_atr_norm'] = macd_slope / effective_atr
 
 
     for n in [1, 3, 5]:
-        # Use dynamic atr_col_name for normalization
-        # df[f'return_{n}b_atr_norm'] = df['close'].pct_change(n) / df[atr_col_name]
         return_n_b = df['close'].pct_change(n)
-        df[f'return_{n}b_atr_norm'] = np.where(df[atr_col_name] == 0, 0, return_n_b / df[atr_col_name])
+        df[f'return_{n}b_atr_norm'] = return_n_b / effective_atr
+    
+    df.drop(columns=['close_safe'], inplace=True, errors='ignore')
 
 
     # Local Structure
@@ -4761,26 +4853,46 @@ def engineer_pivot_features(df, atr_col_name, force_live_bars_since_pivot_calc: 
     ]
     # df.replace([np.inf, -np.inf], np.nan, inplace=True) # Moved after clipping
 
-    # --- Clipping extreme values for specific normalized features ---
-    # Define a clipping range (e.g., -5 to 5 standard deviations, or fixed values)
-    # For now, let's use a fixed range that seems reasonable for normalized slopes/returns.
+    # --- Logging, Clipping, and More Logging ---
     CLIP_MIN = -5.0
     CLIP_MAX = 5.0
-
-    features_to_clip = [
+    features_to_log_and_clip = [
+        'range_atr_norm', # Added for logging, though not typically clipped in the same way as returns
         'macd_slope_atr_norm',
         'return_1b_atr_norm', 'return_3b_atr_norm', 'return_5b_atr_norm'
     ]
-    for feature_name in features_to_clip:
-        if feature_name in df.columns:
-            # Log before clipping for comparison, if needed for debugging, but can be verbose
-            # print(f"Clipping {feature_name}: Min before: {df[feature_name].min()}, Max before: {df[feature_name].max()}")
-            df[feature_name] = df[feature_name].clip(lower=CLIP_MIN, upper=CLIP_MAX)
-            # print(f"Clipping {feature_name}: Min after: {df[feature_name].min()}, Max after: {df[feature_name].max()}")
-    # --- End Clipping ---
 
-    # --- Enhanced Logging for Feature Statistics ---
-    print(f"\n--- Feature Statistics from engineer_pivot_features (ATR: {atr_col_name}) ---")
+    print(f"\n--- Detailed Feature Statistics from engineer_pivot_features (ATR Col: {atr_col_name}) ---")
+    # Log ATR column stats
+    if atr_col_name in df.columns:
+        print(f"\nStatistics for '{atr_col_name}' (Raw ATR values):")
+        print(df[atr_col_name].describe(percentiles=[.01, .05, .25, .5, .75, .95, .99]))
+    else:
+        print(f"\nColumn '{atr_col_name}' not found in DataFrame for ATR stats.")
+
+    for feature_name in features_to_log_and_clip:
+        if feature_name in df.columns:
+            print(f"\nStatistics for '{feature_name}' BEFORE clipping:")
+            print(df[feature_name].describe(percentiles=[.01, .05, .25, .5, .75, .95, .99]))
+            
+            # Apply clipping only to specific features that require it (returns and macd_slope)
+            if feature_name in ['macd_slope_atr_norm', 'return_1b_atr_norm', 'return_3b_atr_norm', 'return_5b_atr_norm']:
+                df[feature_name] = df[feature_name].clip(lower=CLIP_MIN, upper=CLIP_MAX)
+                print(f"\nStatistics for '{feature_name}' AFTER clipping to [{CLIP_MIN}, {CLIP_MAX}]:")
+                print(df[feature_name].describe(percentiles=[.01, .05, .25, .5, .75, .95, .99]))
+            else:
+                # For features like 'range_atr_norm', we just log, no clipping applied here.
+                pass # Or log that it's not clipped by this specific rule
+        else:
+            print(f"\nFeature '{feature_name}' not found in DataFrame for detailed stats.")
+    
+    print(f"\n--- End Detailed Feature Statistics ---\n")
+    # --- End Logging, Clipping, and More Logging ---
+
+
+    # --- Enhanced Logging for Feature Statistics (Overall final features) ---
+    # This section will now show stats after any clipping has occurred.
+    print(f"\n--- Final Feature Statistics (Post-Processing) from engineer_pivot_features (ATR: {atr_col_name}) ---")
     for col in feature_cols:
         if col in df:
             stats = df[col].describe(percentiles=[.01, .05, .25, .5, .75, .95, .99])
@@ -4825,16 +4937,27 @@ def engineer_entry_features(df, atr_col_name, entry_features_base_list_arg=None)
     # We will add these features to the rows identified as pivots.
 
     # Extended Trend
+    # Calculate effective ATR for normalization (consistent with engineer_pivot_features)
+    df['close_safe'] = df['close'].replace(0, 1e-9)
+    price_based_min_atr = df['close_safe'] * 0.00005
+    effective_atr = np.maximum(df[atr_col_name], price_based_min_atr)
+    effective_atr = effective_atr.replace(0, 1e-8).fillna(1e-8)
+
     df['ema20'] = calculate_ema(df, 20)
     df['ema50'] = calculate_ema(df, 50)
-    # Use dynamic atr_col_name for normalization
-    df['ema20_ema50_norm_atr'] = (df['ema20'] - df['ema50']) / df[atr_col_name]
+    df['ema20_ema50_norm_atr'] = (df['ema20'] - df['ema50']) / effective_atr
 
     # Recent Behavior
     for n in [1, 3, 5]: # Returns *before* entry
-        df[f'return_entry_{n}b'] = df['close'].pct_change(n) 
-    # Use dynamic atr_col_name for ATR change feature
-    df[f'{atr_col_name}_change'] = df[atr_col_name].pct_change()
+        df[f'return_entry_{n}b'] = df['close'].pct_change(n)
+    
+    # The ATR change feature should be normalized by the ATR value itself, not the effective_atr,
+    # as we are interested in the percentage change of the ATR.
+    # A zero check is still important.
+    atr_safe_for_pct_change = df[atr_col_name].replace(0, 1e-8)
+    df[f'{atr_col_name}_change'] = df[atr_col_name].diff() / atr_safe_for_pct_change
+    
+    df.drop(columns=['close_safe'], inplace=True, errors='ignore')
 
     # Contextual Flags
     # Ensure 'timestamp' column exists and is datetime type
@@ -5071,28 +5194,42 @@ def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot
         return -97.0
 
     # Prepare data for pivot model
-    X_pivot_train = df_train[trial_pivot_features].fillna(-1) 
+    X_pivot_train_raw = df_train[trial_pivot_features].fillna(-1) 
     y_pivot_train = df_train['pivot_label']
-    X_pivot_val = df_val[trial_pivot_features].fillna(-1)
+    X_pivot_val_raw = df_val[trial_pivot_features].fillna(-1)
     y_pivot_val = df_val['pivot_label']
 
-    if X_pivot_train.empty or X_pivot_val.empty:
+    if X_pivot_train_raw.empty or X_pivot_val_raw.empty:
         print("Warning: Pivot training or validation features are empty. Skipping trial.")
         return -96.0
+
+    # --- Pivot Model Scaling ---
+    pivot_scaler = StandardScaler()
+    X_pivot_train = pivot_scaler.fit_transform(X_pivot_train_raw)
+    X_pivot_val = pivot_scaler.transform(X_pivot_val_raw)
+    # --- End Pivot Model Scaling ---
 
     # Train Pivot Model
     if pivot_model_type == 'lgbm':
         pivot_model = lgb.LGBMClassifier(num_leaves=pivot_num_leaves, learning_rate=pivot_learning_rate,
                                          max_depth=pivot_max_depth, class_weight='balanced', random_state=42, n_estimators=100, verbosity=-1)
+        # LGBM can handle numpy arrays directly
         pivot_model.fit(X_pivot_train, y_pivot_train, eval_set=[(X_pivot_val, y_pivot_val)], callbacks=[early_stopping(stopping_rounds=5, verbose=False)])
     else: # rf
         pivot_model = RandomForestClassifier(n_estimators=100, max_depth=pivot_max_depth, class_weight='balanced', random_state=42)
         pivot_model.fit(X_pivot_train, y_pivot_train)
 
-    p_swing_train_all_classes = pivot_model.predict_proba(X_pivot_train)
-    p_swing_val_all_classes = pivot_model.predict_proba(X_pivot_val)
-    df_train['P_swing'] = np.max(p_swing_train_all_classes[:, 1:], axis=1)
-    df_val['P_swing'] = np.max(p_swing_val_all_classes[:, 1:], axis=1)
+    # Need to predict on scaled data if model was trained on scaled data.
+    # However, predict_proba needs to be called on the original feature names if we are to put P_swing back into df_train/df_val.
+    # For Optuna, the primary goal is to evaluate parameters. The P_swing for entry candidates can be derived from scaled data.
+    # Let's get probabilities from scaled data.
+    p_swing_train_all_classes = pivot_model.predict_proba(X_pivot_train) # X_pivot_train is already scaled
+    p_swing_val_all_classes = pivot_model.predict_proba(X_pivot_val)     # X_pivot_val is already scaled
+    
+    # Assign P_swing back to the original DataFrames (df_train, df_val) using their original indices
+    # This requires that X_pivot_train_raw and X_pivot_val_raw indices are aligned with df_train and df_val
+    df_train.loc[X_pivot_train_raw.index, 'P_swing'] = np.max(p_swing_train_all_classes[:, 1:], axis=1)
+    df_val.loc[X_pivot_val_raw.index, 'P_swing'] = np.max(p_swing_val_all_classes[:, 1:], axis=1)
     
     initial_train_pivots = df_train[(df_train['pivot_label'].isin([1, 2])) & (df_train['trade_outcome'] != -1)]
     print(f"DEBUG (Optuna): Initial Train Pivots with outcome: {len(initial_train_pivots)}")
@@ -5113,26 +5250,41 @@ def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot
     # Construct the full list of entry features for this trial
     current_trial_full_entry_features = trial_entry_features_base + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']
     
-    X_entry_train = entry_train_candidates[current_trial_full_entry_features].fillna(-1)
+    X_entry_train_raw = entry_train_candidates[current_trial_full_entry_features].fillna(-1)
     y_entry_train = (entry_train_candidates['trade_outcome'] > 0).astype(int)
 
-    if len(X_entry_train['P_swing'].unique()) < 2 or len(y_entry_train.unique()) < 2 or X_entry_train.empty:
-        return -1.0
+    if X_entry_train_raw.empty or len(y_entry_train.unique()) < 2 or (not X_entry_train_raw.empty and 'P_swing' in X_entry_train_raw.columns and len(X_entry_train_raw['P_swing'].unique()) < 2) :
+        print(f"DEBUG (Optuna): Insufficient diversity or empty data for entry model training. X_entry_train_raw empty: {X_entry_train_raw.empty}, y_entry_train unique: {len(y_entry_train.unique())}, P_swing unique: {len(X_entry_train_raw['P_swing'].unique()) if 'P_swing' in X_entry_train_raw.columns and not X_entry_train_raw.empty else 'N/A'}. Penalizing.")
+        return -1.0 # Penalize if not enough data or diversity
+
+    # --- Entry Model Scaling & Training ---
+    entry_scaler = StandardScaler()
+    X_entry_train_scaled = entry_scaler.fit_transform(X_entry_train_raw)
 
     if entry_model_type == 'lgbm':
         entry_model = lgb.LGBMClassifier(num_leaves=entry_num_leaves, learning_rate=entry_learning_rate,
                                          max_depth=entry_max_depth, class_weight='balanced', random_state=42, n_estimators=100, verbosity=-1)
-        if len(entry_train_candidates) > 20:
-             X_entry_train_sub, X_entry_val_sub, y_entry_train_sub, y_entry_val_sub = train_test_split(X_entry_train, y_entry_train, test_size=0.2, stratify=y_entry_train if len(y_entry_train.unique()) > 1 else None, random_state=42)
-             if len(X_entry_val_sub) > 0 and len(y_entry_val_sub.unique()) > 1:
-                entry_model.fit(X_entry_train_sub, y_entry_train_sub, eval_set=[(X_entry_val_sub, y_entry_val_sub)], callbacks=[early_stopping(stopping_rounds=5, verbose=False)])
-             else:
-                entry_model.fit(X_entry_train, y_entry_train) 
-        else:
-            entry_model.fit(X_entry_train, y_entry_train)
+        
+        # For entry model's early stopping, we need a validation set.
+        # Let's split the X_entry_train_scaled and y_entry_train.
+        if len(X_entry_train_scaled) > 20 and len(np.unique(y_entry_train)) > 1:
+            try:
+                X_entry_train_fit, X_entry_val_fit, y_entry_train_fit, y_entry_val_fit = train_test_split(
+                    X_entry_train_scaled, y_entry_train, test_size=0.2, stratify=y_entry_train, random_state=42
+                )
+                if len(X_entry_val_fit) > 0 and len(np.unique(y_entry_val_fit)) > 1:
+                    entry_model.fit(X_entry_train_fit, y_entry_train_fit, 
+                                    eval_set=[(X_entry_val_fit, y_entry_val_fit)], 
+                                    callbacks=[early_stopping(stopping_rounds=5, verbose=False)])
+                else: # Not enough diversity in validation split, train on full entry candidate set
+                    entry_model.fit(X_entry_train_scaled, y_entry_train)
+            except ValueError: # Could happen if stratify fails due to too few samples in a class
+                 entry_model.fit(X_entry_train_scaled, y_entry_train)
+        else: # Not enough data or diversity for a validation split
+            entry_model.fit(X_entry_train_scaled, y_entry_train)
     else: # rf
         entry_model = RandomForestClassifier(n_estimators=100, max_depth=entry_max_depth, class_weight='balanced', random_state=42)
-        entry_model.fit(X_entry_train, y_entry_train)
+        entry_model.fit(X_entry_train_scaled, y_entry_train) # Corrected to use X_entry_train_scaled
 
     potential_pivots_val = df_val[df_val['P_swing'] >= p_swing_threshold].copy()
     potential_pivots_val = potential_pivots_val[potential_pivots_val['trade_outcome'] != -1]
@@ -5143,11 +5295,12 @@ def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot
     potential_pivots_val['norm_dist_entry_pivot'] = (potential_pivots_val['entry_price_sim'] - potential_pivots_val.apply(lambda r: r['low'] if r['is_swing_low'] == 1 else r['high'], axis=1)) / potential_pivots_val[atr_col_name_optuna]
     potential_pivots_val['norm_dist_entry_sl'] = (potential_pivots_val['entry_price_sim'] - potential_pivots_val['sl_price_sim']).abs() / potential_pivots_val[atr_col_name_optuna]
 
-    X_entry_eval = potential_pivots_val[current_trial_full_entry_features].fillna(-1)
+    X_entry_eval_raw = potential_pivots_val[current_trial_full_entry_features].fillna(-1)
 
-    if len(X_entry_eval) == 0: return -0.5
-
-    p_profit_val = entry_model.predict_proba(X_entry_eval)[:, 1] # Assuming class 1 is "profitable"
+    if len(X_entry_eval_raw) == 0: return -0.5
+    
+    X_entry_eval_scaled = entry_scaler.transform(X_entry_eval_raw) # Use the scaler fitted on entry_train data
+    p_profit_val = entry_model.predict_proba(X_entry_eval_scaled)[:, 1] # Assuming class 1 is "profitable"
     
     print(f"DEBUG (Optuna): Validation Pivots for Entry Eval: {len(potential_pivots_val)}. P_profit scores sample: {p_profit_val[:5]}")
 
@@ -5392,27 +5545,38 @@ def load_model(filename="model.joblib"):
     print(f"Model loaded from {filename}")
     return model
 
-def full_backtest(df_processed, pivot_model, entry_model, best_params, pivot_features, entry_features_base):
+def full_backtest(df_processed, pivot_model, entry_model, best_params, pivot_features, entry_features_base,
+                  pivot_scaler=None, entry_scaler=None): # Added scaler arguments
     """
     Performs a full backtest on the (hold-out) test set.
     Uses the best models and thresholds found by Optuna.
+    Applies scalers if they are provided.
     """
     print("\n--- Starting Full Backtest ---")
-    # Determine ATR column name for backtest based on best_params or default
-    backtest_atr_period = best_params.get('atr_period_opt', ATR_PERIOD) # Get tuned ATR period or default
+    backtest_atr_period = best_params.get('atr_period_opt', ATR_PERIOD)
     atr_col_name_backtest = f'atr_{backtest_atr_period}'
     print(f"Full Backtest using ATR column: {atr_col_name_backtest}")
 
-    # Split: e.g., last 15% for test
     train_val_size = int(0.85 * len(df_processed))
     df_test = df_processed.iloc[train_val_size:].copy()
 
-    if len(df_test) == 0:
+    if df_test.empty:
         print("No data in test set for backtest.")
         return
 
-    # 1. Pivot Predictions
-    X_pivot_test = df_test[pivot_features].fillna(-1)
+    # 1. Pivot Predictions (with scaling)
+    X_pivot_test_raw = df_test[pivot_features].fillna(-1)
+    if pivot_scaler:
+        try:
+            X_pivot_test = pivot_scaler.transform(X_pivot_test_raw)
+            print("Backtest: Pivot features scaled successfully.")
+        except Exception as e:
+            print(f"Backtest WARNING: Failed to scale pivot features: {e}. Predicting on raw features.")
+            X_pivot_test = X_pivot_test_raw.to_numpy() # Ensure numpy array if not scaled
+    else:
+        print("Backtest WARNING: Pivot scaler not provided. Predicting on raw features.")
+        X_pivot_test = X_pivot_test_raw.to_numpy()
+
     p_swing_test_all_classes = pivot_model.predict_proba(X_pivot_test)
     df_test['P_swing'] = np.max(p_swing_test_all_classes[:, 1:], axis=1)
     df_test['predicted_pivot_class'] = np.argmax(p_swing_test_all_classes, axis=1)
@@ -5435,17 +5599,26 @@ def full_backtest(df_processed, pivot_model, entry_model, best_params, pivot_fea
     potential_pivots_test['norm_dist_entry_pivot'] = (potential_pivots_test['entry_price_sim'] - potential_pivots_test.apply(lambda r: r['low'] if r['predicted_pivot_class'] == 2 else r['high'], axis=1)) / potential_pivots_test[atr_col_name_backtest]
     potential_pivots_test['norm_dist_entry_sl'] = (potential_pivots_test['entry_price_sim'] - potential_pivots_test['sl_price_sim']).abs() / potential_pivots_test[atr_col_name_backtest]
 
-    # Construct the full list of entry features for the backtest
     backtest_full_entry_features = entry_features_base + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']
-    X_entry_test = potential_pivots_test[backtest_full_entry_features].fillna(-1)
+    X_entry_test_raw = potential_pivots_test[backtest_full_entry_features].fillna(-1)
 
-    if len(X_entry_test) == 0:
+    if X_entry_test_raw.empty:
         print("No data for entry model evaluation in test set after feature engineering.")
-        return 0, 0, 0, 0 # Return zero for metrics
+        return 0, 0, 0, 0
 
-    # 4. Entry Predictions (Binary: Not Profitable vs. Profitable)
-    # Entry model is trained as binary, so predict_proba gives [P_NotProfitable, P_Profitable]
-    p_profit_test = entry_model.predict_proba(X_entry_test)[:, 1] # Probability of class 1 (profitable)
+    # 4. Entry Predictions (with scaling)
+    if entry_scaler:
+        try:
+            X_entry_test = entry_scaler.transform(X_entry_test_raw)
+            print("Backtest: Entry features scaled successfully.")
+        except Exception as e:
+            print(f"Backtest WARNING: Failed to scale entry features: {e}. Predicting on raw features.")
+            X_entry_test = X_entry_test_raw.to_numpy()
+    else:
+        print("Backtest WARNING: Entry scaler not provided. Predicting on raw features.")
+        X_entry_test = X_entry_test_raw.to_numpy()
+    
+    p_profit_test = entry_model.predict_proba(X_entry_test)[:, 1]
 
     # 5. Filter by P_profit threshold (consistent with Optuna's validation)
     profit_threshold_backtest = best_params.get('profit_threshold', 0.6) # Default from Optuna, should be consistent
@@ -5548,7 +5721,16 @@ def run_backtest_scenario(scenario_name: str, df_processed: pd.DataFrame,
             print("ML Stage 1: Pivot model not available. Skipping scenario.")
             return {"scenario": scenario_name, "trades": 0, "win_rate": 0, "avg_r": 0, "profit_factor": 0, "max_dd_r": 0, "trade_frequency":0}
 
-        X_pivot_test = df_test[pivot_features].fillna(-1)
+        X_pivot_test_raw = df_test[pivot_features].fillna(-1)
+        if pivot_scaler:
+            try:
+                X_pivot_test = pivot_scaler.transform(X_pivot_test_raw)
+            except Exception as e:
+                print(f"RunBacktestScenario WARNING ({scenario_name}): Failed to scale pivot features for Stage 1: {e}. Using raw.")
+                X_pivot_test = X_pivot_test_raw.to_numpy()
+        else:
+            X_pivot_test = X_pivot_test_raw.to_numpy()
+        
         p_swing_test_all_classes = pivot_model.predict_proba(X_pivot_test)
         df_test['P_swing'] = np.max(p_swing_test_all_classes[:, 1:], axis=1)
 
@@ -5566,8 +5748,17 @@ def run_backtest_scenario(scenario_name: str, df_processed: pd.DataFrame,
             print("Full ML Pipeline: Pivot or Entry model not available. Skipping scenario.")
             return {"scenario": scenario_name, "trades": 0, "win_rate": 0, "avg_r": 0, "profit_factor": 0, "max_dd_r": 0, "trade_frequency":0}
 
-        X_pivot_test = df_test[pivot_features].fillna(-1)
-        p_swing_test_all_classes = pivot_model.predict_proba(X_pivot_test)
+        X_pivot_test_full_ml_raw = df_test[pivot_features].fillna(-1)
+        if pivot_scaler:
+            try:
+                X_pivot_test_full_ml = pivot_scaler.transform(X_pivot_test_full_ml_raw)
+            except Exception as e:
+                print(f"RunBacktestScenario WARNING ({scenario_name}): Failed to scale pivot features for Full ML: {e}. Using raw.")
+                X_pivot_test_full_ml = X_pivot_test_full_ml_raw.to_numpy()
+        else:
+            X_pivot_test_full_ml = X_pivot_test_full_ml_raw.to_numpy()
+
+        p_swing_test_all_classes = pivot_model.predict_proba(X_pivot_test_full_ml)
         df_test['P_swing'] = np.max(p_swing_test_all_classes[:, 1:], axis=1)
         df_test['predicted_pivot_class_ml'] = np.argmax(p_swing_test_all_classes, axis=1)
 
@@ -5587,12 +5778,21 @@ def run_backtest_scenario(scenario_name: str, df_processed: pd.DataFrame,
         potential_pivots_ml['norm_dist_entry_pivot'] = (potential_pivots_ml['entry_price_sim'] - potential_pivots_ml.apply(lambda r: r['low'] if r['predicted_pivot_class_ml'] == 2 else r['high'], axis=1)) / potential_pivots_ml[atr_col_name]
         potential_pivots_ml['norm_dist_entry_sl'] = (potential_pivots_ml['entry_price_sim'] - potential_pivots_ml['sl_price_sim']).abs() / potential_pivots_ml[atr_col_name]
 
-        X_entry_test_ml = potential_pivots_ml[entry_features_base + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']].fillna(-1)
+        X_entry_test_ml_raw = potential_pivots_ml[entry_features_base + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']].fillna(-1)
 
-        if X_entry_test_ml.empty:
+        if X_entry_test_ml_raw.empty:
             print("Full ML: No data for entry model evaluation.")
             return {"scenario": scenario_name, "trades": 0, "win_rate": 0, "avg_r": 0, "profit_factor": 0, "max_dd_r": 0, "trade_frequency":0}
 
+        if entry_scaler:
+            try:
+                X_entry_test_ml = entry_scaler.transform(X_entry_test_ml_raw)
+            except Exception as e:
+                print(f"RunBacktestScenario WARNING ({scenario_name}): Failed to scale entry features: {e}. Using raw.")
+                X_entry_test_ml = X_entry_test_ml_raw.to_numpy()
+        else:
+            X_entry_test_ml = X_entry_test_ml_raw.to_numpy()
+            
         p_profit_test_ml = entry_model.predict_proba(X_entry_test_ml)[:, 1]
         final_trades_for_metrics = potential_pivots_ml[p_profit_test_ml >= profit_threshold].copy()
         print(f"Full ML: Identified {len(final_trades_for_metrics)} full ML pipeline trade setups.")
@@ -5793,11 +5993,12 @@ def run_backtest_scenario(scenario_name: str, df_processed: pd.DataFrame,
     return full_results_dict
 
 # --- Backtest Summary Generation ---
-def generate_training_backtest_summary(df_processed_full_dataset, # This is the full dataset used for training/val/test split
-                                       pivot_model, entry_model, 
-                                       best_params_from_optuna, 
+def generate_training_backtest_summary(df_processed_full_dataset,
+                                       pivot_model, entry_model,
+                                       best_params_from_optuna,
                                        pivot_feature_names_list, entry_feature_names_base_list,
-                                       app_settings_dict):
+                                       app_settings_dict,
+                                       pivot_scaler_for_summary=None, entry_scaler_for_summary=None):
     """
     Generates and displays a summary of backtest results for different scenarios.
     Uses a portion of df_processed_full_dataset as a consistent test set for all scenarios.
@@ -5846,14 +6047,16 @@ def generate_training_backtest_summary(df_processed_full_dataset, # This is the 
 
         scenario_results = run_backtest_scenario(
             scenario_name=scenario,
-            df_processed=df_processed_full_dataset.copy(), # Pass a copy to avoid in-place modifications
+            df_processed=df_processed_full_dataset.copy(),
             pivot_model=pivot_model,
             entry_model=entry_model,
             best_params=best_params_from_optuna,
             pivot_features=pivot_feature_names_list,
             entry_features_base=entry_feature_names_base_list,
-            atr_col_name=atr_col_name_summary, # Use ATR col consistent with model training
-            use_full_df_as_test=False # run_backtest_scenario will take its usual test split (last 15%)
+            atr_col_name=atr_col_name_summary,
+            use_full_df_as_test=False,
+            pivot_scaler=pivot_scaler_for_summary,
+            entry_scaler=entry_scaler_for_summary
         )
         # Add symbol context if possible/relevant for universal model summary (e.g. "Universal")
         scenario_results['symbol_context'] = "UniversalTestSet" 
