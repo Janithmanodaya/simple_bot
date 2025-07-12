@@ -2498,17 +2498,22 @@ def app_calculate_live_pivot_features(df_live: pd.DataFrame, atr_period: int, pi
     # --- Apply Scaling ---
     # Load the pivot scaler (path should be in app_settings, set during training)
     # Global app_settings should be populated by now.
+    pivot_scaler = None  # Initialize pivot_scaler to None
     pivot_scaler_path = app_settings.get("app_pivot_scaler_path")
     if pivot_scaler_path and os.path.exists(pivot_scaler_path):
         try:
             pivot_scaler = load_model(pivot_scaler_path) # Reusing load_model for scalers
-            # Ensure live_features_series is a DataFrame for scaler
-            live_features_df_for_scaling = pd.DataFrame([live_features_series])
-            scaled_features_array = pivot_scaler.transform(live_features_df_for_scaling)
-            live_features_series = pd.Series(scaled_features_array[0], index=live_features_df_for_scaling.columns)
-            print(f"{log_prefix} Live pivot features scaled successfully using {pivot_scaler_path}.")
+            if pivot_scaler:  # Check if scaler is loaded successfully
+                # Ensure live_features_series is a DataFrame for scaler
+                live_features_df_for_scaling = pd.DataFrame([live_features_series])
+                scaled_features_array = pivot_scaler.transform(live_features_df_for_scaling)
+                live_features_series = pd.Series(scaled_features_array[0], index=live_features_df_for_scaling.columns)
+                print(f"{log_prefix} Live pivot features scaled successfully using {pivot_scaler_path}.")
+            else:
+                print(f"{log_prefix} WARNING: Pivot scaler loaded as None from '{pivot_scaler_path}'. Using unscaled features.")
         except Exception as e_scale:
             print(f"{log_prefix} WARNING: Failed to load or apply pivot scaler from '{pivot_scaler_path}': {e_scale}. Using unscaled features.")
+            pivot_scaler = None # Ensure pivot_scaler is None on error
             # Fall through to use unscaled features if scaling fails
     else:
         print(f"{log_prefix} WARNING: Pivot scaler path not found or not configured ('{pivot_scaler_path}'). Using unscaled features for pivot model.")
@@ -2653,16 +2658,21 @@ def app_calculate_live_entry_features(df_live: pd.DataFrame, atr_period: int, en
     # --- Explicit Logging of Final Feature Vector ---
     log_entry_dict_str = "None or Empty"
     # --- Apply Scaling for Entry Model ---
+    entry_scaler = None  # Initialize entry_scaler to None
     entry_scaler_path = app_settings.get("app_entry_scaler_path")
     if entry_scaler_path and os.path.exists(entry_scaler_path):
         try:
             entry_scaler = load_model(entry_scaler_path)
-            live_entry_features_df_for_scaling = pd.DataFrame([live_features_series])
-            scaled_entry_features_array = entry_scaler.transform(live_entry_features_df_for_scaling)
-            live_features_series = pd.Series(scaled_entry_features_array[0], index=live_entry_features_df_for_scaling.columns)
-            print(f"{log_prefix} Live entry features scaled successfully using {entry_scaler_path}.")
+            if entry_scaler:  # Check if scaler is loaded successfully
+                live_entry_features_df_for_scaling = pd.DataFrame([live_features_series])
+                scaled_entry_features_array = entry_scaler.transform(live_entry_features_df_for_scaling)
+                live_features_series = pd.Series(scaled_entry_features_array[0], index=live_entry_features_df_for_scaling.columns)
+                print(f"{log_prefix} Live entry features scaled successfully using {entry_scaler_path}.")
+            else:
+                print(f"{log_prefix} WARNING: Entry scaler loaded as None from '{entry_scaler_path}'. Using unscaled features.")
         except Exception as e_scale_entry:
             print(f"{log_prefix} WARNING: Failed to load or apply entry scaler from '{entry_scaler_path}': {e_scale_entry}. Using unscaled features.")
+            entry_scaler = None # Ensure entry_scaler is None on error
     else:
         print(f"{log_prefix} WARNING: Entry scaler path not found or not configured ('{entry_scaler_path}'). Using unscaled features for entry model.")
 
