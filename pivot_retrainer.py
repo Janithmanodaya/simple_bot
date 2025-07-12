@@ -98,9 +98,13 @@ def get_dynamic_threshold(y_true, y_pred_proba):
     """
     from sklearn.metrics import roc_curve, precision_recall_curve
     import numpy as np
+    from sklearn.preprocessing import label_binarize
 
-    fpr, tpr, thresholds_roc = roc_curve(y_true, y_pred_proba[:, 1])
-    precision, recall, thresholds_prc = precision_recall_curve(y_true, y_pred_proba[:, 1])
+    # Binarize y_true for class 1 vs the rest
+    y_true_binarized = label_binarize(y_true, classes=[0, 1, 2])[:, 1]
+
+    fpr, tpr, thresholds_roc = roc_curve(y_true_binarized, y_pred_proba[:, 1])
+    precision, recall, thresholds_prc = precision_recall_curve(y_true_binarized, y_pred_proba[:, 1])
     
     # Find the threshold that gives the best balance between TPR and FPR
     optimal_idx = np.argmax(tpr - fpr)
