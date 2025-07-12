@@ -2955,7 +2955,7 @@ def app_process_symbol_for_signal(symbol: str, client, current_app_settings: dic
     # `main.py`'s `process_symbol_adv_fib_ml_task` uses `sim_sl_dist_feat = atr_val_for_sim_features * sl_mult_feat`
     # where `sl_mult_feat` is `configs.get("fib_sl_atr_multiplier_exec")`.
     # Let's assume `app_settings` or `best_hyperparams` has a suitable `sim_sl_atr_multiplier`.
-        sim_sl_atr_mult = current_app_settings.get('app_sim_sl_atr_multiplier', 1.0) # Add to settings if needed
+    sim_sl_atr_mult = current_app_settings.get('app_sim_sl_atr_multiplier', 1.0) # Add to settings if needed
     
     sim_entry_for_features = current_candle['close']
     sim_sl_dist_for_features = atr_val_current * sim_sl_atr_mult
