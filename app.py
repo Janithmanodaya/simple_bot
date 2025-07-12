@@ -3876,10 +3876,24 @@ def start_app_main_flow():
             print(f"{log_prefix} Using {num_workers_data_processing} workers for parallel data processing.")
 
             with ThreadPoolExecutor(max_workers=num_workers_data_processing) as executor:
+                # Define a default or base config for data processing
+                # This could be a subset of app_settings or a specific configuration dict
+                data_processing_config = {
+                    "atr_period": app_settings.get("app_atr_period_sl_tp", 14), # Example, should match training logic
+                    "pivot_n_left": PIVOT_N_LEFT,
+                    "pivot_n_right": PIVOT_N_RIGHT,
+                    "min_atr_distance": MIN_ATR_DISTANCE,
+                    "min_bar_gap": MIN_BAR_GAP,
+                    # Add other necessary parameters that get_processed_data_for_symbol might need
+                }
+
                 future_to_symbol = {
                     executor.submit(get_processed_data_for_symbol, 
-                                    symbol_ticker, kline_interval_train, 
-                                    start_date_train, end_date_train): symbol_ticker 
+                                    data_processing_config,
+                                    symbol_ticker, 
+                                    kline_interval_train, 
+                                    start_date_train, 
+                                    end_date_train): symbol_ticker 
                     for symbol_ticker in training_symbols_list
                 }
                 
@@ -4668,11 +4682,19 @@ def engineer_pivot_features(df, atr_col_name, force_live_bars_since_pivot_calc: 
     
     last_pivot_time = None
     df['ticks_since_last_pivot'] = 0
-    for i, row in df.iterrows():
-        if i in candidate_pivots.index:
-            last_pivot_time = i
-        if last_pivot_time:
-            df.loc[i, 'ticks_since_last_pivot'] = (i - last_pivot_time).total_seconds() / 60 # In minutes
+    # Ensure the index is a DatetimeIndex before proceeding
+    if isinstance(df.index, pd.DatetimeIndex):
+        for i, row in df.iterrows():
+            if i in candidate_pivots.index:
+                last_pivot_time = i
+            if last_pivot_time is not None:
+                # i and last_pivot_time are Timestamps from the index
+                time_diff_seconds = (i - last_pivot_time).total_seconds()
+                df.loc[i, 'ticks_since_last_pivot'] = time_diff_seconds / 60  # In minutes
+    else:
+        # Fallback or error if index is not datetime, which is unexpected for this feature
+        print("Warning: DataFrame index is not a DatetimeIndex in engineer_pivot_features. 'ticks_since_last_pivot' will be 0.")
+
 
     # Temporal embeddings
     if isinstance(df.index, pd.DatetimeIndex):
