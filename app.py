@@ -9,8 +9,6 @@ import lightgbm as lgb
 from lightgbm.callback import early_stopping
 import optuna
 import joblib
-import shap
-import matplotlib.pyplot as plt
 from binance.client import Client # Assuming you'll use python-binance
 from binance.exceptions import BinanceAPIException, BinanceRequestException
 import time
@@ -225,15 +223,7 @@ def get_historical_bars(symbol, interval, start_str, end_str=None):
             return pd.DataFrame() # Return empty DataFrame on failure
         # If successful, app_binance_client is now set.
 
-    try:
-        klines = app_binance_client.get_historical_klines(symbol, interval, start_str, end_str)
-    except BinanceAPIException as e:
-        if e.code == -1121: # Invalid symbol
-            print(f"Error (get_historical_bars): Invalid symbol '{symbol}'. Returning empty DataFrame. Error: {e}")
-        else:
-            print(f"Error (get_historical_bars): Binance API Exception for {symbol}: {e}. Returning empty DataFrame.")
-        return pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-
+    klines = app_binance_client.get_historical_klines(symbol, interval, start_str, end_str)
     if not klines: # Check if klines list is empty
         print(f"Warning (get_historical_bars): No klines returned from API for {symbol} {interval} {start_str} {end_str}.")
         # Return DataFrame with expected columns but no data
@@ -244,11 +234,10 @@ def get_historical_bars(symbol, interval, start_str, end_str=None):
         'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
     ])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df.set_index('timestamp', inplace=True)
     for col in ['open', 'high', 'low', 'close', 'volume', 'quote_asset_volume',
                 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume']:
         df[col] = pd.to_numeric(df[col])
-    df = df[['open', 'high', 'low', 'close', 'volume']]
+    df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
     return df
 
 
@@ -295,12 +284,11 @@ def get_or_download_historical_data(symbol: str, interval: str,
                 print(f"{log_prefix_parquet} Existing data loaded. Shape: {existing_df.shape}")
                 # Ensure timestamp is datetime and sorted
                 existing_df['timestamp'] = pd.to_datetime(existing_df['timestamp'])
-                existing_df.set_index('timestamp', inplace=True)
-                existing_df.sort_index(inplace=True)
-                existing_df = existing_df[~existing_df.index.duplicated(keep='last')]
+                existing_df.sort_values('timestamp', inplace=True)
+                existing_df.drop_duplicates(subset=['timestamp'], keep='last', inplace=True) # Deduplicate just in case
                 
                 # Get the last timestamp in milliseconds for Binance API
-                last_timestamp_dt = existing_df.index[-1]
+                last_timestamp_dt = existing_df['timestamp'].iloc[-1]
                 last_timestamp_ms = int(last_timestamp_dt.timestamp() * 1000)
                 print(f"{log_prefix_parquet} Last record in existing data: {last_timestamp_dt}")
                 
@@ -332,15 +320,15 @@ def get_or_download_historical_data(symbol: str, interval: str,
         downloaded_df = get_historical_bars(symbol, interval, start_date_str, end_str=end_date_str)
         if downloaded_df is None or downloaded_df.empty:
             print(f"{log_prefix_parquet} No data downloaded for {symbol} (full download attempt). Returning empty DataFrame with headers.")
-            return pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
+            return pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         
         print(f"{log_prefix_parquet} Downloaded full data. Shape: {downloaded_df.shape}. Sorting and saving...")
-        downloaded_df.sort_index(inplace=True)
-        downloaded_df = downloaded_df[~downloaded_df.index.duplicated(keep='last')]
+        downloaded_df.sort_values('timestamp', inplace=True)
+        downloaded_df.drop_duplicates(subset=['timestamp'], keep='last', inplace=True)
         
         try:
             print(f"{log_prefix_parquet} Attempting to write full data to Parquet. Shape: {downloaded_df.shape}. Path: {file_path}")
-            downloaded_df.reset_index().to_parquet(file_path, index=False)
+            downloaded_df.to_parquet(file_path, index=False)
             print(f"{log_prefix_parquet} INFO: Wrote full data: {file_path}")
         except Exception as e:
             print(f"{log_prefix_parquet} ERROR: Failed writing full data to Parquet {file_path}: {e}")
@@ -365,30 +353,30 @@ def get_or_download_historical_data(symbol: str, interval: str,
 
         if new_data_df is not None and not new_data_df.empty:
             print(f"{log_prefix_parquet} Downloaded {len(new_data_df)} new bars for {symbol}. Shape: {new_data_df.shape}")
-            new_data_df.sort_index(inplace=True)
-            new_data_df = new_data_df[~new_data_df.index.duplicated(keep='last')]
+            new_data_df.sort_values('timestamp', inplace=True)
+            new_data_df.drop_duplicates(subset=['timestamp'], keep='last', inplace=True)
 
-            combined_df = pd.concat([existing_df, new_data_df])
+            combined_df = pd.concat([existing_df, new_data_df], ignore_index=True)
             print(f"{log_prefix_parquet} Combined old and new data. Shape before final sort/dedup: {combined_df.shape}")
-            combined_df.sort_index(inplace=True)
-            combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
+            combined_df.sort_values('timestamp', inplace=True)
+            combined_df.drop_duplicates(subset=['timestamp'], keep='last', inplace=True)
             print(f"{log_prefix_parquet} Shape after final sort/dedup: {combined_df.shape}")
             
             try:
                 print(f"{log_prefix_parquet} Attempting to write appended data to Parquet. Shape: {combined_df.shape}. Path: {file_path}")
-                combined_df.reset_index().to_parquet(file_path, index=False)
+                combined_df.to_parquet(file_path, index=False)
                 print(f"{log_prefix_parquet} INFO: Wrote appended data: {file_path}")
             except Exception as e:
                 print(f"{log_prefix_parquet} ERROR: Failed writing appended data to Parquet {file_path}: {e}")
             
             overall_start_dt = pd.to_datetime(start_date_str)
-            combined_df = combined_df[combined_df.index >= overall_start_dt]
+            combined_df = combined_df[combined_df['timestamp'] >= overall_start_dt]
             return combined_df
         else:
             print(f"No new data found for {symbol} since last record.")
             # Filter existing_df to respect original overall start_date_str
             overall_start_dt = pd.to_datetime(start_date_str)
-            existing_df = existing_df[existing_df.index >= overall_start_dt]
+            existing_df = existing_df[existing_df['timestamp'] >= overall_start_dt]
             return existing_df
 
 # --- Configuration Management ---
@@ -1258,7 +1246,6 @@ def execute_app_trade_signal(symbol: str, side: str,
             df_for_atr, atr_err = get_historical_bars(symbol, app_settings.get("app_trading_kline_interval"), f"{atr_period_for_tp3 + 50} days ago UTC"), None # Simplified fetch
             
             if atr_err is None and not df_for_atr.empty and len(df_for_atr) >= atr_period_for_tp3:
-                df_for_atr.set_index('timestamp', inplace=True)
                 df_for_atr = calculate_atr(df_for_atr, period=atr_period_for_tp3) # calculate_atr is from app.py
                 atr_val_for_tp3 = df_for_atr[f'atr_{atr_period_for_tp3}'].iloc[-1]
                 
@@ -2443,22 +2430,12 @@ def app_calculate_live_pivot_features(df_live: pd.DataFrame, atr_period: int, pi
     # if 'is_swing_high' not in df.columns: df['is_swing_high'] = 0 # No longer needed here
     # if 'is_swing_low' not in df.columns: df['is_swing_low'] = 0 # No longer needed here
     
-    # Add symbol context to df.name if it doesn't exist, for engineer_pivot_features logging
-    symbol_for_logging = "UnknownSymbol"
-    if hasattr(df, 'name') and df.name: # If df already has a name (e.g., from get_processed_data_for_symbol)
-        symbol_for_logging = df.name
-    elif 'symbol' in df.columns and not df['symbol'].empty: # Check if 'symbol' column exists and is not empty
-        symbol_for_logging = df['symbol'].iloc[0] # Use the first symbol found in the column
-        df.name = symbol_for_logging # Assign to df.name for consistency if engineer_pivot_features uses it
-
-    print(f"{log_prefix} Calling engineer_pivot_features for symbol: {symbol_for_logging} (ATR: {atr_col_name})")
-    
     try:
         # Note: Optuna and final training use force_live_bars_since_pivot_calc=True.
         # Live prediction should also use this for consistency if that feature is important.
         df_with_features, calculated_feature_names = engineer_pivot_features(df, atr_col_name=atr_col_name, force_live_bars_since_pivot_calc=True)
     except RuntimeError as e:
-        print(f"{log_prefix} Error during engineer_pivot_features for {symbol_for_logging}: {e}")
+        print(f"{log_prefix} Error during engineer_pivot_features: {e}")
         return None
 
     if df_with_features is None: # If engineer_pivot_features returns None explicitly
@@ -2508,31 +2485,6 @@ def app_calculate_live_pivot_features(df_live: pd.DataFrame, atr_period: int, pi
     # --- Enhanced Logging for Final Selected Live Features ---
     # The plan requested .to_dict() for logging.
     log_dict_str = "None or Empty"
-    # --- Apply Scaling ---
-    # Load the pivot scaler (path should be in app_settings, set during training)
-    # Global app_settings should be populated by now.
-    pivot_scaler_loaded = None  # Initialize pivot_scaler_loaded to None
-    pivot_scaler_path = app_settings.get("app_pivot_scaler_path")
-    if pivot_scaler_path and os.path.exists(pivot_scaler_path):
-        try:
-            pivot_scaler_loaded = load_model(pivot_scaler_path) # Reusing load_model for scalers
-            if pivot_scaler_loaded:  # Check if scaler is loaded successfully
-                # Ensure live_features_series is a DataFrame for scaler
-                live_features_df_for_scaling = pd.DataFrame([live_features_series])
-                scaled_features_array = pivot_scaler_loaded.transform(live_features_df_for_scaling)
-                live_features_series = pd.Series(scaled_features_array[0], index=live_features_df_for_scaling.columns)
-                print(f"{log_prefix} Live pivot features scaled successfully using {pivot_scaler_path}.")
-            else:
-                print(f"{log_prefix} WARNING: Pivot scaler loaded as None from '{pivot_scaler_path}'. Using unscaled features.")
-        except Exception as e_scale:
-            print(f"{log_prefix} WARNING: Failed to load or apply pivot scaler from '{pivot_scaler_path}': {e_scale}. Using unscaled features.")
-            pivot_scaler_loaded = None # Ensure pivot_scaler_loaded is None on error
-            # Fall through to use unscaled features if scaling fails
-    else:
-        print(f"{log_prefix} WARNING: Pivot scaler path not found or not configured ('{pivot_scaler_path}'). Using unscaled features for pivot model.")
-        pivot_scaler_loaded = None # Ensure pivot_scaler_loaded is None if path not found
-
-
     if live_features_series is not None and not live_features_series.empty:
         try:
             log_dict_str = str({k: f"{v:.4f}" if isinstance(v, float) else v for k, v in live_features_series.to_dict().items()})
@@ -2671,27 +2623,6 @@ def app_calculate_live_entry_features(df_live: pd.DataFrame, atr_period: int, en
 
     # --- Explicit Logging of Final Feature Vector ---
     log_entry_dict_str = "None or Empty"
-    # --- Apply Scaling for Entry Model ---
-    entry_scaler_loaded = None  # Initialize entry_scaler_loaded to None
-    entry_scaler_path = app_settings.get("app_entry_scaler_path")
-    if entry_scaler_path and os.path.exists(entry_scaler_path):
-        try:
-            entry_scaler_loaded = load_model(entry_scaler_path)
-            if entry_scaler_loaded:  # Check if scaler is loaded successfully
-                live_entry_features_df_for_scaling = pd.DataFrame([live_features_series])
-                scaled_entry_features_array = entry_scaler_loaded.transform(live_entry_features_df_for_scaling)
-                live_features_series = pd.Series(scaled_entry_features_array[0], index=live_entry_features_df_for_scaling.columns)
-                print(f"{log_prefix} Live entry features scaled successfully using {entry_scaler_path}.")
-            else:
-                print(f"{log_prefix} WARNING: Entry scaler loaded as None from '{entry_scaler_path}'. Using unscaled features.")
-        except Exception as e_scale_entry:
-            print(f"{log_prefix} WARNING: Failed to load or apply entry scaler from '{entry_scaler_path}': {e_scale_entry}. Using unscaled features.")
-            entry_scaler_loaded = None # Ensure entry_scaler_loaded is None on error
-    else:
-        print(f"{log_prefix} WARNING: Entry scaler path not found or not configured ('{entry_scaler_path}'). Using unscaled features for entry model.")
-        entry_scaler_loaded = None # Ensure entry_scaler_loaded is None if path not found
-
-
     if live_features_series is not None and not live_features_series.empty:
         try:
             log_entry_dict_str = str({k: f"{v:.4f}" if isinstance(v, float) else v for k, v in live_features_series.to_dict().items()})
@@ -2979,11 +2910,10 @@ def app_process_symbol_for_signal(symbol: str, client, current_app_settings: dic
     
     # --- Perform Additional Pre-Checks (RSI, etc.) ---
     # trade_side_potential is "long" or "short"
-    klines_df_with_timestamp_col = df_live_raw.reset_index()
     preconditions_ok, reject_reason = check_signal_preconditions(
         symbol, 
         trade_side_potential,  # "long" or "short"
-        klines_df_with_timestamp_col, # Full klines DataFrame for RSI calculation
+        df_live_raw, # Full klines DataFrame for RSI calculation
         current_app_settings, 
         live_pivot_features # Pass the already calculated pivot features
     )
@@ -3348,7 +3278,6 @@ def app_check_fib_proposals(client, current_app_settings: dict,
             if df_check_raw.empty or len(df_check_raw) < 3: # Need at least a few candles
                 print(f"{log_prefix_checker} Insufficient kline data for price touch check for {symbol}. Skipping.")
                 continue
-            df_check_raw.set_index('timestamp', inplace=True)
             
             # Use the most recent closed candles for price touch logic
             # For example, check the high/low of the last closed candle
@@ -3647,7 +3576,6 @@ def app_trading_signal_loop(current_app_settings: dict, pivot_model_loaded, entr
     send_app_telegram_message(startup_message)
     
     global app_binance_client # Ensure global client is accessible
-    active_symbol_context = "LoopInitialization" # For error reporting
 
     # Ensure client is initialized (should be by start_app_main_flow, but double check)
     if app_binance_client is None:
@@ -3657,130 +3585,91 @@ def app_trading_signal_loop(current_app_settings: dict, pivot_model_loaded, entr
             return
         print(f"{log_prefix} Binance client initialized successfully within loop startup.")
 
-    from concurrent.futures import ThreadPoolExecutor, as_completed # Ensure this is imported at the top of app.py if not already
-
     try:
-        active_symbol_context = "ThreadPoolInitialization"
-        # Determine max_workers for symbol scanning pool.
-        # Can be a fixed number, os.cpu_count(), or based on number of symbols.
-        # Let's use a sensible default, e.g., min(len(trading_symbols_list_at_startup), os.cpu_count() or 4)
-        # This needs to be defined before the loop if symbols list is static, or dynamically if it changes.
-        # For now, let's define it once based on initial symbol count or a fixed value.
-        
-        # Initial symbol list for determining worker count (can be refined if symbols change dynamically often)
-        initial_symbols_str = current_app_settings.get("app_trading_symbols", "BTCUSDT")
-        initial_trading_symbols_list = []
-        if isinstance(initial_symbols_str, str) and initial_symbols_str.lower().endswith(".csv"):
-            initial_trading_symbols_list = app_load_symbols_from_csv(initial_symbols_str)
-        elif isinstance(initial_symbols_str, str):
-            initial_trading_symbols_list = [s.strip().upper() for s in initial_symbols_str.split(',') if s.strip()]
-        
-        if not initial_trading_symbols_list: initial_trading_symbols_list = ["BTCUSDT"] # Fallback
+        while True:
+            loop_start_time = time.time()
+            print(f"\n{log_prefix} --- New Scan Cycle --- | Mode: {current_app_settings.get('app_operational_mode', 'UNKNOWN')}")
 
-        num_workers_scanning = min(len(initial_trading_symbols_list), (os.cpu_count() or 4) if os.cpu_count() else 4)
-        # Cap workers to a reasonable number if many symbols, e.g., 10, to avoid API rate limits or excessive resource use.
-        num_workers_scanning = min(num_workers_scanning, 10) 
-        print(f"{log_prefix} Using {num_workers_scanning} workers for parallel symbol scanning.")
-
-        with ThreadPoolExecutor(max_workers=num_workers_scanning) as executor:
-            while True:
-                loop_start_time = time.time()
-                print(f"\n{log_prefix} --- New Scan Cycle --- | Mode: {current_app_settings.get('app_operational_mode', 'UNKNOWN')}")
-
-                trading_symbols = [] # This list will be populated fresh each cycle
-                symbols_source_config = current_app_settings.get("app_trading_symbols", "BTCUSDT")
-                
-                if isinstance(symbols_source_config, str) and symbols_source_config.lower().endswith(".csv"):
-                    trading_symbols = app_load_symbols_from_csv(symbols_source_config)
-                    if not trading_symbols: trading_symbols = ["BTCUSDT"]
-                elif isinstance(symbols_source_config, str):
-                    trading_symbols = [s.strip().upper() for s in symbols_source_config.split(',') if s.strip()]
-                    if not trading_symbols: trading_symbols = ["BTCUSDT"]
-                else:
-                    trading_symbols = ["BTCUSDT"]
-                
-                active_symbol_context = f"BatchProcessing_{'_'.join(trading_symbols[:3])}" # Context for the current batch
-
+            trading_symbols = []
+            symbols_source_config = current_app_settings.get("app_trading_symbols", "BTCUSDT") # Default to BTCUSDT string
+            
+            if isinstance(symbols_source_config, str) and symbols_source_config.lower().endswith(".csv"):
+                # Attempt to load from CSV file specified in app_trading_symbols
+                print(f"{log_prefix} Attempting to load symbols from CSV: {symbols_source_config}")
+                trading_symbols = app_load_symbols_from_csv(symbols_source_config)
                 if not trading_symbols:
-                    print(f"{log_prefix} No trading symbols configured. Skipping symbol processing part of cycle.")
-                else:
-                    print(f"{log_prefix} Submitting {len(trading_symbols)} symbols for parallel processing: {trading_symbols}")
-                    future_to_symbol_scan = {
-                        executor.submit(app_process_symbol_for_signal,
-                                        symbol_ticker,
-                                        app_binance_client, # Pass global client
-                                        current_app_settings,
-                                        pivot_model_loaded,
-                                        entry_model_loaded,
-                                        current_best_hyperparams): symbol_ticker
-                        for symbol_ticker in trading_symbols
-                    }
-                    
-                    for future in as_completed(future_to_symbol_scan):
-                        symbol_ticker_scan = future_to_symbol_scan[future]
-                        active_symbol_context = symbol_ticker_scan # Update context to the specific symbol being handled
-                        try:
-                            # app_process_symbol_for_signal doesn't typically return a value we need to capture here.
-                            # It logs its own success/failure. We just want to ensure it completes or handle exceptions.
-                            future.result() # Wait for completion and raise exceptions if any
-                            print(f"{log_prefix} Successfully completed processing for {symbol_ticker_scan} in parallel scan.")
-                        except Exception as exc_scan:
-                            print(f"{log_prefix} Symbol {symbol_ticker_scan} generated an exception during parallel scan: {exc_scan}")
-                            import traceback
-                            traceback.print_exc()
-                            # Optionally send a Telegram alert about the error for this symbol
-                            send_app_telegram_message(f"🆘 ERROR processing {symbol_ticker_scan} in scan: {str(exc_scan)[:200]}")
-                    
-                    active_symbol_context = "BatchScanComplete" # Reset context after batch
-                    print(f"{log_prefix} Parallel symbol scanning for this cycle complete.")
-                    # Note: The app_delay_between_symbols_seconds is no longer applicable in parallel execution.
-                    # If delays are needed (e.g. for API rate limits), they should be managed within app_process_symbol_for_signal
-                    # or by adjusting the number of workers.
+                    print(f"{log_prefix} Failed to load symbols from {symbols_source_config} or file is empty. Defaulting to BTCUSDT.")
+                    trading_symbols = ["BTCUSDT"]
+            elif isinstance(symbols_source_config, str):
+                # Parse as comma-separated string
+                trading_symbols = [s.strip().upper() for s in symbols_source_config.split(',') if s.strip()]
+                if not trading_symbols: # If string was empty or only commas
+                    print(f"{log_prefix} 'app_trading_symbols' string ('{symbols_source_config}') resulted in no symbols. Defaulting to BTCUSDT.")
+                    trading_symbols = ["BTCUSDT"]
+            else: # Fallback if config is not a string (e.g. error or unexpected type)
+                print(f"{log_prefix} 'app_trading_symbols' has unexpected type or value. Defaulting to BTCUSDT.")
+                trading_symbols = ["BTCUSDT"]
 
-                # --- Check Fibonacci Pre-Order Proposals (remains sequential after parallel scan) ---
-                if current_app_settings.get("use_fib_preorder", False): # Only run if feature is enabled
-                    print(f"{log_prefix} Checking Fibonacci pre-order proposals...")
-                    app_check_fib_proposals(
-                        client=app_binance_client,
+            if not trading_symbols: # Final fallback, though logic above should ensure trading_symbols is not empty
+                print(f"{log_prefix} No trading symbols configured after all checks. Skipping cycle.")
+            else:
+                print(f"{log_prefix} Processing symbols: {trading_symbols}")
+                for symbol_to_trade in trading_symbols:
+                    print(f"{log_prefix} Processing symbol: {symbol_to_trade}")
+                    app_process_symbol_for_signal(
+                        symbol=symbol_to_trade,
+                        client=app_binance_client, # Use the global client
                         current_app_settings=current_app_settings,
-                        pivot_model_loaded=pivot_model_loaded, # Pass loaded models
+                        pivot_model_loaded=pivot_model_loaded,
                         entry_model_loaded=entry_model_loaded,
                         current_best_hyperparams=current_best_hyperparams
                     )
-                # --- End Fibonacci Pre-Order Proposal Check ---
+                    # Optional: Short delay between processing symbols if multiple are listed
+                    time.sleep(current_app_settings.get("app_delay_between_symbols_seconds", 2)) # Default 2s
 
-                # Monitor existing trades/signals (if any were placed)
-                # monitor_app_trades uses the global app_binance_client and app_active_trades
-                if current_app_settings.get('app_operational_mode') == 'live':
-                     print(f"{log_prefix} Monitoring active live trades...")
-                     monitor_app_trades() 
-                elif current_app_settings.get('app_operational_mode') == 'signal':
-                     # If signal mode also needs monitoring (e.g. for virtual SL/TP hits), call a similar function.
-                     # For now, monitor_app_trades is primarily for live order management.
-                     # We might need a separate `monitor_app_virtual_signals` or adapt `monitor_app_trades`.
-                     # The current `monitor_app_trades` has logic for "signal" mode signals if they are in `app_active_trades`.
-                     # The `execute_app_trade_signal` does not add to `app_active_trades` in signal mode.
-                     # This part needs refinement if signal mode requires active monitoring beyond just sending initial signal.
-                     # For now, let's assume `monitor_app_trades` is primarily for live logic.
-                     # If `app_process_symbol_for_signal` were to add signals to a list for tracking,
-                     # a `monitor_app_signals` function would go here.
-                     pass
-                
-                # Save decision log periodically (e.g., every cycle if new entries, or based on buffer)
-                save_decision_log_to_csv() # Will save if buffer is full or if forced (not forced here)
+            # --- Check Fibonacci Pre-Order Proposals ---
+            if current_app_settings.get("use_fib_preorder", False): # Only run if feature is enabled
+                print(f"{log_prefix} Checking Fibonacci pre-order proposals...")
+                app_check_fib_proposals(
+                    client=app_binance_client,
+                    current_app_settings=current_app_settings,
+                    pivot_model_loaded=pivot_model_loaded, # Pass loaded models
+                    entry_model_loaded=entry_model_loaded,
+                    current_best_hyperparams=current_best_hyperparams
+                )
+            # --- End Fibonacci Pre-Order Proposal Check ---
+
+            # Monitor existing trades/signals (if any were placed)
+            # monitor_app_trades uses the global app_binance_client and app_active_trades
+            if current_app_settings.get('app_operational_mode') == 'live':
+                 print(f"{log_prefix} Monitoring active live trades...")
+                 monitor_app_trades() 
+            elif current_app_settings.get('app_operational_mode') == 'signal':
+                 # If signal mode also needs monitoring (e.g. for virtual SL/TP hits), call a similar function.
+                 # For now, monitor_app_trades is primarily for live order management.
+                 # We might need a separate `monitor_app_virtual_signals` or adapt `monitor_app_trades`.
+                 # The current `monitor_app_trades` has logic for "signal" mode signals if they are in `app_active_trades`.
+                 # The `execute_app_trade_signal` does not add to `app_active_trades` in signal mode.
+                 # This part needs refinement if signal mode requires active monitoring beyond just sending initial signal.
+                 # For now, let's assume `monitor_app_trades` is primarily for live logic.
+                 # If `app_process_symbol_for_signal` were to add signals to a list for tracking,
+                 # a `monitor_app_signals` function would go here.
+                 pass
+            
+            # Save decision log periodically (e.g., every cycle if new entries, or based on buffer)
+            save_decision_log_to_csv() # Will save if buffer is full or if forced (not forced here)
 
 
-                # Loop delay
-                scan_interval_seconds = current_app_settings.get("app_scan_interval_seconds", 60) # Default to 60 seconds
-                loop_duration = time.time() - loop_start_time
-                sleep_time = max(0, scan_interval_seconds - loop_duration)
-                
-                if sleep_time > 0:
-                    print(f"{log_prefix} Cycle completed in {loop_duration:.2f}s. Sleeping for {sleep_time:.2f}s...")
-                    time.sleep(sleep_time)
-                else:
-                    print(f"{log_prefix} Cycle completed in {loop_duration:.2f}s. Starting next cycle immediately (scan interval too short or processing too long).")
-
+            # Loop delay
+            scan_interval_seconds = current_app_settings.get("app_scan_interval_seconds", 60) # Default to 60 seconds
+            loop_duration = time.time() - loop_start_time
+            sleep_time = max(0, scan_interval_seconds - loop_duration)
+            
+            if sleep_time > 0:
+                print(f"{log_prefix} Cycle completed in {loop_duration:.2f}s. Sleeping for {sleep_time:.2f}s...")
+                time.sleep(sleep_time)
+            else:
+                print(f"{log_prefix} Cycle completed in {loop_duration:.2f}s. Starting next cycle immediately (scan interval too short or processing too long).")
 
     except KeyboardInterrupt:
         print(f"\n{log_prefix} Loop interrupted by user (Ctrl+C). Shutting down...")
@@ -3789,7 +3678,7 @@ def app_trading_signal_loop(current_app_settings: dict, pivot_model_loaded, entr
         import traceback
         traceback.print_exc()
         # Optionally send a Telegram alert about the critical error
-        error_message = f"🆘 CRITICAL ERROR in AppTradingLoop 🆘\nContext: {active_symbol_context}\nError: {str(e)[:1000]}"
+        error_message = f"🆘 CRITICAL ERROR in AppTradingLoop 🆘\nSymbol: {symbol_to_trade if 'symbol_to_trade' in locals() else 'N/A'}\nError: {str(e)[:1000]}"
         send_app_telegram_message(error_message) # Uses global app_trading_configs for token/chat_id
     finally:
         print(f"{log_prefix} Trading/signal loop stopped. Saving final decision log...")
@@ -3805,17 +3694,15 @@ def start_app_main_flow():
     # 1. Load settings
     load_app_settings() # Loads or prompts for settings and saves them
     load_app_trading_configs() # Ensure trading configs are populated from app_settings
-    
-    # Excluded symbols
-    excluded_symbols = ["SUIUSDT", "LEOUSDT"]
 
     # 2. Check for ML Models
     # check_ml_models_exist now returns versioned paths based on current app_study_version
+    models_exist, versioned_pivot_model_path_check, versioned_entry_model_path_check, versioned_params_path_check = check_ml_models_exist()
+    
     force_retrain = app_settings.get("app_force_retrain_on_startup", False)
 
     # Main application loop / decision tree
     while True: # Loop to allow retraining and then returning to choices
-        models_exist, versioned_pivot_model_path_check, versioned_entry_model_path_check, versioned_params_path_check = check_ml_models_exist()
         # Re-check model existence at the start of each loop iteration, as paths might change if study_version is altered by user/program
         # This ensures that if training happens, the subsequent load attempt uses the correct versioned paths.
         current_study_version_for_loop = app_settings.get("app_study_version", "default_study_v1")
@@ -3870,8 +3757,6 @@ def start_app_main_flow():
             if training_symbols_list is None or not training_symbols_list: # Check None or empty
                 print(f"{log_prefix} CRITICAL: No training symbols loaded from any source. Defaulting to BTCUSDT for training.")
                 training_symbols_list = ["BTCUSDT"]
-                
-            training_symbols_list = [s for s in training_symbols_list if s not in excluded_symbols]
             
             kline_interval_train = app_settings.get("app_training_kline_interval", Client.KLINE_INTERVAL_15MINUTE)
             start_date_train = app_settings.get("app_training_start_date", "1 Jan, 2023")
@@ -3884,87 +3769,31 @@ def start_app_main_flow():
             processed_pivot_feature_names_app = None # Initialize for this training run
             processed_entry_feature_names_base_app = None # Initialize for this training run
 
-            # --- Parallelized Data Processing for Training ---
-            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            for symbol_ticker_app in training_symbols_list:
+                processed_df_app, pivot_feats_app, entry_feats_base_app = get_processed_data_for_symbol(
+                    symbol_ticker_app, kline_interval_train, start_date_train, end_date_train
+                )
+                if processed_df_app is not None and not processed_df_app.empty:
+                    if processed_pivot_feature_names_app is None: # Capture feature names from first successful processing
+                        processed_pivot_feature_names_app = pivot_feats_app
+                    if processed_entry_feature_names_base_app is None: # Capture from first
+                        processed_entry_feature_names_base_app = entry_feats_base_app
+                    all_symbols_train_data_list_app.append(processed_df_app)
             
-            # Determine number of threads (e.g., number of symbols or a fixed cap like 5 or CPU count)
-            # For now, let's use a sensible default, e.g., min(len(training_symbols_list), os.cpu_count() or 4)
-            # This assumes os.cpu_count() is available. If not, a fixed number.
-            num_workers_data_processing = min(len(training_symbols_list), (os.cpu_count() or 4) if os.cpu_count() else 4)
-            print(f"{log_prefix} Using {num_workers_data_processing} workers for parallel data processing.")
-
-            with ThreadPoolExecutor(max_workers=num_workers_data_processing) as executor:
-                # Define a default or base config for data processing
-                # This could be a subset of app_settings or a specific configuration dict
-                data_processing_config = {
-                    "atr_period": app_settings.get("app_atr_period_sl_tp", 14), # Example, should match training logic
-                    "pivot_n_left": PIVOT_N_LEFT,
-                    "pivot_n_right": PIVOT_N_RIGHT,
-                    "min_atr_distance": MIN_ATR_DISTANCE,
-                    "min_bar_gap": MIN_BAR_GAP,
-                    # Add other necessary parameters that get_processed_data_for_symbol might need
-                }
-                print(f"DEBUG: data_processing_config: {data_processing_config}")
-
-                future_to_symbol = {
-                    executor.submit(get_processed_data_for_symbol,
-                                    data_processing_config,
-                                    symbol_ticker,
-                                    kline_interval_train,
-                                    start_date_train,
-                                    end_date_train,
-                                    force_reprocess=force_retrain): symbol_ticker
-                    for symbol_ticker in training_symbols_list
-                }
-                
-                for future in as_completed(future_to_symbol):
-                    symbol_ticker_app = future_to_symbol[future]
-                    try:
-                        processed_df_app, pivot_feats_app, entry_feats_base_app = future.result()
-                        if processed_df_app is not None and not processed_df_app.empty:
-                            if processed_pivot_feature_names_app is None and pivot_feats_app: # Capture feature names from first successful processing
-                                processed_pivot_feature_names_app = pivot_feats_app
-                            if processed_entry_feature_names_base_app is None and entry_feats_base_app: # Capture from first
-                                processed_entry_feature_names_base_app = entry_feats_base_app
-                            all_symbols_train_data_list_app.append(processed_df_app)
-                            print(f"{log_prefix} Successfully processed data for {symbol_ticker_app} in parallel.")
-                        else:
-                            print(f"{log_prefix} No data returned or empty data for {symbol_ticker_app} from parallel processing.")
-                    except Exception as exc:
-                        print(f"{log_prefix} Symbol {symbol_ticker_app} generated an exception during parallel data processing: {exc}")
-                        import traceback
-                        traceback.print_exc()
-            
-            if not all_symbols_train_data_list_app: print("CRITICAL: No training data after parallel processing. Cannot train models."); sys.exit(1)
-            
-            # Ensure feature names were captured from at least one symbol.
-            # If multiple symbols return different feature sets (should not happen with current design), this takes the first one.
-            if processed_pivot_feature_names_app is None or processed_entry_feature_names_base_app is None:
-                 # Attempt to get from the first valid df if lists are still None
-                 if all_symbols_train_data_list_app:
-                     # This part is tricky because get_processed_data_for_symbol returns the features, not the df itself containing them as columns
-                     # The current structure assumes that if processed_df_app is valid, pivot_feats_app and entry_feats_base_app were also valid from that call.
-                     # If after all parallel calls, these are still None, it means no symbol processing was successful in returning feature names.
-                     print("CRITICAL: Feature names for training not determined after parallel processing (no symbol data processed successfully or returned feature names?). Exiting.")
-                     sys.exit(1)
-
-
+            if not all_symbols_train_data_list_app: print("CRITICAL: No training data. Cannot train models."); sys.exit(1) # Empty list check
             universal_df_initial_processed_app = pd.concat(all_symbols_train_data_list_app, ignore_index=True)
-            if len(universal_df_initial_processed_app) < 200: print(f"CRITICAL: Combined training data too small ({len(universal_df_initial_processed_app)}) after parallel processing."); sys.exit(1)
-            
-            # Ensure feature names are available before Optuna (already checked above, but good final check)
-            if processed_pivot_feature_names_app is None or processed_entry_feature_names_base_app is None:
-                print("CRITICAL: Feature names for training are still None before Optuna. Exiting.")
-                sys.exit(1)
-            
-            print(f"{log_prefix} Parallel data processing complete. Combined data shape: {universal_df_initial_processed_app.shape}")
-            # --- End Parallelized Data Processing ---
+            if len(universal_df_initial_processed_app) < 200: print(f"CRITICAL: Combined training data too small ({len(universal_df_initial_processed_app)})."); sys.exit(1)
 
+            # Ensure feature names are available before Optuna if they were determined
+            if processed_pivot_feature_names_app is None or processed_entry_feature_names_base_app is None:
+                print("CRITICAL: Feature names for training not determined (no symbol data processed successfully?). Exiting.")
+                sys.exit(1)
 
             try:
                 current_best_hyperparams = run_optuna_tuning(
                     universal_df_initial_processed_app.copy(),
-                    static_entry_features_base_list=processed_entry_feature_names_base_app, 
+                    static_entry_features_base_list=processed_entry_feature_names_base_app, # Pass determined base names
                     n_trials=optuna_trials_app
                 )
                 if current_best_hyperparams is None: # Check if Optuna returned None
@@ -4084,31 +3913,23 @@ def start_app_main_flow():
             raw_pivot_args = {k.replace('pivot_', ''):v for k,v in best_hyperparams.items() if k.startswith('pivot_')}
             pivot_model_args = {k: v for k, v in raw_pivot_args.items() if k in valid_pivot_model_arg_names}
             
-            # --- Pivot Model Scaling & Training (Final) ---
-            final_pivot_scaler = StandardScaler()
-            X_p_train_resampled_scaled = final_pivot_scaler.fit_transform(X_p_train_resampled)
-            # Save the scaler
-            pivot_scaler_basename = "pivot_scaler.joblib" # Define a basename for the scaler
-            current_version_pivot_scaler_path = os.path.join(current_versioned_artifact_dir, pivot_scaler_basename)
-            save_model(final_pivot_scaler, current_version_pivot_scaler_path)
-            app_settings["app_pivot_scaler_path"] = current_version_pivot_scaler_path # Store path in settings
-            print(f"Pivot scaler for '{current_study_version_for_loop}' saved to {current_version_pivot_scaler_path}")
-
-            print(f"DEBUG: Args passed to train_pivot_model (final): {pivot_model_args}")
+            print(f"DEBUG: Args passed to train_pivot_model: {pivot_model_args}") # Log the actual args
+            # Train pivot model with resampled data
             temp_pivot_model, _ = train_pivot_model(X_p_train_resampled, y_p_train_resampled, 
-                                                    X_p_train_resampled, y_p_train_resampled, # Using scaled for validation
+                                                    X_p_train_resampled, y_p_train_resampled, # Using resampled for validation during this fit
                                                     **pivot_model_args)
             if temp_pivot_model is None: print("CRITICAL: Pivot model training failed. Exiting."); sys.exit(1)
             
-            os.makedirs(current_versioned_artifact_dir, exist_ok=True)
+            # Save model to versioned path
+            os.makedirs(current_versioned_artifact_dir, exist_ok=True) # Ensure directory exists
             save_model(temp_pivot_model, current_version_pivot_path) 
-            app_settings["app_pivot_model_path"] = current_version_pivot_path
+            app_settings["app_pivot_model_path"] = current_version_pivot_path # Update setting to new path
             universal_pivot_model = temp_pivot_model
             print(f"Pivot model for '{current_study_version_for_loop}' saved to {current_version_pivot_path}")
 
-            # For P_swing on original data, scale X_p_train (non-resampled) with the fitted pivot_scaler
-            X_p_train_scaled_for_pswing = final_pivot_scaler.transform(X_p_train)
-            p_swing_on_original_train_data = temp_pivot_model.predict_proba(X_p_train_scaled_for_pswing)
+            # For calculating P_swing on the original (non-resampled) df_final_train for entry candidate filtering:
+            # This is important because we want to evaluate P_swing on the original data distribution.
+            p_swing_on_original_train_data = temp_pivot_model.predict_proba(X_p_train) # X_p_train is original
             df_final_train['P_swing'] = np.max(p_swing_on_original_train_data[:,1:], axis=1)
             
             # Filter for entry candidates
@@ -4130,39 +3951,27 @@ def start_app_main_flow():
                 
                 full_entry_feats = final_entry_base_feats_to_use + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']
                 X_e_train = entry_candidates[full_entry_feats].fillna(-1)
-                y_e_train = (entry_candidates['trade_outcome'] > 0).astype(int) # Target variable for entry model
+                y_e_train = (entry_candidates['trade_outcome'] > 0).astype(int)
                 
-                if len(X_e_train) > 0 and len(y_e_train.unique()) > 1: # Ensure data and class diversity
-                    # --- Entry Model Scaling & Training (Final) ---
-                    final_entry_scaler = StandardScaler()
-                    X_e_train_scaled = final_entry_scaler.fit_transform(X_e_train)
-                    # Save the entry scaler
-                    entry_scaler_basename = "entry_scaler.joblib"
-                    current_version_entry_scaler_path = os.path.join(current_versioned_artifact_dir, entry_scaler_basename)
-                    save_model(final_entry_scaler, current_version_entry_scaler_path)
-                    app_settings["app_entry_scaler_path"] = current_version_entry_scaler_path # Store path
-                    print(f"Entry scaler for '{current_study_version_for_loop}' saved to {current_version_entry_scaler_path}")
-
+                if len(X_e_train) > 0 and len(y_e_train.unique()) > 1:
                     valid_entry_model_arg_names = ['model_type', 'num_leaves', 'learning_rate', 'max_depth', 'n_estimators']
                     raw_entry_args = {k.replace('entry_', ''):v for k,v in best_hyperparams.items() if k.startswith('entry_')}
                     entry_model_args = {k: v for k, v in raw_entry_args.items() if k in valid_entry_model_arg_names}
                     
-                    print(f"DEBUG: Args passed to train_entry_model (final): {entry_model_args}")
-                    # Train with scaled data
-                    temp_entry_model, _ = train_entry_model(X_e_train, y_e_train, 
-                                                            X_e_train, y_e_train, # Using scaled for validation
-                                                            **entry_model_args)
+                    print(f"DEBUG: Args passed to train_entry_model: {entry_model_args}")
+                    temp_entry_model, _ = train_entry_model(X_e_train, y_e_train, X_e_train, y_e_train, **entry_model_args)
                     if temp_entry_model is None: 
-                        print(f"{log_prefix} Entry model training returned None. Marking as not trained.")
-                        universal_entry_model = None # Ensure it's None
+                        print(f"{log_prefix} Entry model training returned None. Marking as not trained."); 
+                        universal_entry_model = None
                     else: 
-                        os.makedirs(current_versioned_artifact_dir, exist_ok=True)
+                        # Save entry model to versioned path
+                        os.makedirs(current_versioned_artifact_dir, exist_ok=True) # Ensure directory exists
                         save_model(temp_entry_model, current_version_entry_path)
-                        app_settings["app_entry_model_path"] = current_version_entry_path
+                        app_settings["app_entry_model_path"] = current_version_entry_path # Update setting
                         universal_entry_model = temp_entry_model
                         print(f"{log_prefix} Entry model for '{current_study_version_for_loop}' trained and saved to {current_version_entry_path}.")
                 else:
-                    print(f"{log_prefix} Entry model training SKIPPED: Insufficient data or class diversity for training. X_e_train length: {len(X_e_train)}, y_e_train unique values: {y_e_train.unique() if len(X_e_train) > 0 else 'N/A'}.")
+                    print(f"{log_prefix} Entry model training SKIPPED: Insufficient data diversity for training. X_e_train length: {len(X_e_train)}, y_e_train unique values: {y_e_train.unique() if len(X_e_train) > 0 else 'N/A'}.")
                     universal_entry_model = None # Ensure it's None if skipped
             else:
                 print(f"{log_prefix} Entry model training SKIPPED: Not enough candidates ({len(entry_candidates)}) after pivot filter (P_swing >= {p_swing_thresh_for_entry_candidates:.2f}). Minimum required: {MIN_ENTRY_CANDIDATES}.")
@@ -4181,33 +3990,14 @@ def start_app_main_flow():
                final_pivot_feats_to_use is not None and \
                final_entry_base_feats_to_use is not None and \
                app_settings is not None:
-
-                # Load the scalers that were just saved during the final training phase
-                pivot_scaler_path = app_settings.get("app_pivot_scaler_path")
-                entry_scaler_path = app_settings.get("app_entry_scaler_path")
-                
-                final_pivot_scaler_loaded = None
-                if pivot_scaler_path and os.path.exists(pivot_scaler_path):
-                    final_pivot_scaler_loaded = load_model(pivot_scaler_path)
-                else:
-                    print(f"WARNING: Pivot scaler not found at '{pivot_scaler_path}' for summary generation.")
-
-                final_entry_scaler_loaded = None
-                if entry_scaler_path and os.path.exists(entry_scaler_path):
-                    final_entry_scaler_loaded = load_model(entry_scaler_path)
-                else:
-                    print(f"WARNING: Entry scaler not found at '{entry_scaler_path}' for summary generation.")
-
                 generate_training_backtest_summary(
-                    df_processed_full_dataset=df_final_train,
+                    df_processed_full_dataset=df_final_train, 
                     pivot_model=universal_pivot_model,
                     entry_model=universal_entry_model,
-                    best_params_from_optuna=best_hyperparams,
-                    pivot_feature_names_list=final_pivot_feats_to_use,
-                    entry_feature_names_base_list=final_entry_base_feats_to_use,
-                    app_settings_dict=app_settings,
-                    pivot_scaler_for_summary=final_pivot_scaler_loaded,
-                    entry_scaler_for_summary=final_entry_scaler_loaded
+                    best_params_from_optuna=best_hyperparams, # This contains all tuned params including thresholds
+                    pivot_feature_names_list=final_pivot_feats_to_use, # Features used for pivot model
+                    entry_feature_names_base_list=final_entry_base_feats_to_use, # Base features for entry model
+                    app_settings_dict=app_settings
                 )
             else:
                 print("Skipping training summary generation due to missing data or models from training process.")
@@ -4272,40 +4062,37 @@ def start_app_main_flow():
                 print(f"[ERROR] loading entry model from '{checked_entry_path}': {e}")
                 retry_train = input(f"Error loading entry model. Attempt to retrain models? (yes/no) [yes]: ").lower()
                 if retry_train in ['no', 'n']: sys.exit(1)
-                force_retrain = True; models_exist_loop_check = False; continue # models_exist_loop_check to trigger retrain path
+                force_retrain = True; models_exist_loop_check = False; continue
 
             try:
                 # `checked_params_path` is the versioned path to the params file
                 with open(checked_params_path, 'r') as f:
                     loaded_params = json.load(f) 
-                if loaded_params is None or not loaded_params:
-                    raise ValueError(f"Parameters file '{checked_params_path}' loaded as None or empty.")
+                if loaded_params is None or not loaded_params: 
+                    raise ValueError("Parameters file loaded as None or empty.")
+                best_hyperparams = loaded_params 
                 
-                # Validate essential keys in loaded_params
-                required_keys = ['pivot_feature_names_used', 'entry_feature_names_base_used', 
-                                 'model_training_atr_period_used', 'p_swing_threshold', 'profit_threshold']
-                missing_keys = [key for key in required_keys if key not in loaded_params or not loaded_params[key]] # Check loaded_params
+                required_keys = ['pivot_feature_names_used', 'entry_feature_names_base_used', 'model_training_atr_period_used']
+                missing_keys = [key for key in required_keys if key not in best_hyperparams or not best_hyperparams[key]]
                 if missing_keys:
-                    raise ValueError(f"Parameters file '{checked_params_path}' is incomplete. Missing or empty for critical keys: {missing_keys}.")
-                
-                best_hyperparams = loaded_params # Assign to global after validation
-                print(f"Parameters successfully loaded and validated from '{checked_params_path}'.")
+                    print(f"[ERROR] Parameters file '{checked_params_path}' is incomplete. Missing or empty for keys: {missing_keys}.")
+                    raise ValueError(f"Incomplete parameters file, missing: {missing_keys}")
 
             except FileNotFoundError:
-                print(f"[ERROR] Parameters file not found at '{checked_params_path}' (expected by check_ml_models_exist). This could indicate an issue with file saving or pathing previously.")
-                retry_train = input(f"Critical: Parameters file missing. Attempt to retrain models? (yes/no) [yes]: ").lower()
+                print(f"[ERROR] parameters file not found at '{checked_params_path}'.")
+                retry_train = input(f"Parameters file not found. Attempt to retrain models (which recreates this file)? (yes/no) [yes]: ").lower()
                 if retry_train in ['no', 'n']: sys.exit(1)
                 force_retrain = True; models_exist_loop_check = False; universal_pivot_model = None; universal_entry_model = None; best_hyperparams = {}; continue
-            except (json.JSONDecodeError, ValueError) as e_params_load: # Catches both JSON errors and our custom ValueErrors for structure
-                print(f"[ERROR] Error loading, decoding, or validating parameters file '{checked_params_path}': {e_params_load}")
-                retry_train = input(f"Critical: Parameters file corrupted or invalid. Attempt to retrain models? (yes/no) [yes]: ").lower()
+            except (json.JSONDecodeError, ValueError) as e_params_load: 
+                print(f"[ERROR] loading or validating parameters file '{checked_params_path}': {e_params_load}")
+                retry_train = input(f"Error with parameters file. Attempt to retrain models? (yes/no) [yes]: ").lower()
                 if retry_train in ['no', 'n']: sys.exit(1)
                 force_retrain = True; models_exist_loop_check = False; universal_pivot_model = None; universal_entry_model = None; best_hyperparams = {}; continue
-            except Exception as e_params_other: # Catch-all for other unexpected errors during params loading
-                print(f"[ERROR] Unexpected error loading parameters file '{checked_params_path}': {e_params_other}")
-                retry_train = input(f"Unexpected error with parameters file. Attempt to retrain models? (yes/no) [yes]: ").lower()
+            except Exception as e_params: 
+                print(f"[ERROR] loading parameters file '{checked_params_path}': {e_params}")
+                retry_train = input(f"Unexpected error loading parameters file. Attempt to retrain models? (yes/no) [yes]: ").lower()
                 if retry_train in ['no', 'n']: sys.exit(1)
-                force_retrain = True; models_exist_loop_check = False; universal_pivot_model = None; universal_entry_model = None; best_hyperparams = {}; continue # models_exist_loop_check to trigger retrain path
+                force_retrain = True; models_exist_loop_check = False; continue
             
             print(f"Models and parameters for version '{current_study_version_for_loop}' loaded successfully.")
 
@@ -4313,24 +4100,45 @@ def start_app_main_flow():
         print("\n--- Application Menu ---")
         print("1. Start Live Market Trading / Signal Generation")
         print("2. Retrain ML Models")
-        print("3. Run Golden Pivot Test Harness")
-        print("4. Exit")
-        user_action = input("Enter choice (1-4): ")
+        print("3. Exit")
+        user_action = input("Enter choice (1-3): ")
 
         if user_action == '1':
-            # ... (existing code for starting trading)
-            pass
+            print("Starting Live Market Trading / Signal Generation mode...")
+            app_settings['app_operational_mode'] = get_user_input(
+                "Set operational mode ('live' or 'signal')",
+                app_settings.get("app_operational_mode", "signal"), 
+                str, choices=['live', 'signal']
+            )
+            save_app_settings() 
+            print(f"Operational mode set to: {app_settings['app_operational_mode']}")
+            
+            if app_binance_client is None: # Initialize client if not done yet
+                if not initialize_app_binance_client(env=app_settings.get("app_trading_environment")):
+                    print("CRITICAL: Failed to initialize Binance client. Exiting.")
+                    sys.exit(1)
+            
+            # --- Call the main trading/signal loop ---
+            print(f"{log_prefix} Initializing trading/signal loop with mode: {app_settings['app_operational_mode']}")
+            app_trading_signal_loop(
+                current_app_settings=app_settings, # Pass the global app_settings
+                pivot_model_loaded=universal_pivot_model,
+                entry_model_loaded=universal_entry_model,
+                current_best_hyperparams=best_hyperparams
+            )
+            # The loop will run until explicitly stopped (e.g., Ctrl+C or a shutdown command if implemented)
+            # If the loop exits, the application can then terminate.
+            print(f"{log_prefix} Trading/signal loop has exited. Application will now terminate.")
+            sys.exit(0) # Exit after the loop finishes
+        
         elif user_action == '2':
-            # ... (existing code for retraining)
-            pass
+            print("User chose to retrain models.")
+            force_retrain = True 
+            models_exist = False 
+            universal_pivot_model, universal_entry_model, best_hyperparams = None, None, {} # Clear loaded models
+            continue 
+        
         elif user_action == '3':
-            if universal_pivot_model and best_hyperparams:
-                pivot_scaler_path = app_settings.get("app_pivot_scaler_path")
-                pivot_scaler = load_model(pivot_scaler_path) if pivot_scaler_path and os.path.exists(pivot_scaler_path) else None
-                test_pivot_detector(universal_pivot_model, pivot_scaler, best_hyperparams)
-            else:
-                print("Models not loaded. Please train or load models first.")
-        elif user_action == '4':
             print("Exiting application.")
             sys.exit(0)
         else:
@@ -4338,11 +4146,12 @@ def start_app_main_flow():
 
 def calculate_atr(df, period=ATR_PERIOD):
     """Calculates Average True Range."""
-    high_low = df['high'] - df['low']
-    high_close_prev = np.abs(df['high'] - df['close'].shift(1))
-    low_close_prev = np.abs(df['low'] - df['close'].shift(1))
-    tr = pd.concat([high_low, high_close_prev, low_close_prev], axis=1).max(axis=1)
-    df[f'atr_{period}'] = tr.rolling(window=period).mean()
+    """Calculates Average True Range."""
+    df['high_low'] = df['high'] - df['low']
+    df['high_close_prev'] = np.abs(df['high'] - df['close'].shift(1))
+    df['low_close_prev'] = np.abs(df['low'] - df['close'].shift(1))
+    df['tr'] = df[['high_low', 'high_close_prev', 'low_close_prev']].max(axis=1)
+    df[f'atr_{period}'] = df['tr'].rolling(window=period).mean()
     return df
 
 def generate_candidate_pivots(df, n_left=PIVOT_N_LEFT, n_right=PIVOT_N_RIGHT):
@@ -4385,60 +4194,128 @@ def generate_candidate_pivots(df, n_left=PIVOT_N_LEFT, n_right=PIVOT_N_RIGHT):
             df.loc[df.index[i], 'is_candidate_low'] = True
     return df
 
-def prune_and_label_pivots(df, atr_col_name, atr_distance_factor=MIN_ATR_DISTANCE, min_bar_gap=MIN_BAR_GAP):
-    df['is_swing_high'] = 0
+def prune_and_label_pivots(df, atr_col_name, atr_distance_factor=MIN_ATR_DISTANCE, min_bar_gap=MIN_BAR_GAP): # Added atr_col_name
+    """
+    Prunes candidate pivots and labels them.
+    - Enforce ATR-distance >= 1 * ATR14 from the previous pivot.
+    - Enforce bar gap >= 8 bars since the last confirmed pivot.
+    - Label each pivot as is_swing_high, is_swing_low, or neither.
+    """
+    df['is_swing_high'] = 0 # 0: neither, 1: swing high, 2: swing low (for multiclass target)
     df['is_swing_low'] = 0
-    df['pivot_label'] = 0  # 0: none, 1: high, 2: low, 3: ambiguous
+    df['pivot_label'] = 0 # 0: none, 1: high, 2: low
+
     last_confirmed_pivot_idx = -1
     last_confirmed_pivot_price = 0
+    last_confirmed_pivot_type = None
 
     if atr_col_name not in df.columns:
-        print(f"Warning: ATR column '{atr_col_name}' not found. ATR distance pruning will be skipped.")
-        atr_distance_factor = 0
+        print(f"Warning (prune_and_label_pivots): ATR column '{atr_col_name}' not found. Pivots might be incorrect if ATR is needed and not present. Returning df as is.")
+        return df # Cannot proceed without ATR column if it's expected
+
+    # Parse ATR period from atr_col_name for warmup period calculation
+    try:
+        parsed_atr_period = int(atr_col_name.split('_')[-1])
+        if parsed_atr_period <= 0:
+            raise ValueError("Parsed ATR period must be positive.")
+    except (ValueError, IndexError):
+        print(f"Error (prune_and_label_pivots): Could not parse ATR period from '{atr_col_name}'. Assuming 14 for warmup. This may be incorrect.")
+        parsed_atr_period = 14 # Fallback
+
+    min_index_for_valid_atr = parsed_atr_period - 1
+
+    # Iterate starting from where ATR is expected to be valid
+    candidates_evaluated = 0
+    pruned_by_bar_gap = 0
+    pruned_by_atr_dist = 0
+    pruned_by_invalid_atr_current = 0
+    pruned_by_invalid_atr_last = 0
+    confirmed_pivots = 0
 
     for i in range(len(df)):
-        is_candidate_high = df.get('is_candidate_high', pd.Series(False, index=df.index)).iloc[i]
-        is_candidate_low = df.get('is_candidate_low', pd.Series(False, index=df.index)).iloc[i]
+        if i < min_index_for_valid_atr and atr_distance_factor > 0: # Skip early bars if ATR is used for pruning
+            continue
+        
+        is_ch_initial = df['is_candidate_high'].iloc[i]
+        is_cl_initial = df['is_candidate_low'].iloc[i]
+        if not is_ch_initial and not is_cl_initial:
+            continue
+        candidates_evaluated +=1
 
-        if not is_candidate_high and not is_candidate_low:
-            # Check for ambiguous pivots
-            # Example rule: A candle that is a local high/low but fails the full pivot rule
-            # This is a simplified version of "almost happened"
-            # A more robust rule would check which part of the pivot rule failed
-            is_local_high = (df['high'].iloc[i] >= df['high'].iloc[max(0, i-2):i].max() and
-                             df['high'].iloc[i] > df['high'].iloc[i+1:min(len(df), i+3)].max()) if i > 2 and i < len(df) - 3 else False
-            is_local_low = (df['low'].iloc[i] <= df['low'].iloc[max(0, i-2):i].min() and
-                            df['low'].iloc[i] < df['low'].iloc[i+1:min(len(df), i+3)].min()) if i > 2 and i < len(df) - 3 else False
-
-            if is_local_high or is_local_low:
-                df.loc[df.index[i], 'pivot_label'] = 3
+        # ATR at the current candidate pivot `i`
+        atr_val_at_current_pivot = df.loc[df.index[i], atr_col_name] 
+        
+        # If ATR is needed for distance factor and current ATR is invalid, skip this candidate
+        if atr_distance_factor > 0 and (pd.isna(atr_val_at_current_pivot) or atr_val_at_current_pivot == 0):
+            pruned_by_invalid_atr_current +=1
             continue
 
-        atr_val = df[atr_col_name].iloc[i] if atr_distance_factor > 0 and atr_col_name in df.columns else 0
-        if atr_distance_factor > 0 and (pd.isna(atr_val) or atr_val == 0):
+        is_ch = df['is_candidate_high'].iloc[i]
+        is_cl = df['is_candidate_low'].iloc[i]
+
+        if not is_ch and not is_cl:
             continue
 
-        if last_confirmed_pivot_idx != -1 and (i - last_confirmed_pivot_idx) < min_bar_gap:
-            df.loc[df.index[i], 'pivot_label'] = 3  # Mark as ambiguous
-            continue
-
-        current_price = df['high'].iloc[i] if is_candidate_high else df['low'].iloc[i]
-        if last_confirmed_pivot_idx != -1 and atr_distance_factor > 0:
-            price_diff = abs(current_price - last_confirmed_pivot_price)
-            if price_diff < (atr_distance_factor * atr_val):
-                df.loc[df.index[i], 'pivot_label'] = 3  # Mark as ambiguous
+        # Check bar gap
+        if last_confirmed_pivot_idx != -1 and (df.index[i] - last_confirmed_pivot_idx) < min_bar_gap:
+            # Note: This assumes df.index[i] and last_confirmed_pivot_idx are comparable.
+            # If df.index is not a simple range index, direct subtraction might be an issue.
+            # However, 'i' is from range(len(df)), and last_confirmed_pivot_idx stores 'i'.
+            # So, this comparison is on the integer position.
+            if (i - last_confirmed_pivot_idx) < min_bar_gap: # Corrected to use integer index i
+                pruned_by_bar_gap += 1
                 continue
 
-        if is_candidate_high:
+
+        current_price = 0
+        current_type = None
+
+        if is_ch:
+            current_price = df['high'].iloc[i]
+            current_type = 'high'
+        elif is_cl:
+            current_price = df['low'].iloc[i]
+            current_type = 'low'
+
+        # Check ATR distance (if there's a previous pivot and ATR distance pruning is active)
+        if last_confirmed_pivot_idx != -1 and atr_distance_factor > 0:
+            # ATR at the last confirmed pivot
+            # Ensure last_confirmed_pivot_idx is also >= min_index_for_valid_atr for its ATR to be valid.
+            # This should be true by construction if the loop starts after warmup.
+            atr_at_last_pivot = df.loc[df.index[last_confirmed_pivot_idx], atr_col_name]
+
+            if pd.isna(atr_at_last_pivot) or atr_at_last_pivot == 0:
+                pruned_by_invalid_atr_last += 1
+                continue
+            
+            price_diff = abs(current_price - last_confirmed_pivot_price)
+            if price_diff < (atr_distance_factor * atr_at_last_pivot):
+                pruned_by_atr_dist += 1
+                continue
+        
+        # Confirm pivot
+        confirmed_pivots +=1
+        # Note: last_confirmed_pivot_idx stores the integer position 'i', not the DataFrame label index.
+        if current_type == 'high':
+            # Ensure it's not immediately followed by a higher high or preceded by a higher high (within candidate window)
+            # This is somewhat handled by generate_candidate_pivots, but an extra check can be useful
+            # For simplicity, we'll rely on the candidate generation for now.
             df.loc[df.index[i], 'is_swing_high'] = 1
             df.loc[df.index[i], 'pivot_label'] = 1
-        elif is_candidate_low:
+            last_confirmed_pivot_idx = i
+            last_confirmed_pivot_price = current_price
+            last_confirmed_pivot_type = 'high'
+        elif current_type == 'low':
             df.loc[df.index[i], 'is_swing_low'] = 1
             df.loc[df.index[i], 'pivot_label'] = 2
-        
-        last_confirmed_pivot_idx = i
-        last_confirmed_pivot_price = current_price
-
+            last_confirmed_pivot_idx = i
+            last_confirmed_pivot_price = current_price
+            last_confirmed_pivot_type = 'low'
+    
+    print(f"DEBUG (prune_and_label_pivots): Evaluated {candidates_evaluated} candidates. "
+          f"Pruned by BarGap: {pruned_by_bar_gap}, ATRDist: {pruned_by_atr_dist}, "
+          f"InvalidCurrATR: {pruned_by_invalid_atr_current}, InvalidLastATR: {pruned_by_invalid_atr_last}. "
+          f"Confirmed Pivots: {confirmed_pivots}")
     return df
 
 
@@ -4495,7 +4372,7 @@ def simulate_fib_entries(df, atr_col_name): # Added atr_col_name
     
     # Filter pivots to only include those that occur at or after the ATR warmup period.
     # The index 'i' from iterrows() is the DataFrame index of the pivot.
-    pivots = all_pivots.iloc[min_pivot_index_for_valid_atr:].copy()
+    pivots = all_pivots[all_pivots.index >= min_pivot_index_for_valid_atr].copy()
 
     if pivots.empty:
         print(f"DEBUG (simulate_fib_entries): No pivots found after ATR warmup period ({min_pivot_index_for_valid_atr}). Original pivots: {len(all_pivots)}")
@@ -4665,66 +4542,173 @@ def calculate_rsi(df, period=14, column='close'):
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
-def engineer_pivot_features(df, atr_col_name, force_live_bars_since_pivot_calc: bool = False):
+def engineer_pivot_features(df, atr_col_name, force_live_bars_since_pivot_calc: bool = False): # Added force_live_bars_since_pivot_calc
+    """
+    Engineers features for the pivot detection model.
+    `atr_col_name` should be the name of the ATR column to use (e.g., 'atr_14').
+    `force_live_bars_since_pivot_calc` forces the use of candidate pivots for 'bars_since_last_pivot'.
+    """
+    # The caller is responsible for ensuring df contains the correct atr_col_name.
+    # This function will use the provided atr_col_name.
     if atr_col_name not in df.columns:
-        raise RuntimeError(f"ATR column '{atr_col_name}' missing in engineer_pivot_features.")
-    if df[atr_col_name].isnull().all():
-        raise RuntimeError(f"ATR column '{atr_col_name}' contains all NaN values.")
+        raise RuntimeError(f"ATR column '{atr_col_name}' missing in engineer_pivot_features – aborting feature calculation. DataFrame columns: {df.columns.tolist()}")
+    if df[atr_col_name].isnull().all(): # Check if all values are NaN even if column exists
+        raise RuntimeError(f"ATR column '{atr_col_name}' contains all NaN values in engineer_pivot_features – aborting feature calculation.")
 
-    # Rolling statistics over multiple windows
-    for window in [3, 7, 15]:
-        df[f'price_rolling_mean_{window}'] = df['close'].rolling(window=window).mean()
-        df[f'price_rolling_std_{window}'] = df['close'].rolling(window=window).std()
-        df[f'volume_rolling_mean_{window}'] = df['volume'].rolling(window=window).mean()
-        df[f'volume_rolling_std_{window}'] = df['volume'].rolling(window=window).std()
+    # Volatility & Range
+    # df['range_atr_norm'] = (df['high'] - df['low']) / df[atr_col_name]
+    df['range_atr_norm'] = np.where(df[atr_col_name] == 0, 0, (df['high'] - df['low']) / df[atr_col_name])
 
-    # Directional momentum and volatility
-    df['atr_normalized_return'] = (df['close'] - df['open']) / df[atr_col_name]
-    df['rsi'] = calculate_rsi(df, period=14)
+
+    # Trend & Momentum
+    df['ema12'] = calculate_ema(df, 12)
+    df['ema26'] = calculate_ema(df, 26)
+    df['macd_line'] = df['ema12'] - df['ema26']
+    # Use dynamic atr_col_name for normalization
+    # df['macd_slope_atr_norm'] = df['macd_line'].diff() / df[atr_col_name]
+    macd_slope = df['macd_line'].diff()
+    df['macd_slope_atr_norm'] = np.where(df[atr_col_name] == 0, 0, macd_slope / df[atr_col_name])
+
+
+    for n in [1, 3, 5]:
+        # Use dynamic atr_col_name for normalization
+        # df[f'return_{n}b_atr_norm'] = df['close'].pct_change(n) / df[atr_col_name]
+        return_n_b = df['close'].pct_change(n)
+        df[f'return_{n}b_atr_norm'] = np.where(df[atr_col_name] == 0, 0, return_n_b / df[atr_col_name])
+
+
+    # Local Structure
+    df['high_rank_7'] = df['high'].rolling(window=7).rank(pct=True)
     
-    # Bollinger Bands
-    rolling_mean = df['close'].rolling(window=20).mean()
-    rolling_std = df['close'].rolling(window=20).std()
-    df['bollinger_upper'] = rolling_mean + (rolling_std * 2)
-    df['bollinger_lower'] = rolling_mean - (rolling_std * 2)
-    df['bollinger_width'] = df['bollinger_upper'] - df['bollinger_lower']
+    # --- Bars Since Last Pivot Calculation (Revised) ---
+    MAX_BARS_NO_PIVOT_CONSTANT = 200
+    df['bars_since_last_pivot'] = MAX_BARS_NO_PIVOT_CONSTANT # Default
 
-    # MACD
-    ema12 = df['close'].ewm(span=12, adjust=False).mean()
-    ema26 = df['close'].ewm(span=26, adjust=False).mean()
-    df['macd'] = ema12 - ema26
-    df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
-    df['macd_slope'] = df['macd'].diff()
+    has_pre_calculated_pivots = False
+    # Determine if actual pre-calculated pivots exist (for the original "TrainingLabels" path)
+    if 'is_swing_high' in df.columns and 'is_swing_low' in df.columns:
+        if (df['is_swing_high'] == 1).any() or (df['is_swing_low'] == 1).any():
+            has_pre_calculated_pivots = True # True labels exist
 
-    # Contextual "distance" measures
-    candidate_pivots = df[(df.get('is_candidate_high', pd.Series(False, index=df.index))) | 
-                          (df.get('is_candidate_low', pd.Series(False, index=df.index)))]
-    
-    last_pivot_time = None
-    df['ticks_since_last_pivot'] = 0
-    # Ensure the index is a DatetimeIndex before proceeding
-    if 'timestamp' in df.columns:
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-        df.set_index(pd.to_datetime(df['timestamp']), inplace=True)
+    # Decide which path to take for bars_since_last_pivot
+    # If force_live_bars_since_pivot_calc is True, always use the candidate-based method.
+    # Otherwise, use true pivots if they exist, else fall back to candidates.
+    use_candidate_pivot_path = force_live_bars_since_pivot_calc or not has_pre_calculated_pivots
+    path_type_for_log = "" # Will be set below
 
-    if isinstance(df.index, pd.DatetimeIndex):
-        for i, row in df.iterrows():
-            if i in candidate_pivots.index:
-                last_pivot_time = i
-            if last_pivot_time is not None:
-                time_diff_seconds = (i - last_pivot_time).total_seconds()
-                df.loc[i, 'ticks_since_last_pivot'] = time_diff_seconds / 60
+    if not use_candidate_pivot_path:
+        # Path 1: Using actual pre-calculated (pruned) pivots - Original "TrainingLabels" path
+        path_type_for_log = "TrainingLabels"
+        pivot_indices_series = df[(df['is_swing_high'] == 1) | (df['is_swing_low'] == 1)].index
+        if not pivot_indices_series.empty:
+            # (Original logic for TrainingLabels path remains here)
+            last_pivot_map = pd.Series(index=df.index, dtype='float64')
+            current_last_pivot_idx = np.nan # Use np.nan for missing initial pivots
+            for idx in df.index:
+                pivots_up_to_idx = pivot_indices_series[pivot_indices_series <= idx]
+                if not pivots_up_to_idx.empty:
+                    current_last_pivot_idx = pivots_up_to_idx[-1]
+                last_pivot_map.loc[idx] = current_last_pivot_idx
+            
+            df_idx_to_pos = pd.Series(range(len(df)), index=df.index)
+            # Calculate bars_since: current_pos - pos_of_last_pivot
+            # Ensure mapping from df.index (potentially non-integer) to integer positions
+            pos_of_last_pivot = last_pivot_map.map(df_idx_to_pos).fillna(-1).astype(int) # Map pivot index labels to positions
+            bars_since = df_idx_to_pos - pos_of_last_pivot
+            
+            # For rows before the first pivot, last_pivot_map would be NaN, pos_of_last_pivot -1
+            # So bars_since would be df_idx_to_pos - (-1) = df_idx_to_pos + 1. This is correct.
+            # If last_pivot_map.map(df_idx_to_pos) results in NaN (pivot index not in df_idx_to_pos), fillna(-1) handles it.
+            df['bars_since_last_pivot'] = bars_since.astype(int)
+            # Any remaining NaNs (e.g. if mapping failed unexpectedly) or if no pivots at all, should be caught by fillna later if not here.
+            # If pivot_indices_series was empty, this block is skipped, default MAX_BARS_NO_PIVOT_CONSTANT remains.
+    # else: # This 'else' corresponds to 'if not use_candidate_pivot_path'
+    if use_candidate_pivot_path: # Combined condition for live path or forced live-like calculation
+        # Path 2: Using candidate pivots - Original "LiveCandidates" path OR forced for training
+        path_type_for_log = "LiveCandidates"
+        if force_live_bars_since_pivot_calc:
+            path_type_for_log = "TrainingUniversal (ForcedLiveCalc)"
+
+        df_temp_candidates = df.copy() # Operate on a copy to avoid modifying 'is_candidate_high/low' if they already exist
+        # Ensure candidate columns are fresh for this calculation if forced
+        if force_live_bars_since_pivot_calc or 'is_candidate_high' not in df_temp_candidates.columns:
+            df_temp_candidates = generate_candidate_pivots(df_temp_candidates, n_left=PIVOT_N_LEFT, n_right=PIVOT_N_RIGHT) 
+        
+        candidate_indices = df_temp_candidates[(df_temp_candidates['is_candidate_high']) | (df_temp_candidates['is_candidate_low'])].index
+        
+        if not candidate_indices.empty:
+            last_candidate_pivot_map = pd.Series(index=df.index, dtype='float64') # Use original df.index for map
+            current_last_candidate_idx = np.nan
+            for idx in df.index: # Iterate using original df's index
+                candidates_up_to_idx = candidate_indices[candidate_indices <= idx]
+                if not candidates_up_to_idx.empty:
+                    current_last_candidate_idx = candidates_up_to_idx[-1]
+                last_candidate_pivot_map.loc[idx] = current_last_candidate_idx
+
+            df_idx_to_pos = pd.Series(range(len(df)), index=df.index) # Map for original df
+            pos_of_last_candidate_pivot = last_candidate_pivot_map.map(df_idx_to_pos).fillna(-1).astype(int)
+            bars_since_candidate = df_idx_to_pos - pos_of_last_candidate_pivot
+            df['bars_since_last_pivot'] = bars_since_candidate.astype(int)
+        # If no candidates found, 'bars_since_last_pivot' remains MAX_BARS_NO_PIVOT_CONSTANT
+
+    # Ensure any NaNs that might have slipped through (e.g. if df.index was very unusual) are defaulted
+    df['bars_since_last_pivot'] = df['bars_since_last_pivot'].fillna(MAX_BARS_NO_PIVOT_CONSTANT)
+
+    # --- Logging for bars_since_last_pivot ---
+    # path_type_for_log is now set correctly based on the path taken
+    print(f"\n--- `bars_since_last_pivot` Statistics (Path: {path_type_for_log}) ---")
+    if 'bars_since_last_pivot' in df and not df['bars_since_last_pivot'].empty:
+        print(df['bars_since_last_pivot'].describe(percentiles=[.01, .05, .25, .5, .75, .95, .99]))
     else:
-        print("Warning: DataFrame index is not a DatetimeIndex in engineer_pivot_features. 'ticks_since_last_pivot' will be 0.")
+        print("`bars_since_last_pivot` column not found or empty.")
+    print(f"--- End `bars_since_last_pivot` Statistics ---\n")
+    # --- End Logging ---
 
+    # Volume
+    df['volume_rolling_avg_20'] = df['volume'].rolling(window=20).mean()
+    df['volume_spike_vs_avg'] = df['volume'] / df['volume_rolling_avg_20']
 
-    # Temporal embeddings
-    if isinstance(df.index, pd.DatetimeIndex):
-        df['hour_of_day'] = df.index.hour
-        df['day_of_week'] = df.index.dayofweek
+    # Add more features as needed: RSI, other indicators
+    df['rsi_14'] = calculate_rsi(df, 14)
 
-    feature_cols = [col for col in df.columns if col.startswith(('price_rolling', 'volume_rolling', 'atr_normalized', 'rsi', 'bollinger', 'macd', 'ticks_since', 'hour_of_day', 'day_of_week'))]
-    
+    # Target: 'pivot_label' (0: none, 1: high, 2: low)
+    feature_cols = [
+        atr_col_name, 'range_atr_norm', 'macd_slope_atr_norm', # Use dynamic atr_col_name
+        'return_1b_atr_norm', 'return_3b_atr_norm', 'return_5b_atr_norm',
+        'high_rank_7', 'bars_since_last_pivot', 'volume_spike_vs_avg', 'rsi_14'
+    ]
+    # df.replace([np.inf, -np.inf], np.nan, inplace=True) # Moved after clipping
+
+    # --- Clipping extreme values for specific normalized features ---
+    # Define a clipping range (e.g., -5 to 5 standard deviations, or fixed values)
+    # For now, let's use a fixed range that seems reasonable for normalized slopes/returns.
+    CLIP_MIN = -5.0
+    CLIP_MAX = 5.0
+
+    features_to_clip = [
+        'macd_slope_atr_norm',
+        'return_1b_atr_norm', 'return_3b_atr_norm', 'return_5b_atr_norm'
+    ]
+    for feature_name in features_to_clip:
+        if feature_name in df.columns:
+            # Log before clipping for comparison, if needed for debugging, but can be verbose
+            # print(f"Clipping {feature_name}: Min before: {df[feature_name].min()}, Max before: {df[feature_name].max()}")
+            df[feature_name] = df[feature_name].clip(lower=CLIP_MIN, upper=CLIP_MAX)
+            # print(f"Clipping {feature_name}: Min after: {df[feature_name].min()}, Max after: {df[feature_name].max()}")
+    # --- End Clipping ---
+
+    # --- Enhanced Logging for Feature Statistics ---
+    print(f"\n--- Feature Statistics from engineer_pivot_features (ATR: {atr_col_name}) ---")
+    for col in feature_cols:
+        if col in df:
+            stats = df[col].describe(percentiles=[.01, .05, .25, .5, .75, .95, .99])
+            print(f"\nFeature: {col}")
+            print(stats)
+        else:
+            print(f"\nFeature: {col} - Not found in DataFrame after engineering.")
+    print("--- End Feature Statistics from engineer_pivot_features ---\n")
+    # --- End Enhanced Logging ---
+
     return df, feature_cols
 
 def engineer_entry_features(df, atr_col_name, entry_features_base_list_arg=None): # Added atr_col_name, made list an arg
@@ -4759,27 +4743,16 @@ def engineer_entry_features(df, atr_col_name, entry_features_base_list_arg=None)
     # We will add these features to the rows identified as pivots.
 
     # Extended Trend
-    # Calculate effective ATR for normalization (consistent with engineer_pivot_features)
-    df['close_safe'] = df['close'].replace(0, 1e-9)
-    price_based_min_atr = df['close_safe'] * 0.00005
-    effective_atr = np.maximum(df[atr_col_name], price_based_min_atr)
-    effective_atr = effective_atr.replace(0, 1e-8).fillna(1e-8)
-
     df['ema20'] = calculate_ema(df, 20)
     df['ema50'] = calculate_ema(df, 50)
-    df['ema20_ema50_norm_atr'] = (df['ema20'] - df['ema50']) / effective_atr
+    # Use dynamic atr_col_name for normalization
+    df['ema20_ema50_norm_atr'] = (df['ema20'] - df['ema50']) / df[atr_col_name]
 
     # Recent Behavior
     for n in [1, 3, 5]: # Returns *before* entry
-        df[f'return_entry_{n}b'] = df['close'].pct_change(n)
-    
-    # The ATR change feature should be normalized by the ATR value itself, not the effective_atr,
-    # as we are interested in the percentage change of the ATR.
-    # A zero check is still important.
-    atr_safe_for_pct_change = df[atr_col_name].replace(0, 1e-8)
-    df[f'{atr_col_name}_change'] = df[atr_col_name].diff() / atr_safe_for_pct_change
-    
-    df.drop(columns=['close_safe'], inplace=True, errors='ignore')
+        df[f'return_entry_{n}b'] = df['close'].pct_change(n) 
+    # Use dynamic atr_col_name for ATR change feature
+    df[f'{atr_col_name}_change'] = df[atr_col_name].pct_change()
 
     # Contextual Flags
     # Ensure 'timestamp' column exists and is datetime type
@@ -4792,6 +4765,13 @@ def engineer_entry_features(df, atr_col_name, entry_features_base_list_arg=None)
         df['day_of_week'] = np.nan
 
 
+    # Regime cluster label (e.g. low/high vol from K-means) - Placeholder
+    # This would require a separate clustering step on volatility or other features.
+    df['day_of_week'] = df['timestamp'].dt.dayofweek
+
+    # Regime cluster label (e.g. low/high vol from K-means) - Placeholder
+    # This would require a separate clustering step on volatility or other features.
+    df['vol_regime'] = 0 # Example: 0 for low, 1 for high. Needs actual implementation.
 
     # Meta-Feature: P_swing (This will be added when preparing data for the entry model)
 
@@ -4824,40 +4804,45 @@ def train_pivot_model(X_train, y_train, X_val, y_val, model_type='lgbm', **kwarg
     
     model_params = {'class_weight': 'balanced', 'random_state': 42}
     
+    # Filter kwargs to only include those relevant for the specific model type
     if model_type == 'lgbm':
-        lgbm_valid_keys = ['num_leaves', 'learning_rate', 'max_depth', 'n_estimators', 'reg_alpha', 'reg_lambda', 'colsample_bytree', 'subsample', 'min_child_samples', 'n_jobs']
+        lgbm_valid_keys = ['num_leaves', 'learning_rate', 'max_depth', 'n_estimators', 'reg_alpha', 'reg_lambda', 'colsample_bytree', 'subsample', 'min_child_samples'] # Add more as tuned by Optuna
         model_params.update({k: v for k, v in kwargs.items() if k in lgbm_valid_keys})
-        if 'n_estimators' not in model_params: model_params['n_estimators'] = 100
-        if 'n_jobs' not in model_params: model_params['n_jobs'] = -1
+        # Ensure n_estimators is reasonable, Optuna might not always set it.
+        if 'n_estimators' not in model_params: model_params['n_estimators'] = 100 # Default
         model = lgb.LGBMClassifier(**model_params)
         model.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[early_stopping(stopping_rounds=10, verbose=-1)])
     elif model_type == 'rf':
-        rf_valid_keys = ['n_estimators', 'max_depth', 'min_samples_split', 'min_samples_leaf', 'max_features']
+        rf_valid_keys = ['n_estimators', 'max_depth', 'min_samples_split', 'min_samples_leaf', 'max_features'] # Add more as tuned
         model_params.update({k: v for k, v in kwargs.items() if k in rf_valid_keys})
         if 'n_estimators' not in model_params: model_params['n_estimators'] = 100
-        if 'max_depth' not in model_params and 'max_depth' in kwargs : model_params['max_depth'] = kwargs['max_depth']
-        elif 'max_depth' not in model_params : model_params['max_depth'] = 7
+        if 'max_depth' not in model_params and 'max_depth' in kwargs : model_params['max_depth'] = kwargs['max_depth'] # Ensure max_depth from Optuna is used if provided
+        elif 'max_depth' not in model_params : model_params['max_depth'] = 7 # Default if not from Optuna
+
         model = RandomForestClassifier(**model_params)
         model.fit(X_train, y_train)
     else:
         raise ValueError("Unsupported model type for pivot detection.")
 
-    preds_val = model.predict(X_val.values)
-    precision_high = precision_score(y_val, preds_val, labels=[1], average='micro', zero_division=0)
+    # Evaluate (example)
+    preds_val = model.predict(X_val)
+    # For multiclass:
+    # Precision/Recall for high (label 1) and low (label 2) swings
+    precision_high = precision_score(y_val, preds_val, labels=[1], average='micro', zero_division=0) # Adjust labels/average as needed
     recall_high = recall_score(y_val, preds_val, labels=[1], average='micro', zero_division=0)
     precision_low = precision_score(y_val, preds_val, labels=[2], average='micro', zero_division=0)
     recall_low = recall_score(y_val, preds_val, labels=[2], average='micro', zero_division=0)
-    f1_high = 2 * (precision_high * recall_high) / (precision_high + recall_high) if (precision_high + recall_high) > 0 else 0
-    f1_low = 2 * (precision_low * recall_low) / (precision_low + recall_low) if (precision_low + recall_low) > 0 else 0
 
     print(f"Pivot Model ({model_type}) Validation:")
-    print(f"  Precision (High): {precision_high:.3f}, Recall (High): {recall_high:.3f}, F1 (High): {f1_high:.3f}")
-    print(f"  Precision (Low): {precision_low:.3f}, Recall (Low): {recall_low:.3f}, F1 (Low): {f1_low:.3f}")
+    print(f"  Precision (High): {precision_high:.3f}, Recall (High): {recall_high:.3f}")
+    print(f"  Precision (Low): {precision_low:.3f}, Recall (Low): {recall_low:.3f}")
     
     pivot_val_metrics = {
-        "precision_high": precision_high, "recall_high": recall_high, "f1_high": f1_high,
-        "precision_low": precision_low, "recall_low": recall_low, "f1_low": f1_low,
+        "precision_high": precision_high, "recall_high": recall_high,
+        "precision_low": precision_low, "recall_low": recall_low,
+        # Add F1 or other metrics if needed
     }
+    # print(confusion_matrix(y_val, preds_val)) # Keep for debug if needed
     return model, pivot_val_metrics
 
 def train_entry_model(X_train, y_train, X_val, y_val, model_type='lgbm', **kwargs):
@@ -4868,10 +4853,9 @@ def train_entry_model(X_train, y_train, X_val, y_val, model_type='lgbm', **kwarg
     model_params = {'class_weight': 'balanced', 'random_state': 42}
 
     if model_type == 'lgbm':
-        lgbm_valid_keys = ['num_leaves', 'learning_rate', 'max_depth', 'n_estimators', 'reg_alpha', 'reg_lambda', 'colsample_bytree', 'subsample', 'min_child_samples', 'n_jobs'] # Added n_jobs
+        lgbm_valid_keys = ['num_leaves', 'learning_rate', 'max_depth', 'n_estimators', 'reg_alpha', 'reg_lambda', 'colsample_bytree', 'subsample', 'min_child_samples']
         model_params.update({k: v for k, v in kwargs.items() if k in lgbm_valid_keys})
         if 'n_estimators' not in model_params: model_params['n_estimators'] = 100
-        if 'n_jobs' not in model_params: model_params['n_jobs'] = -1 # Default to use all cores if not specified
         
         model = lgb.LGBMClassifier(**model_params)
         model.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[early_stopping(stopping_rounds=10, verbose=-1)])
@@ -4888,7 +4872,7 @@ def train_entry_model(X_train, y_train, X_val, y_val, model_type='lgbm', **kwarg
         raise ValueError("Unsupported model type for entry evaluation.")
     
     # Evaluate (example for binary classification)
-    preds_val_entry = model.predict(X_val.values)
+    preds_val_entry = model.predict(X_val)
     # y_val is binary (0 for not profitable, 1 for profitable)
     precision_profit = precision_score(y_val, preds_val_entry, pos_label=1, zero_division=0)
     recall_profit = recall_score(y_val, preds_val_entry, pos_label=1, zero_division=0)
@@ -4933,7 +4917,7 @@ def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot
 
     # --- Per-Trial Data Processing ---
     df_trial_processed = df_raw.copy() # Start with a fresh copy of the raw data for each trial
-    df_trial_processed.sort_values('timestamp', inplace=True)
+    df_trial_processed.reset_index(drop=True, inplace=True) # Ensure 0-based index for concatenated DFs
 
     # 1. Calculate ATR for the current trial's period
     df_trial_processed = calculate_atr(df_trial_processed, period=current_atr_period)
@@ -4956,7 +4940,7 @@ def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot
     # Drop rows with NaN in critical columns that might have been introduced or not handled by ATR/simulation
     # This is important before feature engineering
     df_trial_processed.dropna(subset=[atr_col_name_optuna, 'low', 'high', 'close'], inplace=True) # Add other critical columns if necessary
-    df_trial_processed.sort_index(inplace=True)
+    df_trial_processed.reset_index(drop=True, inplace=True)
 
     if len(df_trial_processed) < 100: # Check if enough data remains after initial processing
         print(f"Warning: Not enough data ({len(df_trial_processed)} rows) after initial trial processing. Skipping trial.")
@@ -5003,21 +4987,14 @@ def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot
         return -97.0
 
     # Prepare data for pivot model
-    X_pivot_train_raw = df_train[trial_pivot_features].fillna(-1) 
+    X_pivot_train = df_train[trial_pivot_features].fillna(-1) 
     y_pivot_train = df_train['pivot_label']
-    X_pivot_val_raw = df_val[trial_pivot_features].fillna(-1)
+    X_pivot_val = df_val[trial_pivot_features].fillna(-1)
     y_pivot_val = df_val['pivot_label']
 
-    if X_pivot_train_raw.empty or X_pivot_val_raw.empty:
+    if X_pivot_train.empty or X_pivot_val.empty:
         print("Warning: Pivot training or validation features are empty. Skipping trial.")
         return -96.0
-
-    # --- Pivot Model Scaling ---
-    pivot_scaler = StandardScaler()
-    pivot_scaler = StandardScaler()
-    X_pivot_train = pd.DataFrame(pivot_scaler.fit_transform(X_pivot_train_raw), columns=trial_pivot_features)
-    X_pivot_val = pd.DataFrame(pivot_scaler.transform(X_pivot_val_raw), columns=trial_pivot_features)
-    # --- End Pivot Model Scaling ---
 
     # Train Pivot Model
     if pivot_model_type == 'lgbm':
@@ -5028,17 +5005,10 @@ def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot
         pivot_model = RandomForestClassifier(n_estimators=100, max_depth=pivot_max_depth, class_weight='balanced', random_state=42)
         pivot_model.fit(X_pivot_train, y_pivot_train)
 
-    # Need to predict on scaled data if model was trained on scaled data.
-    # However, predict_proba needs to be called on the original feature names if we are to put P_swing back into df_train/df_val.
-    # For Optuna, the primary goal is to evaluate parameters. The P_swing for entry candidates can be derived from scaled data.
-    # Let's get probabilities from scaled data.
-    p_swing_train_all_classes = pivot_model.predict_proba(X_pivot_train.values) # X_pivot_train is already scaled
-    p_swing_val_all_classes = pivot_model.predict_proba(X_pivot_val.values)     # X_pivot_val is already scaled
-    
-    # Assign P_swing back to the original DataFrames (df_train, df_val) using their original indices
-    # This requires that X_pivot_train_raw and X_pivot_val_raw indices are aligned with df_train and df_val
-    df_train.loc[X_pivot_train_raw.index, 'P_swing'] = np.max(p_swing_train_all_classes[:, 1:], axis=1)
-    df_val.loc[X_pivot_val_raw.index, 'P_swing'] = np.max(p_swing_val_all_classes[:, 1:], axis=1)
+    p_swing_train_all_classes = pivot_model.predict_proba(X_pivot_train)
+    p_swing_val_all_classes = pivot_model.predict_proba(X_pivot_val)
+    df_train['P_swing'] = np.max(p_swing_train_all_classes[:, 1:], axis=1)
+    df_val['P_swing'] = np.max(p_swing_val_all_classes[:, 1:], axis=1)
     
     initial_train_pivots = df_train[(df_train['pivot_label'].isin([1, 2])) & (df_train['trade_outcome'] != -1)]
     print(f"DEBUG (Optuna): Initial Train Pivots with outcome: {len(initial_train_pivots)}")
@@ -5059,41 +5029,26 @@ def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot
     # Construct the full list of entry features for this trial
     current_trial_full_entry_features = trial_entry_features_base + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']
     
-    X_entry_train_raw = entry_train_candidates[current_trial_full_entry_features].fillna(-1)
+    X_entry_train = entry_train_candidates[current_trial_full_entry_features].fillna(-1)
     y_entry_train = (entry_train_candidates['trade_outcome'] > 0).astype(int)
 
-    if X_entry_train_raw.empty or len(y_entry_train.unique()) < 2 or (not X_entry_train_raw.empty and 'P_swing' in X_entry_train_raw.columns and len(X_entry_train_raw['P_swing'].unique()) < 2) :
-        print(f"DEBUG (Optuna): Insufficient diversity or empty data for entry model training. X_entry_train_raw empty: {X_entry_train_raw.empty}, y_entry_train unique: {len(y_entry_train.unique())}, P_swing unique: {len(X_entry_train_raw['P_swing'].unique()) if 'P_swing' in X_entry_train_raw.columns and not X_entry_train_raw.empty else 'N/A'}. Penalizing.")
-        return -1.0 # Penalize if not enough data or diversity
-
-    # --- Entry Model Scaling & Training ---
-    entry_scaler = StandardScaler()
-    X_entry_train_scaled = pd.DataFrame(entry_scaler.fit_transform(X_entry_train_raw), columns=current_trial_full_entry_features)
+    if len(X_entry_train['P_swing'].unique()) < 2 or len(y_entry_train.unique()) < 2 or X_entry_train.empty:
+        return -1.0
 
     if entry_model_type == 'lgbm':
         entry_model = lgb.LGBMClassifier(num_leaves=entry_num_leaves, learning_rate=entry_learning_rate,
                                          max_depth=entry_max_depth, class_weight='balanced', random_state=42, n_estimators=100, verbosity=-1)
-        
-        # For entry model's early stopping, we need a validation set.
-        # Let's split the X_entry_train_scaled and y_entry_train.
-        if len(X_entry_train_scaled) > 20 and len(np.unique(y_entry_train)) > 1:
-            try:
-                X_entry_train_fit, X_entry_val_fit, y_entry_train_fit, y_entry_val_fit = train_test_split(
-                    X_entry_train_scaled, y_entry_train, test_size=0.2, stratify=y_entry_train, random_state=42
-                )
-                if len(X_entry_val_fit) > 0 and len(np.unique(y_entry_val_fit)) > 1:
-                    entry_model.fit(X_entry_train_fit, y_entry_train_fit, 
-                                    eval_set=[(X_entry_val_fit, y_entry_val_fit)], 
-                                    callbacks=[early_stopping(stopping_rounds=5, verbose=False)])
-                else: # Not enough diversity in validation split, train on full entry candidate set
-                    entry_model.fit(X_entry_train_scaled, y_entry_train)
-            except ValueError: # Could happen if stratify fails due to too few samples in a class
-                 entry_model.fit(X_entry_train_scaled, y_entry_train)
-        else: # Not enough data or diversity for a validation split
-            entry_model.fit(X_entry_train_scaled, y_entry_train)
+        if len(entry_train_candidates) > 20:
+             X_entry_train_sub, X_entry_val_sub, y_entry_train_sub, y_entry_val_sub = train_test_split(X_entry_train, y_entry_train, test_size=0.2, stratify=y_entry_train if len(y_entry_train.unique()) > 1 else None, random_state=42)
+             if len(X_entry_val_sub) > 0 and len(y_entry_val_sub.unique()) > 1:
+                entry_model.fit(X_entry_train_sub, y_entry_train_sub, eval_set=[(X_entry_val_sub, y_entry_val_sub)], callbacks=[early_stopping(stopping_rounds=5, verbose=False)])
+             else:
+                entry_model.fit(X_entry_train, y_entry_train) 
+        else:
+            entry_model.fit(X_entry_train, y_entry_train)
     else: # rf
         entry_model = RandomForestClassifier(n_estimators=100, max_depth=entry_max_depth, class_weight='balanced', random_state=42)
-        entry_model.fit(X_entry_train_scaled, y_entry_train)
+        entry_model.fit(X_entry_train, y_entry_train)
 
     potential_pivots_val = df_val[df_val['P_swing'] >= p_swing_threshold].copy()
     potential_pivots_val = potential_pivots_val[potential_pivots_val['trade_outcome'] != -1]
@@ -5104,12 +5059,11 @@ def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot
     potential_pivots_val['norm_dist_entry_pivot'] = (potential_pivots_val['entry_price_sim'] - potential_pivots_val.apply(lambda r: r['low'] if r['is_swing_low'] == 1 else r['high'], axis=1)) / potential_pivots_val[atr_col_name_optuna]
     potential_pivots_val['norm_dist_entry_sl'] = (potential_pivots_val['entry_price_sim'] - potential_pivots_val['sl_price_sim']).abs() / potential_pivots_val[atr_col_name_optuna]
 
-    X_entry_eval_raw = potential_pivots_val[current_trial_full_entry_features].fillna(-1)
+    X_entry_eval = potential_pivots_val[current_trial_full_entry_features].fillna(-1)
 
-    if len(X_entry_eval_raw) == 0: return -0.5
-    
-    X_entry_eval_scaled = entry_scaler.transform(X_entry_eval_raw) # Use the scaler fitted on entry_train data
-    p_profit_val = entry_model.predict_proba(X_entry_eval_scaled)[:, 1] # Assuming class 1 is "profitable"
+    if len(X_entry_eval) == 0: return -0.5
+
+    p_profit_val = entry_model.predict_proba(X_entry_eval)[:, 1] # Assuming class 1 is "profitable"
     
     print(f"DEBUG (Optuna): Validation Pivots for Entry Eval: {len(potential_pivots_val)}. P_profit scores sample: {p_profit_val[:5]}")
 
@@ -5155,42 +5109,121 @@ def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot
     return final_objective_value
 
 
-def run_optuna_tuning(df_universal_raw, static_entry_features_base_list, n_trials=20):
-    global app_settings
+def run_optuna_tuning(df_universal_raw, static_entry_features_base_list, n_trials=50): # Renamed df_processed to df_universal_raw, changed features params
+    """Runs Optuna hyperparameter tuning and stores results in SQLite."""
+    global app_settings # Access global app_settings for version and path
+
     study_version = app_settings.get("app_study_version", "default_study_v1")
     optuna_runs_path = app_settings.get("app_optuna_runs_path", "optuna_runs")
+
+    # Create the directory for Optuna runs if it doesn't exist
     os.makedirs(optuna_runs_path, exist_ok=True)
-    storage_url = f"sqlite:///{os.path.join(optuna_runs_path, f'{study_version}.db')}"
 
-    study = optuna.create_study(study_name=study_version, storage=storage_url, direction='maximize', load_if_exists=True)
-    
-    # Restrict search space for faster iteration
-    study.enqueue_trial({
-        'pivot_model_type': 'lgbm',
-        'pivot_max_depth': 7,
-        'entry_model_type': 'lgbm',
-        'entry_max_depth': 7,
-        'atr_period_opt': 14,
-        'min_atr_distance_opt': 1.0,
-    })
+    # Construct SQLite URL
+    study_db_filename = f"{study_version}.db"
+    sqlite_db_path = os.path.join(optuna_runs_path, study_db_filename)
+    storage_url = f"sqlite:///{sqlite_db_path}"
 
-    study.optimize(lambda trial: objective_optuna(trial, df_universal_raw, static_entry_features_base_list),
-                   n_trials=n_trials, n_jobs=1)
+    print(f"Optuna study version: {study_version}")
+    print(f"Optuna study database: {storage_url}")
 
-    best_trial_retrieved = study.best_trial
-    params_to_save = best_trial_retrieved.params
-    
-    # Save best parameters
-    params_filename = os.path.basename(app_settings.get("app_model_params_path", "best_model_params.json"))
+    # Create or load the study
+    # Optuna will create the study if it doesn't exist in the DB, or load it if it does.
+    # The study_name within the DB will be our study_version.
+    study = optuna.create_study(
+        study_name=study_version, # Use study_version as the study_name within the database
+        storage=storage_url,
+        direction='maximize',
+        load_if_exists=True # This is key for resuming
+    )
+
+    # Check if we should prune based on previous trials (if resuming)
+    # Example: Prune if a trial is substantially worse than the mean of completed trials
+    # This is an advanced feature and can be added later if desired.
+    # For now, we use default pruner or one set by sampler.
+
+    # Check current number of trials vs target, and only run new ones
+    n_completed_trials = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
+    n_trials_to_run = n_trials - n_completed_trials
+
+    print(f"Target Optuna trials: {n_trials}")
+    print(f"Completed Optuna trials for '{study_version}': {n_completed_trials}")
+
+    if n_trials_to_run <= 0:
+        print(f"Study '{study_version}' already has {n_completed_trials} completed trials (target {n_trials}). No new trials will be run.")
+    else:
+        print(f"Running {n_trials_to_run} new Optuna trials...")
+        study.optimize(
+            lambda trial: objective_optuna(trial, df_universal_raw, static_entry_features_base_list),
+            n_trials=n_trials_to_run # Only run the remaining number of trials
+        )
+
+    # Log best trial details
+    try:
+        best_trial_retrieved = study.best_trial
+        print(f"Best Optuna trial for study '{study_version}':")
+        print(f"  Value: {best_trial_retrieved.value}")
+        print(f"  Params: {best_trial_retrieved.params}")
+    except ValueError: # Happens if no trials are completed (e.g., if n_trials_to_run was 0)
+        print(f"No completed trials found for study '{study_version}'. Cannot determine best trial.")
+        # If no trials, we can't proceed with model training based on these params.
+        # However, the user might want to just run with previously saved best_params if the study was already complete.
+        # For now, the function will return None if no best trial.
+        # The calling function (start_app_main_flow) needs to handle this.
+        # If best_params.json exists, it might be used. If not, training cannot proceed.
+        # Let's try to load params from the file if no best trial from study.
+        params_path_for_fallback = app_settings.get("app_model_params_path", "best_model_params.json")
+        if os.path.exists(params_path_for_fallback):
+            print(f"Attempting to load best parameters from existing file: {params_path_for_fallback}")
+            try:
+                with open(params_path_for_fallback, 'r') as f:
+                    loaded_fallback_params = json.load(f)
+                print("Successfully loaded fallback parameters.")
+                return loaded_fallback_params # Return previously saved params
+            except Exception as e_fallback_load:
+                print(f"Error loading fallback parameters from {params_path_for_fallback}: {e_fallback_load}")
+                return None # Truly no params available
+        else:
+            print(f"No best trial in study and no fallback parameter file ({params_path_for_fallback}) found.")
+            return None
+
+
+    # Save best_params to a JSON file, named with the study_version
+    # The model params path from app_settings is the *filename*, not the full path.
+    # We will save it inside the optuna_runs_path/study_version directory for versioning.
+    params_filename = app_settings.get("app_model_params_path", "best_model_params.json") # Default filename
     versioned_params_dir = os.path.join(optuna_runs_path, study_version)
     os.makedirs(versioned_params_dir, exist_ok=True)
     versioned_params_path = os.path.join(versioned_params_dir, params_filename)
 
-    with open(versioned_params_path, 'w') as f:
-        json.dump(params_to_save, f, indent=4)
-    print(f"Best Optuna parameters for '{study_version}' saved to {versioned_params_path}")
+    try:
+        best_trial_for_saving = study.best_trial
+        params_to_save = best_trial_for_saving.params.copy()
+        
+        # Retrieve and add user attributes stored during the trial
+        params_to_save['pivot_feature_names_used'] = best_trial_for_saving.user_attrs.get('pivot_feature_names_used', [])
+        params_to_save['entry_feature_names_base_used'] = best_trial_for_saving.user_attrs.get('entry_feature_names_base_used', [])
+        params_to_save['model_training_atr_period_used'] = best_trial_for_saving.user_attrs.get('model_training_atr_period_used', None)
+        # Also save the full entry feature list if available
+        params_to_save['full_entry_feature_names_used'] = best_trial_for_saving.user_attrs.get('full_entry_feature_names_used', [])
 
-    return params_to_save
+
+        # Add other metadata
+        params_to_save['_study_version'] = study_version
+        params_to_save['_best_trial_value'] = best_trial_for_saving.value
+        params_to_save['_source_db_file'] = sqlite_db_path
+        params_to_save['_best_trial_number'] = best_trial_for_saving.number
+
+
+        with open(versioned_params_path, 'w') as f:
+            json.dump(params_to_save, f, indent=4)
+        print(f"Best Optuna parameters for '{study_version}' saved to {versioned_params_path}")
+    except Exception as e:
+        print(f"Error saving Optuna best parameters for '{study_version}' to {versioned_params_path}: {e}")
+        # Even if saving fails, return the params for current run
+        return study.best_trial.params
+
+    return study.best_trial.params
 
 
 def process_dataframe_with_params(df_initial, params, static_entry_features_base_list_arg=None):
@@ -5200,7 +5233,7 @@ def process_dataframe_with_params(df_initial, params, static_entry_features_base
     """
     print(f"Processing DataFrame with params: {params}")
     df_processed = df_initial.copy()
-    df_processed.sort_values('timestamp', inplace=True)
+    df_processed.reset_index(drop=True, inplace=True) # Ensure 0-based index
 
     # Extract parameters, providing defaults if not all are in 'params' (e.g. if Optuna didn't tune some)
     atr_period = params.get('atr_period_opt', ATR_PERIOD)
@@ -5229,7 +5262,7 @@ def process_dataframe_with_params(df_initial, params, static_entry_features_base
     df_processed = simulate_fib_entries(df_processed, atr_col_name=atr_col_name)
     
     df_processed.dropna(subset=[atr_col_name, 'low', 'high', 'close'], inplace=True)
-    df_processed.sort_index(inplace=True)
+    df_processed.reset_index(drop=True, inplace=True)
 
     if len(df_processed) < 30: # Min data check
         print(f"Warning: Not enough data ({len(df_processed)} rows) after initial processing with best_params.")
@@ -5273,96 +5306,118 @@ def load_model(filename="model.joblib"):
     print(f"Model loaded from {filename}")
     return model
 
-def full_backtest(df_processed, pivot_model, entry_model, best_params, pivot_features, entry_features_base,
-                  pivot_scaler=None, entry_scaler=None):
+def full_backtest(df_processed, pivot_model, entry_model, best_params, pivot_features, entry_features_base):
     """
     Performs a full backtest on the (hold-out) test set.
     Uses the best models and thresholds found by Optuna.
-    Applies scalers if they are provided.
     """
     print("\n--- Starting Full Backtest ---")
-    backtest_atr_period = best_params.get('atr_period_opt', ATR_PERIOD)
+    # Determine ATR column name for backtest based on best_params or default
+    backtest_atr_period = best_params.get('atr_period_opt', ATR_PERIOD) # Get tuned ATR period or default
     atr_col_name_backtest = f'atr_{backtest_atr_period}'
     print(f"Full Backtest using ATR column: {atr_col_name_backtest}")
 
+    # Split: e.g., last 15% for test
     train_val_size = int(0.85 * len(df_processed))
     df_test = df_processed.iloc[train_val_size:].copy()
 
-    if df_test.empty:
+    if len(df_test) == 0:
         print("No data in test set for backtest.")
         return
 
-    # Pivot Predictions
-    X_pivot_test_raw = df_test[pivot_features].fillna(-1)
-    if pivot_scaler:
-        X_pivot_test = pd.DataFrame(pivot_scaler.transform(X_pivot_test_raw), columns=pivot_features)
-    else:
-        X_pivot_test = X_pivot_test_raw
-    p_swing_test_all_classes = pivot_model.predict_proba(X_pivot_test.values)
+    # 1. Pivot Predictions
+    X_pivot_test = df_test[pivot_features].fillna(-1)
+    p_swing_test_all_classes = pivot_model.predict_proba(X_pivot_test)
     df_test['P_swing'] = np.max(p_swing_test_all_classes[:, 1:], axis=1)
     df_test['predicted_pivot_class'] = np.argmax(p_swing_test_all_classes, axis=1)
 
-    # Filter by P_swing threshold
+
+    # 2. Filter by P_swing threshold
     p_swing_threshold = best_params['p_swing_threshold']
-    potential_pivots_test = df_test[(df_test['P_swing'] >= p_swing_threshold) & (df_test['trade_outcome'] != -1)].copy()
+    potential_pivots_test = df_test[
+        (df_test['P_swing'] >= p_swing_threshold) &
+        (df_test['trade_outcome'] != -1) # Has valid simulated outcome
+    ].copy()
 
     if len(potential_pivots_test) == 0:
         print("No pivots passed P_swing threshold in test set.")
-        return 0, 0, 0, 0, 0
+        return None, None, None, None
 
-    # Entry Features
+    # 3. Entry Features for these pivots
+    # Ensure 'predicted_pivot_class' (from pivot_model) is used for pivot direction if available.
+    # 'entry_features_base' should be the list of feature names determined when models were finalized.
     potential_pivots_test['norm_dist_entry_pivot'] = (potential_pivots_test['entry_price_sim'] - potential_pivots_test.apply(lambda r: r['low'] if r['predicted_pivot_class'] == 2 else r['high'], axis=1)) / potential_pivots_test[atr_col_name_backtest]
     potential_pivots_test['norm_dist_entry_sl'] = (potential_pivots_test['entry_price_sim'] - potential_pivots_test['sl_price_sim']).abs() / potential_pivots_test[atr_col_name_backtest]
+
+    # Construct the full list of entry features for the backtest
     backtest_full_entry_features = entry_features_base + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']
-    X_entry_test_raw = potential_pivots_test[backtest_full_entry_features].fillna(-1)
+    X_entry_test = potential_pivots_test[backtest_full_entry_features].fillna(-1)
 
-    # Entry Predictions
-    if entry_scaler:
-        X_entry_test = pd.DataFrame(entry_scaler.transform(X_entry_test_raw), columns=backtest_full_entry_features)
-    else:
-        X_entry_test = X_entry_test_raw
-    p_profit_test = entry_model.predict_proba(X_entry_test.values)[:, 1]
+    if len(X_entry_test) == 0:
+        print("No data for entry model evaluation in test set after feature engineering.")
+        return 0, 0, 0, 0 # Return zero for metrics
 
-    # Filter by P_profit threshold
-    profit_threshold_backtest = best_params.get('profit_threshold', 0.6)
+    # 4. Entry Predictions (Binary: Not Profitable vs. Profitable)
+    # Entry model is trained as binary, so predict_proba gives [P_NotProfitable, P_Profitable]
+    p_profit_test = entry_model.predict_proba(X_entry_test)[:, 1] # Probability of class 1 (profitable)
+
+    # 5. Filter by P_profit threshold (consistent with Optuna's validation)
+    profit_threshold_backtest = best_params.get('profit_threshold', 0.6) # Default from Optuna, should be consistent
     final_trades_test = potential_pivots_test[p_profit_test >= profit_threshold_backtest].copy()
+    
+    print(f"DEBUG (full_backtest): Test Pivots for Entry Eval: {len(potential_pivots_test)}. P_profit scores sample: {p_profit_test[:5]}")
+    print(f"DEBUG (full_backtest): Final Test Trades after P_profit ({profit_threshold_backtest:.2f}) filter: {len(final_trades_test)}")
+
 
     if len(final_trades_test) == 0:
         print(f"No trades passed P_profit threshold ({profit_threshold_backtest:.2f}) in test set.")
-        return 0, 0, 0, 0, 0
+        return 0, 0, 0, 0 # Trades, Win Rate, Avg R, Profit Factor
 
-    # Calculate Metrics
+    # 6. Calculate Metrics
     num_trades = len(final_trades_test)
     wins = final_trades_test[final_trades_test['trade_outcome'] > 0]
-    win_rate = len(wins) / num_trades if num_trades > 0 else 0
-    total_r = sum([-1 if trade['trade_outcome'] == 0 else trade['trade_outcome'] for _, trade in final_trades_test.iterrows()])
+    num_wins = len(wins)
+    win_rate = num_wins / num_trades if num_trades > 0 else 0
+
+    # Calculate R values (simplified)
+    total_r = 0
+    profit_sum_bt = 0
+    loss_sum_bt = 0
+    for idx, trade in final_trades_test.iterrows():
+        outcome = trade['trade_outcome']
+        # This R calculation is simplified. True R needs entry, SL, TP prices.
+        # For now, use the 1,2,3 mapping as approximate R.
+        if outcome == 0: # SL
+            total_r -= 1
+            loss_sum_bt += 1
+        elif outcome == 1: # TP1
+            total_r += 1 # Example: TP1 = 1R
+            profit_sum_bt +=1
+        elif outcome == 2: # TP2
+            total_r += 2 # Example: TP2 = 2R
+            profit_sum_bt += 2
+        elif outcome == 3: # TP3
+            total_r += 3 # Example: TP3 = 3R
+            profit_sum_bt += 3
+
     avg_r = total_r / num_trades if num_trades > 0 else 0
-    profit_sum_bt = sum([trade['trade_outcome'] for _, trade in wins.iterrows()])
-    loss_sum_bt = num_trades - len(wins)
-    profit_factor_bt = profit_sum_bt / loss_sum_bt if loss_sum_bt > 0 else float('inf')
+    profit_factor_bt = profit_sum_bt / loss_sum_bt if loss_sum_bt > 0 else (profit_sum_bt if profit_sum_bt > 0 else 0)
 
-    # SHAP Explainability
-    explainer = shap.TreeExplainer(pivot_model)
-    shap_values = explainer.shap_values(X_pivot_test)
-    shap.summary_plot(shap_values, X_pivot_test_raw, plot_type="bar", show=False)
-    plt.savefig('shap_summary.png')
-    plt.close()
 
-    print("Backtest Results (Test Set):")
+    print(f"Backtest Results (Test Set):")
     print(f"  Number of Trades: {num_trades}")
     print(f"  Win Rate: {win_rate:.3f}")
-    print(f"  Average R: {avg_r:.3f}")
-    print(f"  Profit Factor: {profit_factor_bt:.3f}")
-    
-    return num_trades, win_rate, avg_r, profit_factor_bt, 0
+    print(f"  Average R (simplified): {avg_r:.3f}")
+    print(f"  Profit Factor (simplified): {profit_factor_bt:.3f}")
+    # TODO: Max drawdown, trade frequency etc.
+
+    return num_trades, win_rate, avg_r, profit_factor_bt, 0 # Placeholder for max_drawdown
 
 
 def run_backtest_scenario(scenario_name: str, df_processed: pd.DataFrame,
                           pivot_model, entry_model, best_params,
                           pivot_features, entry_features_base,
                           atr_col_name=f'atr_{ATR_PERIOD}',
-                          pivot_scaler = globals().get("pivot_scaler", None),
-                          entry_scaler = globals().get("entry_scaler", None),
                           use_full_df_as_test: bool = False):
     """
     Runs a backtest for a specific scenario (Rule-based, ML Stage 1, Full ML).
@@ -5384,7 +5439,7 @@ def run_backtest_scenario(scenario_name: str, df_processed: pd.DataFrame,
         print(f"No data in (derived) test set for {scenario_name} backtest.")
         return {"scenario": scenario_name, "trades": 0, "win_rate": 0, "avg_r": 0, "profit_factor": 0, "max_dd_r": 0, "trade_frequency":0}
 
-    # Ensure df_test has a DatetimeIndex from 'timestamp' column for period calculation 
+    # Ensure df_test has a DatetimeIndex from 'timestamp' column for period calculation
     if 'timestamp' in df_test.columns:
         df_test['timestamp'] = pd.to_datetime(df_test['timestamp'])
         df_test.set_index('timestamp', inplace=True)
@@ -5407,17 +5462,8 @@ def run_backtest_scenario(scenario_name: str, df_processed: pd.DataFrame,
             print("ML Stage 1: Pivot model not available. Skipping scenario.")
             return {"scenario": scenario_name, "trades": 0, "win_rate": 0, "avg_r": 0, "profit_factor": 0, "max_dd_r": 0, "trade_frequency":0}
 
-        X_pivot_test_raw = df_test[pivot_features].fillna(-1)
-        if 'pivot_scaler' in locals():
-            try:
-                X_pivot_test = pd.DataFrame(pivot_scaler.transform(X_pivot_test_raw), columns=pivot_features)
-            except Exception as e:
-                print(f"RunBacktestScenario WARNING ({scenario_name}): Failed to scale pivot features for Stage 1: {e}. Using raw.")
-                X_pivot_test = X_pivot_test_raw
-        else:
-            X_pivot_test = X_pivot_test_raw
-        
-        p_swing_test_all_classes = pivot_model.predict_proba(X_pivot_test.values)
+        X_pivot_test = df_test[pivot_features].fillna(-1)
+        p_swing_test_all_classes = pivot_model.predict_proba(X_pivot_test)
         df_test['P_swing'] = np.max(p_swing_test_all_classes[:, 1:], axis=1)
 
         p_swing_threshold = best_params.get('p_swing_threshold', 0.6)
@@ -5434,17 +5480,8 @@ def run_backtest_scenario(scenario_name: str, df_processed: pd.DataFrame,
             print("Full ML Pipeline: Pivot or Entry model not available. Skipping scenario.")
             return {"scenario": scenario_name, "trades": 0, "win_rate": 0, "avg_r": 0, "profit_factor": 0, "max_dd_r": 0, "trade_frequency":0}
 
-        X_pivot_test_full_ml_raw = df_test[pivot_features].fillna(-1)
-        if 'pivot_scaler' in locals():
-            try:
-                X_pivot_test_full_ml = pivot_scaler.transform(X_pivot_test_full_ml_raw)
-            except Exception as e:
-                print(f"RunBacktestScenario WARNING ({scenario_name}): Failed to scale pivot features for Full ML: {e}. Using raw.")
-                X_pivot_test_full_ml = X_pivot_test_full_ml_raw.to_numpy()
-        else:
-            X_pivot_test_full_ml = X_pivot_test_full_ml_raw.to_numpy()
-
-        p_swing_test_all_classes = pivot_model.predict_proba(X_pivot_test_full_ml)
+        X_pivot_test = df_test[pivot_features].fillna(-1)
+        p_swing_test_all_classes = pivot_model.predict_proba(X_pivot_test)
         df_test['P_swing'] = np.max(p_swing_test_all_classes[:, 1:], axis=1)
         df_test['predicted_pivot_class_ml'] = np.argmax(p_swing_test_all_classes, axis=1)
 
@@ -5464,27 +5501,17 @@ def run_backtest_scenario(scenario_name: str, df_processed: pd.DataFrame,
         potential_pivots_ml['norm_dist_entry_pivot'] = (potential_pivots_ml['entry_price_sim'] - potential_pivots_ml.apply(lambda r: r['low'] if r['predicted_pivot_class_ml'] == 2 else r['high'], axis=1)) / potential_pivots_ml[atr_col_name]
         potential_pivots_ml['norm_dist_entry_sl'] = (potential_pivots_ml['entry_price_sim'] - potential_pivots_ml['sl_price_sim']).abs() / potential_pivots_ml[atr_col_name]
 
-        X_entry_test_ml_raw = potential_pivots_ml[entry_features_base + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']].fillna(-1)
+        X_entry_test_ml = potential_pivots_ml[entry_features_base + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl']].fillna(-1)
 
-        if X_entry_test_ml_raw.empty:
+        if X_entry_test_ml.empty:
             print("Full ML: No data for entry model evaluation.")
             return {"scenario": scenario_name, "trades": 0, "win_rate": 0, "avg_r": 0, "profit_factor": 0, "max_dd_r": 0, "trade_frequency":0}
 
-        if 'entry_scaler' in locals():
-            try:
-                X_entry_test_ml = pd.DataFrame(entry_scaler.transform(X_entry_test_ml_raw), columns=entry_features_base + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl'])
-            except Exception as e:
-                print(f"RunBacktestScenario WARNING ({scenario_name}): Failed to scale entry features: {e}. Using raw.")
-                X_entry_test_ml = X_entry_test_ml_raw
-        else:
-            X_entry_test_ml = X_entry_test_ml_raw
-
-        p_profit_test_ml = entry_model.predict_proba(X_entry_test_ml.values)[:, 1]
+        p_profit_test_ml = entry_model.predict_proba(X_entry_test_ml)[:, 1]
         final_trades_for_metrics = potential_pivots_ml[p_profit_test_ml >= profit_threshold].copy()
         print(f"Full ML: Identified {len(final_trades_for_metrics)} full ML pipeline trade setups.")
     else:
         raise ValueError(f"Unknown scenario: {scenario_name}")
-
 
     if final_trades_for_metrics.empty:
         print(f"{scenario_name}: No trades to evaluate metrics for.")
@@ -5590,13 +5617,12 @@ def run_backtest_scenario(scenario_name: str, df_processed: pd.DataFrame,
         # we can try to add it.
         temp_final_trades = final_trades_for_metrics.copy()
         if scenario_name == "Full ML Pipeline" and 'p_profit_test_ml' in locals() and len(p_profit_test_ml) == len(X_entry_test_ml):
-             # This assumes X_entry_test_ml_raw has the same index as potential_pivots_ml,
-             # because X_entry_test_ml_raw is a direct slice of potential_pivots_ml.
-             if X_entry_test_ml_raw.index.equals(potential_pivots_ml.loc[X_entry_test_ml_raw.index].index): # Check index alignment using the raw df
-                 potential_pivots_ml['P_profit_score_calc'] = np.nan # Initialize column
-                 potential_pivots_ml.loc[X_entry_test_ml_raw.index, 'P_profit_score_calc'] = p_profit_test_ml
+             # This assumes X_entry_test_ml has the same index as potential_pivots_ml
+             # And final_trades_for_metrics is a filtered version of potential_pivots_ml
+             if X_entry_test_ml.index.equals(potential_pivots_ml.index): # Check index alignment
+                 potential_pivots_ml['P_profit_score_calc'] = p_profit_test_ml
                  # Merge this back to temp_final_trades based on index
-                 temp_final_trades = temp_final_trades.join(potential_pivots_ml[['P_profit_score_calc']], how='left')
+                 temp_final_trades = temp_final_trades.join(potential_pivots_ml[['P_profit_score_calc']])
 
 
         for idx, trade_row in temp_final_trades.iterrows():
@@ -5681,12 +5707,11 @@ def run_backtest_scenario(scenario_name: str, df_processed: pd.DataFrame,
     return full_results_dict
 
 # --- Backtest Summary Generation ---
-def generate_training_backtest_summary(df_processed_full_dataset,
-                                       pivot_model, entry_model,
-                                       best_params_from_optuna,
+def generate_training_backtest_summary(df_processed_full_dataset, # This is the full dataset used for training/val/test split
+                                       pivot_model, entry_model, 
+                                       best_params_from_optuna, 
                                        pivot_feature_names_list, entry_feature_names_base_list,
-                                       app_settings_dict,
-                                       pivot_scaler_for_summary=None, entry_scaler_for_summary=None):
+                                       app_settings_dict):
     """
     Generates and displays a summary of backtest results for different scenarios.
     Uses a portion of df_processed_full_dataset as a consistent test set for all scenarios.
@@ -5735,16 +5760,14 @@ def generate_training_backtest_summary(df_processed_full_dataset,
 
         scenario_results = run_backtest_scenario(
             scenario_name=scenario,
-            df_processed=df_processed_full_dataset.copy(),
+            df_processed=df_processed_full_dataset.copy(), # Pass a copy to avoid in-place modifications
             pivot_model=pivot_model,
             entry_model=entry_model,
             best_params=best_params_from_optuna,
             pivot_features=pivot_feature_names_list,
             entry_features_base=entry_feature_names_base_list,
-            atr_col_name=atr_col_name_summary,
-            use_full_df_as_test=False,
-            pivot_scaler=pivot_scaler_for_summary,
-            entry_scaler=entry_scaler_for_summary
+            atr_col_name=atr_col_name_summary, # Use ATR col consistent with model training
+            use_full_df_as_test=False # run_backtest_scenario will take its usual test split (last 15%)
         )
         # Add symbol context if possible/relevant for universal model summary (e.g. "Universal")
         scenario_results['symbol_context'] = "UniversalTestSet" 
@@ -6048,126 +6071,126 @@ def display_summary_table(main_summary_df: pd.DataFrame,
 
 
 # --- Main Orchestration ---
-import hashlib
-
-def get_processed_data_for_symbol(config, symbol_ticker, kline_interval, start_date, end_date, force_reprocess=False):
+def get_processed_data_for_symbol(symbol_ticker, kline_interval, start_date, end_date):
     """
     Fetches, preprocesses, and engineers features for a single symbol.
-    Implements caching for the fully processed DataFrame.
+    Returns a processed DataFrame, pivot feature names, and entry feature names.
     """
-    log_prefix = f"[DataProcessing-{symbol_ticker}]"
     print(f"\n--- Initial Data Processing for Symbol: {symbol_ticker} ---")
-
-    params_str = json.dumps(config, sort_keys=True)
-    params_hash = hashlib.md5(params_str.encode('utf-8')).hexdigest()[:8]
-
-    safe_interval = kline_interval.replace(" ", "").lower()
-    safe_start_date = start_date.replace(" ", "_").replace(",", "")
-    safe_end_date = end_date.replace(" ", "_").replace(",", "") if end_date else "latest"
-    
-    cache_directory = "processed_data_cache"
-    os.makedirs(cache_directory, exist_ok=True)
-    cache_filename = f"{symbol_ticker}_{safe_interval}_{safe_start_date}_to_{safe_end_date}_params_{params_hash}.parquet"
-    cache_filepath = os.path.join(cache_directory, cache_filename)
-
-    if not force_reprocess and os.path.exists(cache_filepath):
-        try:
-            print(f"{log_prefix} Loading cached processed data from {cache_filepath}...")
-            df_processed_cached = pd.read_parquet(cache_filepath)
-            sidecar_path = cache_filepath.replace(".parquet", "_feature_names.json")
-            if os.path.exists(sidecar_path):
-                with open(sidecar_path, 'r') as f_sidecar:
-                    cached_feature_info = json.load(f_sidecar)
-                pivot_feature_names_cached = cached_feature_info.get("pivot_feature_names")
-                entry_feature_names_base_cached = cached_feature_info.get("entry_feature_names_base")
-                if pivot_feature_names_cached and entry_feature_names_base_cached:
-                    return df_processed_cached, pivot_feature_names_cached, entry_feature_names_base_cached
-        except Exception as e:
-            print(f"{log_prefix} Error loading cached data: {e}. Reprocessing.")
-    
-    print(f"{log_prefix} Getting/Downloading raw historical data for {symbol_ticker}...")
-    historical_df = get_or_download_historical_data(
-        symbol=symbol_ticker, 
-        interval=kline_interval,
-        start_date_str=start_date,
-        end_date_str=end_date,
-        force_redownload_all=force_reprocess
-    )
-    if historical_df is None or historical_df.empty:
-        print(f"{log_prefix} No data for {symbol_ticker}. Skipping processing.")
-        return None, None, None
-
-    historical_df['symbol'] = symbol_ticker
-    atr_col_name_dynamic = f'atr_{config["atr_period"]}'
-    historical_df = calculate_atr(historical_df, period=config["atr_period"])
-    historical_df = generate_candidate_pivots(historical_df, n_left=config["pivot_n_left"], n_right=config["pivot_n_right"])
-    historical_df = prune_and_label_pivots(historical_df, atr_col_name=atr_col_name_dynamic, 
-                                           atr_distance_factor=config["min_atr_distance"], min_bar_gap=config["min_bar_gap"])
-    historical_df = simulate_fib_entries(historical_df, atr_col_name=atr_col_name_dynamic)
-    
-    historical_df.dropna(subset=[atr_col_name_dynamic], inplace=True)
-    historical_df.sort_values('timestamp', inplace=True)
-
-    historical_df, pivot_feature_names = engineer_pivot_features(historical_df, atr_col_name=atr_col_name_dynamic)
-    historical_df, entry_feature_names_base = engineer_entry_features(historical_df, atr_col_name=atr_col_name_dynamic)
-
-    df_processed = historical_df.iloc[30:].copy()
-    df_processed.dropna(subset=pivot_feature_names, inplace=True)
-    df_processed.sort_index(inplace=True)
-
-    if len(df_processed) < 100:
-        return None, None, None
-    
+    # 1. Data Collection using the new function
+    print(f"Getting/Downloading historical data for {symbol_ticker}...")
     try:
-        df_processed.to_parquet(cache_filepath, index=False)
-        feature_info_to_cache = {"pivot_feature_names": pivot_feature_names, "entry_feature_names_base": entry_feature_names_base}
-        with open(cache_filepath.replace(".parquet", "_feature_names.json"), 'w') as f_sidecar:
-            json.dump(feature_info_to_cache, f_sidecar, indent=4)
-    except Exception as e:
-        print(f"{log_prefix} Error caching data: {e}")
+        # Initialize Binance client if not already done (e.g. if main script part is not run first)
+        global app_binance_client, app_trading_configs # Added app_trading_configs
+        if app_binance_client is None:
+            # Load trading configs which also loads API keys and initializes client
+            # This ensures client is ready for get_or_download_historical_data
+            load_app_trading_configs() # Loads default "app_trade_config.csv"
+            # Check if app_trading_configs was loaded successfully
+            if app_trading_configs is None or not app_trading_configs:
+                 print(f"CRITICAL: Failed to load app_trading_configs for {symbol_ticker}. Skipping.")
+                 return None, None, None
+            if not initialize_app_binance_client(env=app_trading_configs.get("app_trading_environment", "mainnet")):
+                print(f"CRITICAL: Failed to initialize Binance client for {symbol_ticker} data processing. Skipping.")
+                return None, None, None
+        
+        historical_df = get_or_download_historical_data(
+            symbol=symbol_ticker, 
+            interval=kline_interval,
+            start_date_str=start_date, # Overall start date for the dataset
+            end_date_str=end_date,     # Overall end date for the dataset
+            data_directory="historical_data" # Standardized directory
+            # force_redownload_all can be a parameter to main script if needed
+        )
+        if historical_df is None or historical_df.empty: # Check for None as well
+            print(f"No data obtained for {symbol_ticker} (None or empty DataFrame). Skipping.")
+            return None, None, None
+            
+    except BinanceAPIException as e: # These might still be caught if client init fails within get_or_download
+        print(f"Binance API Exception for {symbol_ticker} during data retrieval: {e}. Skipping symbol.")
+        return None, None, None
+    except BinanceRequestException as e:
+        print(f"Binance Request Exception for {symbol_ticker} during data retrieval: {e}. Skipping symbol.")
+        return None, None, None
+    except Exception as e: 
+        print(f"An unexpected error occurred getting/downloading data for {symbol_ticker}: {e}. Skipping symbol.")
+        import traceback
+        traceback.print_exc()
+        return None, None, None
 
+    print(f"Data obtained for {symbol_ticker}: {len(historical_df)} bars")
+    if 'timestamp' not in historical_df.columns:
+         historical_df.reset_index(inplace=True) # Should not be needed if get_or_download returns consistent format
+    if 'timestamp' not in historical_df.columns and 'index' in historical_df.columns and pd.api.types.is_datetime64_any_dtype(historical_df['index']):
+        historical_df.rename(columns={'index':'timestamp'}, inplace=True)
+    
+    historical_df['symbol'] = symbol_ticker # Add symbol identifier
+
+    # 2. Preprocessing & Labeling
+    historical_df = calculate_atr(historical_df, period=ATR_PERIOD) # Ensure ATR_PERIOD is used
+    if historical_df is None: return None, None, None # Check after each processing step
+    atr_col_name_dynamic = f'atr_{ATR_PERIOD}'
+    historical_df = generate_candidate_pivots(historical_df)
+    if historical_df is None: return None, None, None
+    historical_df = prune_and_label_pivots(historical_df, atr_col_name=atr_col_name_dynamic)
+    if historical_df is None: return None, None, None
+    historical_df = simulate_fib_entries(historical_df, atr_col_name=atr_col_name_dynamic)
+    if historical_df is None: return None, None, None
+    
+    if 'timestamp' not in historical_df.columns:
+        if pd.api.types.is_datetime64_any_dtype(historical_df.index):
+            historical_df.reset_index(inplace=True)
+            if 'index' in historical_df.columns and 'timestamp' not in historical_df.columns:
+                 historical_df.rename(columns={'index':'timestamp'}, inplace=True)
+
+    historical_df.dropna(subset=[f'atr_{ATR_PERIOD}'], inplace=True)
+    historical_df.reset_index(drop=True, inplace=True)
+
+    # 3. Feature Engineering
+    # atr_col_name_dynamic was defined above
+    historical_df, pivot_feature_names = engineer_pivot_features(historical_df, atr_col_name=atr_col_name_dynamic)
+    if historical_df is None or pivot_feature_names is None: return None, None, None # Check features as well
+    historical_df, entry_feature_names_base = engineer_entry_features(historical_df, atr_col_name=atr_col_name_dynamic, entry_features_base_list_arg=None)
+    if historical_df is None or entry_feature_names_base is None: return None, None, None
+
+    historical_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    min_required_data_for_features = 30
+    if len(historical_df) < min_required_data_for_features:
+        print(f"Not enough data after initial processing for {symbol_ticker} ({len(historical_df)} rows). Skipping.")
+        return None, None, None
+
+    df_processed = historical_df.iloc[min_required_data_for_features:].copy()
+    
+    if 'timestamp' not in df_processed.columns:
+        print(f"CRITICAL: 'timestamp' column lost for {symbol_ticker} during processing.")
+        return None, None, None # Cannot proceed without timestamp
+
+    if pivot_feature_names is None or not pivot_feature_names: # Check features list itself
+        print(f"CRITICAL: Pivot feature names list is None or empty for {symbol_ticker}.")
+        return None, None, None
+    df_processed.dropna(subset=pivot_feature_names, inplace=True) # Ensure core features are present
+    df_processed.reset_index(drop=True, inplace=True)
+
+    if len(df_processed) < 100: # Minimum data for meaningful processing/splitting
+        print(f"Not enough final processed data for {symbol_ticker} ({len(df_processed)} rows). Skipping.")
+        return None, None, None
+        
+    print(f"Initial data processing complete for {symbol_ticker}: {len(df_processed)} rows")
     return df_processed, pivot_feature_names, entry_feature_names_base
 
 
-def test_pivot_detector(pivot_model, pivot_scaler, best_params):
-    """
-    Loads golden pivot snippets and reports detection accuracy.
-    """
-    df_golden = pd.read_csv('golden_pivots.csv', parse_dates=['timestamp'])
-    symbols = df_golden['symbol'].unique()
-    total_pivots = 0
-    detected_pivots = 0
-
-    for symbol in symbols:
-        df_symbol = df_golden[df_golden['symbol'] == symbol].copy()
-        true_pivot_indices = df_symbol[df_symbol['is_pivot'] == 1]
-
-        # Feature Engineering
-        atr_period = best_params.get('atr_period_opt', ATR_PERIOD)
-        df_symbol = calculate_atr(df_symbol, period=atr_period)
-        df_symbol, feature_names = engineer_pivot_features(df_symbol, atr_col_name=f'atr_{atr_period}')
-        
-        X_test = df_symbol[feature_names].fillna(-1)
-        if pivot_scaler:
-            X_test = pivot_scaler.transform(X_test)
-            
-        predictions = pivot_model.predict(X_test)
-        
-        for true_idx in true_pivot_indices:
-            total_pivots += 1
-            # Check for detection within a window of ±1 bar
-            start = max(0, true_idx - 1)
-            end = min(len(predictions), true_idx + 2)
-            if 1 in predictions[start:end] or 2 in predictions[start:end]:
-                detected_pivots += 1
-
-    detection_rate = (detected_pivots / total_pivots) * 100 if total_pivots > 0 else 0
-    print(f"\n--- Golden Pivot Test Harness ---")
-    print(f"Result: {detection_rate:.2f}% pivots found ({detected_pivots}/{total_pivots}).")
-    print(f"---------------------------------")
-    return detection_rate
-
 if __name__ == '__main__':
+    # Ensure settings are loaded once at the beginning.
+    # This will populate app_settings which includes model paths and other configurations.
+    # load_app_settings() will also handle initial user prompts if app_settings.json is missing/invalid.
     load_app_settings()
+
+    # Directly call the main application flow orchestrator.
+    # start_app_main_flow() will handle:
+    # - Checking if models exist.
+    # - If not, running the training pipeline (data processing, Optuna, training, saving).
+    # - If models exist, loading them.
+    # - Presenting the user with the operational menu.
     start_app_main_flow()
+
     print("\nApplication finished or exited via menu.")
