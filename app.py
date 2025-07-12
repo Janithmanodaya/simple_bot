@@ -4195,7 +4195,7 @@ def start_app_main_flow():
                     print(f"WARNING: Entry scaler not found at '{entry_scaler_path}' for summary generation.")
 
                 generate_training_backtest_summary(
-                    df_processed_full_dataset=df_processed_full_dataset, 
+                    df_processed_full_dataset=df_final_train,
                     pivot_model=universal_pivot_model,
                     entry_model=universal_entry_model,
                     best_params_from_optuna=best_hyperparams,
@@ -4323,7 +4323,7 @@ def start_app_main_flow():
             if universal_pivot_model and best_hyperparams:
                 pivot_scaler_path = app_settings.get("app_pivot_scaler_path")
                 pivot_scaler = load_model(pivot_scaler_path) if pivot_scaler_path and os.path.exists(pivot_scaler_path) else None
-                test_pivot_detector(universal_pivot_model, pivot_scaler, best_params)
+                test_pivot_detector(universal_pivot_model, pivot_scaler, best_hyperparams)
             else:
                 print("Models not loaded. Please train or load models first.")
         elif user_action == '4':
