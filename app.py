@@ -7,6 +7,8 @@ from catboost import CatBoostClassifier
 from sklearn.metrics import precision_score, recall_score, confusion_matrix
 import optuna
 import joblib
+from pivot_retrainer import get_label_distribution, augment_positive_examples, apply_smote, add_momentum_features, encode_contextual_indicators, mark_categorical_features, get_tuned_hyperparameters, plot_probability_distribution, get_dynamic_threshold, fallback_rule
+from validation import backtest_comparison, live_shadow_mode, automated_alerts
 from binance.client import Client # Assuming you'll use python-binance
 from binance.exceptions import BinanceAPIException, BinanceRequestException
 import time
@@ -3689,8 +3691,10 @@ def start_app_main_flow():
     log_prefix = "[AppMainFlow]"
     global app_settings, universal_pivot_model, universal_entry_model, best_hyperparams # Ensure best_hyperparams is global if modified
 
-    # 1. Load settings
-    load_app_settings() # Loads or prompts for settings and saves them
+    # 1. Load settings from app_settings.json
+    with open('app_settings.json', 'r') as f:
+        app_settings = json.load(f)
+    
     load_app_trading_configs() # Ensure trading configs are populated from app_settings
 
     # 2. Check for ML Models
@@ -3854,6 +3858,9 @@ def start_app_main_flow():
 
             X_p_train = df_final_train[final_pivot_feats_to_use].fillna(-1)
             y_p_train = df_final_train['pivot_label']
+            
+            # Get label distribution
+            get_label_distribution(df_final_train)
 
             print(f"\n{log_prefix} --- Pivot Label Distribution BEFORE Resampling (y_p_train) ---")
             print(f"{log_prefix} Raw Value Counts:")
@@ -3895,8 +3902,7 @@ def start_app_main_flow():
 
             df_resampled = pd.concat([df_majority, df_minority1_resampled, df_minority2_resampled])
             
-            X_p_train_resampled = df_resampled[final_pivot_feats_to_use]
-            y_p_train_resampled = df_resampled['pivot_label']
+            X_p_train_resampled, y_p_train_resampled = apply_smote(df_resampled[final_pivot_feats_to_use], df_resampled['pivot_label'])
             
             print(f"\n{log_prefix} --- Pivot Label Distribution AFTER Resampling ---")
             print(f"{log_prefix} Raw Value Counts:")
@@ -4815,6 +4821,12 @@ def train_pivot_model(X_train, y_train, X_val, y_val, model_type='catboost', **k
     preds_val = model.predict(X_val)
     # For multiclass:
     # Precision/Recall for high (label 1) and low (label 2) swings
+    plot_probability_distribution(y_val, model.predict_proba(X_val))
+    
+    # Get dynamic threshold
+    dynamic_threshold = get_dynamic_threshold(y_val, model.predict_proba(X_val))
+    print(f"Dynamic Threshold: {dynamic_threshold}")
+    
     precision_high = precision_score(y_val, preds_val, labels=[1], average='micro', zero_division=0)
     recall_high = recall_score(y_val, preds_val, labels=[1], average='micro', zero_division=0)
     precision_low = precision_score(y_val, preds_val, labels=[2], average='micro', zero_division=0)
@@ -4978,15 +4990,17 @@ def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot
 
     # Train Pivot Model
     if pivot_model_type == 'catboost':
+        tuned_params = get_tuned_hyperparameters()
         pivot_model = CatBoostClassifier(
-            iterations=pivot_iterations,
-            learning_rate=pivot_learning_rate,
-            depth=pivot_depth,
-            l2_leaf_reg=pivot_l2_leaf_reg,
+            iterations=tuned_params['iterations'],
+            learning_rate=tuned_params['learning_rate'],
+            depth=tuned_params['depth'],
+            l2_leaf_reg=tuned_params['l2_leaf_reg'],
             random_state=42,
-            verbose=0
+            verbose=0,
+            class_weights={0: 1, 1: 3}
         )
-        pivot_model.fit(X_pivot_train, y_pivot_train, eval_set=[(X_pivot_val, y_pivot_val)], early_stopping_rounds=10)
+        pivot_model.fit(X_pivot_train, y_pivot_train, eval_set=[(X_pivot_val, y_pivot_val)], early_stopping_rounds=20)
     else:
         raise ValueError(f"Unsupported pivot model type: {pivot_model_type}")
 
@@ -5021,18 +5035,20 @@ def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot
         return -1.0
 
     if entry_model_type == 'catboost':
+        tuned_params = get_tuned_hyperparameters()
         entry_model = CatBoostClassifier(
-            iterations=entry_iterations,
-            learning_rate=entry_learning_rate,
-            depth=entry_depth,
-            l2_leaf_reg=entry_l2_leaf_reg,
+            iterations=tuned_params['iterations'],
+            learning_rate=tuned_params['learning_rate'],
+            depth=tuned_params['depth'],
+            l2_leaf_reg=tuned_params['l2_leaf_reg'],
             random_state=42,
-            verbose=0
+            verbose=0,
+            class_weights={0: 1, 1: 3}
         )
         if len(entry_train_candidates) > 20:
              X_entry_train_sub, X_entry_val_sub, y_entry_train_sub, y_entry_val_sub = train_test_split(X_entry_train, y_entry_train, test_size=0.2, stratify=y_entry_train if len(y_entry_train.unique()) > 1 else None, random_state=42)
              if len(X_entry_val_sub) > 0 and len(y_entry_val_sub.unique()) > 1:
-                entry_model.fit(X_entry_train_sub, y_entry_train_sub, eval_set=[(X_entry_val_sub, y_entry_val_sub)], early_stopping_rounds=10)
+                entry_model.fit(X_entry_train_sub, y_entry_train_sub, eval_set=[(X_entry_val_sub, y_entry_val_sub)], early_stopping_rounds=20)
              else:
                 entry_model.fit(X_entry_train, y_entry_train) 
         else:
@@ -5103,6 +5119,9 @@ def run_optuna_tuning(df_universal_raw, static_entry_features_base_list, n_trial
     """Runs Optuna hyperparameter tuning and stores results in SQLite."""
     global app_settings # Access global app_settings for version and path
 
+    # Modular retrain routine
+    from pivot_retrainer import get_label_distribution, augment_positive_examples, apply_smote
+    
     study_version = app_settings.get("app_study_version", "default_study_v1")
     optuna_runs_path = app_settings.get("app_optuna_runs_path", "optuna_runs")
 
@@ -6150,6 +6169,15 @@ def get_processed_data_for_symbol(symbol_ticker, kline_interval, start_date, end
     historical_df, entry_feature_names_base = engineer_entry_features(historical_df, atr_col_name=atr_col_name_dynamic, entry_features_base_list_arg=None)
     if historical_df is None or entry_feature_names_base is None: return None, None, None
 
+    # Add momentum features
+    historical_df = add_momentum_features(historical_df)
+    
+    # Encode contextual indicators
+    historical_df = encode_contextual_indicators(historical_df)
+    
+    # Mark categorical features
+    historical_df = mark_categorical_features(historical_df)
+
     historical_df.replace([np.inf, -np.inf], np.nan, inplace=True)
     min_required_data_for_features = 30
     if len(historical_df) < min_required_data_for_features:
@@ -6189,5 +6217,10 @@ if __name__ == '__main__':
     # - If models exist, loading them.
     # - Presenting the user with the operational menu.
     start_app_main_flow()
+    
+    # Example validation calls
+    # backtest_comparison(old_logic, new_logic, data)
+    # live_shadow_mode(data, old_logic, new_logic)
+    # automated_alerts(new_pivots_count)
 
     print("\nApplication finished or exited via menu.")
