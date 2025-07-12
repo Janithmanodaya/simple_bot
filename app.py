@@ -3576,6 +3576,7 @@ def app_trading_signal_loop(current_app_settings: dict, pivot_model_loaded, entr
     send_app_telegram_message(startup_message)
     
     global app_binance_client # Ensure global client is accessible
+    active_symbol_context = "LoopInitialization" # For error reporting
 
     # Ensure client is initialized (should be by start_app_main_flow, but double check)
     if app_binance_client is None:
@@ -3585,49 +3586,87 @@ def app_trading_signal_loop(current_app_settings: dict, pivot_model_loaded, entr
             return
         print(f"{log_prefix} Binance client initialized successfully within loop startup.")
 
+    from concurrent.futures import ThreadPoolExecutor, as_completed # Ensure this is imported at the top of app.py if not already
+
     try:
-        while True:
-            loop_start_time = time.time()
-            print(f"\n{log_prefix} --- New Scan Cycle --- | Mode: {current_app_settings.get('app_operational_mode', 'UNKNOWN')}")
+        active_symbol_context = "ThreadPoolInitialization"
+        # Determine max_workers for symbol scanning pool.
+        # Can be a fixed number, os.cpu_count(), or based on number of symbols.
+        # Let's use a sensible default, e.g., min(len(trading_symbols_list_at_startup), os.cpu_count() or 4)
+        # This needs to be defined before the loop if symbols list is static, or dynamically if it changes.
+        # For now, let's define it once based on initial symbol count or a fixed value.
+        
+        # Initial symbol list for determining worker count (can be refined if symbols change dynamically often)
+        initial_symbols_str = current_app_settings.get("app_trading_symbols", "BTCUSDT")
+        initial_trading_symbols_list = []
+        if isinstance(initial_symbols_str, str) and initial_symbols_str.lower().endswith(".csv"):
+            initial_trading_symbols_list = app_load_symbols_from_csv(initial_symbols_str)
+        elif isinstance(initial_symbols_str, str):
+            initial_trading_symbols_list = [s.strip().upper() for s in initial_symbols_str.split(',') if s.strip()]
+        
+        if not initial_trading_symbols_list: initial_trading_symbols_list = ["BTCUSDT"] # Fallback
 
-            trading_symbols = []
-            symbols_source_config = current_app_settings.get("app_trading_symbols", "BTCUSDT") # Default to BTCUSDT string
-            
-            if isinstance(symbols_source_config, str) and symbols_source_config.lower().endswith(".csv"):
-                # Attempt to load from CSV file specified in app_trading_symbols
-                print(f"{log_prefix} Attempting to load symbols from CSV: {symbols_source_config}")
-                trading_symbols = app_load_symbols_from_csv(symbols_source_config)
+        num_workers_scanning = min(len(initial_trading_symbols_list), (os.cpu_count() or 4) if os.cpu_count() else 4)
+        # Cap workers to a reasonable number if many symbols, e.g., 10, to avoid API rate limits or excessive resource use.
+        num_workers_scanning = min(num_workers_scanning, 10) 
+        print(f"{log_prefix} Using {num_workers_scanning} workers for parallel symbol scanning.")
+
+        with ThreadPoolExecutor(max_workers=num_workers_scanning) as executor:
+            while True:
+                loop_start_time = time.time()
+                print(f"\n{log_prefix} --- New Scan Cycle --- | Mode: {current_app_settings.get('app_operational_mode', 'UNKNOWN')}")
+
+                trading_symbols = [] # This list will be populated fresh each cycle
+                symbols_source_config = current_app_settings.get("app_trading_symbols", "BTCUSDT")
+                
+                if isinstance(symbols_source_config, str) and symbols_source_config.lower().endswith(".csv"):
+                    trading_symbols = app_load_symbols_from_csv(symbols_source_config)
+                    if not trading_symbols: trading_symbols = ["BTCUSDT"]
+                elif isinstance(symbols_source_config, str):
+                    trading_symbols = [s.strip().upper() for s in symbols_source_config.split(',') if s.strip()]
+                    if not trading_symbols: trading_symbols = ["BTCUSDT"]
+                else:
+                    trading_symbols = ["BTCUSDT"]
+                
+                active_symbol_context = f"BatchProcessing_{'_'.join(trading_symbols[:3])}" # Context for the current batch
+
                 if not trading_symbols:
-                    print(f"{log_prefix} Failed to load symbols from {symbols_source_config} or file is empty. Defaulting to BTCUSDT.")
-                    trading_symbols = ["BTCUSDT"]
-            elif isinstance(symbols_source_config, str):
-                # Parse as comma-separated string
-                trading_symbols = [s.strip().upper() for s in symbols_source_config.split(',') if s.strip()]
-                if not trading_symbols: # If string was empty or only commas
-                    print(f"{log_prefix} 'app_trading_symbols' string ('{symbols_source_config}') resulted in no symbols. Defaulting to BTCUSDT.")
-                    trading_symbols = ["BTCUSDT"]
-            else: # Fallback if config is not a string (e.g. error or unexpected type)
-                print(f"{log_prefix} 'app_trading_symbols' has unexpected type or value. Defaulting to BTCUSDT.")
-                trading_symbols = ["BTCUSDT"]
+                    print(f"{log_prefix} No trading symbols configured. Skipping symbol processing part of cycle.")
+                else:
+                    print(f"{log_prefix} Submitting {len(trading_symbols)} symbols for parallel processing: {trading_symbols}")
+                    future_to_symbol_scan = {
+                        executor.submit(app_process_symbol_for_signal,
+                                        symbol_ticker,
+                                        app_binance_client, # Pass global client
+                                        current_app_settings,
+                                        pivot_model_loaded,
+                                        entry_model_loaded,
+                                        current_best_hyperparams): symbol_ticker
+                        for symbol_ticker in trading_symbols
+                    }
+                    
+                    for future in as_completed(future_to_symbol_scan):
+                        symbol_ticker_scan = future_to_symbol_scan[future]
+                        active_symbol_context = symbol_ticker_scan # Update context to the specific symbol being handled
+                        try:
+                            # app_process_symbol_for_signal doesn't typically return a value we need to capture here.
+                            # It logs its own success/failure. We just want to ensure it completes or handle exceptions.
+                            future.result() # Wait for completion and raise exceptions if any
+                            print(f"{log_prefix} Successfully completed processing for {symbol_ticker_scan} in parallel scan.")
+                        except Exception as exc_scan:
+                            print(f"{log_prefix} Symbol {symbol_ticker_scan} generated an exception during parallel scan: {exc_scan}")
+                            import traceback
+                            traceback.print_exc()
+                            # Optionally send a Telegram alert about the error for this symbol
+                            send_app_telegram_message(f"🆘 ERROR processing {symbol_ticker_scan} in scan: {str(exc_scan)[:200]}")
+                    
+                    active_symbol_context = "BatchScanComplete" # Reset context after batch
+                    print(f"{log_prefix} Parallel symbol scanning for this cycle complete.")
+                    # Note: The app_delay_between_symbols_seconds is no longer applicable in parallel execution.
+                    # If delays are needed (e.g. for API rate limits), they should be managed within app_process_symbol_for_signal
+                    # or by adjusting the number of workers.
 
-            if not trading_symbols: # Final fallback, though logic above should ensure trading_symbols is not empty
-                print(f"{log_prefix} No trading symbols configured after all checks. Skipping cycle.")
-            else:
-                print(f"{log_prefix} Processing symbols: {trading_symbols}")
-                for symbol_to_trade in trading_symbols:
-                    print(f"{log_prefix} Processing symbol: {symbol_to_trade}")
-                    app_process_symbol_for_signal(
-                        symbol=symbol_to_trade,
-                        client=app_binance_client, # Use the global client
-                        current_app_settings=current_app_settings,
-                        pivot_model_loaded=pivot_model_loaded,
-                        entry_model_loaded=entry_model_loaded,
-                        current_best_hyperparams=current_best_hyperparams
-                    )
-                    # Optional: Short delay between processing symbols if multiple are listed
-                    time.sleep(current_app_settings.get("app_delay_between_symbols_seconds", 2)) # Default 2s
-
-            # --- Check Fibonacci Pre-Order Proposals ---
+            # --- Check Fibonacci Pre-Order Proposals (remains sequential after parallel scan) ---
             if current_app_settings.get("use_fib_preorder", False): # Only run if feature is enabled
                 print(f"{log_prefix} Checking Fibonacci pre-order proposals...")
                 app_check_fib_proposals(
@@ -3678,7 +3717,7 @@ def app_trading_signal_loop(current_app_settings: dict, pivot_model_loaded, entr
         import traceback
         traceback.print_exc()
         # Optionally send a Telegram alert about the critical error
-        error_message = f"🆘 CRITICAL ERROR in AppTradingLoop 🆘\nSymbol: {symbol_to_trade if 'symbol_to_trade' in locals() else 'N/A'}\nError: {str(e)[:1000]}"
+        error_message = f"🆘 CRITICAL ERROR in AppTradingLoop 🆘\nContext: {active_symbol_context}\nError: {str(e)[:1000]}"
         send_app_telegram_message(error_message) # Uses global app_trading_configs for token/chat_id
     finally:
         print(f"{log_prefix} Trading/signal loop stopped. Saving final decision log...")
@@ -3769,31 +3808,71 @@ def start_app_main_flow():
             processed_pivot_feature_names_app = None # Initialize for this training run
             processed_entry_feature_names_base_app = None # Initialize for this training run
 
-
-            for symbol_ticker_app in training_symbols_list:
-                processed_df_app, pivot_feats_app, entry_feats_base_app = get_processed_data_for_symbol(
-                    symbol_ticker_app, kline_interval_train, start_date_train, end_date_train
-                )
-                if processed_df_app is not None and not processed_df_app.empty:
-                    if processed_pivot_feature_names_app is None: # Capture feature names from first successful processing
-                        processed_pivot_feature_names_app = pivot_feats_app
-                    if processed_entry_feature_names_base_app is None: # Capture from first
-                        processed_entry_feature_names_base_app = entry_feats_base_app
-                    all_symbols_train_data_list_app.append(processed_df_app)
+            # --- Parallelized Data Processing for Training ---
+            from concurrent.futures import ThreadPoolExecutor, as_completed
             
-            if not all_symbols_train_data_list_app: print("CRITICAL: No training data. Cannot train models."); sys.exit(1) # Empty list check
-            universal_df_initial_processed_app = pd.concat(all_symbols_train_data_list_app, ignore_index=True)
-            if len(universal_df_initial_processed_app) < 200: print(f"CRITICAL: Combined training data too small ({len(universal_df_initial_processed_app)})."); sys.exit(1)
+            # Determine number of threads (e.g., number of symbols or a fixed cap like 5 or CPU count)
+            # For now, let's use a sensible default, e.g., min(len(training_symbols_list), os.cpu_count() or 4)
+            # This assumes os.cpu_count() is available. If not, a fixed number.
+            num_workers_data_processing = min(len(training_symbols_list), (os.cpu_count() or 4) if os.cpu_count() else 4)
+            print(f"{log_prefix} Using {num_workers_data_processing} workers for parallel data processing.")
 
-            # Ensure feature names are available before Optuna if they were determined
+            with ThreadPoolExecutor(max_workers=num_workers_data_processing) as executor:
+                future_to_symbol = {
+                    executor.submit(get_processed_data_for_symbol, 
+                                    symbol_ticker, kline_interval_train, 
+                                    start_date_train, end_date_train): symbol_ticker 
+                    for symbol_ticker in training_symbols_list
+                }
+                
+                for future in as_completed(future_to_symbol):
+                    symbol_ticker_app = future_to_symbol[future]
+                    try:
+                        processed_df_app, pivot_feats_app, entry_feats_base_app = future.result()
+                        if processed_df_app is not None and not processed_df_app.empty:
+                            if processed_pivot_feature_names_app is None and pivot_feats_app: # Capture feature names from first successful processing
+                                processed_pivot_feature_names_app = pivot_feats_app
+                            if processed_entry_feature_names_base_app is None and entry_feats_base_app: # Capture from first
+                                processed_entry_feature_names_base_app = entry_feats_base_app
+                            all_symbols_train_data_list_app.append(processed_df_app)
+                            print(f"{log_prefix} Successfully processed data for {symbol_ticker_app} in parallel.")
+                        else:
+                            print(f"{log_prefix} No data returned or empty data for {symbol_ticker_app} from parallel processing.")
+                    except Exception as exc:
+                        print(f"{log_prefix} Symbol {symbol_ticker_app} generated an exception during parallel data processing: {exc}")
+                        import traceback
+                        traceback.print_exc()
+            
+            if not all_symbols_train_data_list_app: print("CRITICAL: No training data after parallel processing. Cannot train models."); sys.exit(1)
+            
+            # Ensure feature names were captured from at least one symbol.
+            # If multiple symbols return different feature sets (should not happen with current design), this takes the first one.
             if processed_pivot_feature_names_app is None or processed_entry_feature_names_base_app is None:
-                print("CRITICAL: Feature names for training not determined (no symbol data processed successfully?). Exiting.")
+                 # Attempt to get from the first valid df if lists are still None
+                 if all_symbols_train_data_list_app:
+                     # This part is tricky because get_processed_data_for_symbol returns the features, not the df itself containing them as columns
+                     # The current structure assumes that if processed_df_app is valid, pivot_feats_app and entry_feats_base_app were also valid from that call.
+                     # If after all parallel calls, these are still None, it means no symbol processing was successful in returning feature names.
+                     print("CRITICAL: Feature names for training not determined after parallel processing (no symbol data processed successfully or returned feature names?). Exiting.")
+                     sys.exit(1)
+
+
+            universal_df_initial_processed_app = pd.concat(all_symbols_train_data_list_app, ignore_index=True)
+            if len(universal_df_initial_processed_app) < 200: print(f"CRITICAL: Combined training data too small ({len(universal_df_initial_processed_app)}) after parallel processing."); sys.exit(1)
+            
+            # Ensure feature names are available before Optuna (already checked above, but good final check)
+            if processed_pivot_feature_names_app is None or processed_entry_feature_names_base_app is None:
+                print("CRITICAL: Feature names for training are still None before Optuna. Exiting.")
                 sys.exit(1)
+            
+            print(f"{log_prefix} Parallel data processing complete. Combined data shape: {universal_df_initial_processed_app.shape}")
+            # --- End Parallelized Data Processing ---
+
 
             try:
                 current_best_hyperparams = run_optuna_tuning(
                     universal_df_initial_processed_app.copy(),
-                    static_entry_features_base_list=processed_entry_feature_names_base_app, # Pass determined base names
+                    static_entry_features_base_list=processed_entry_feature_names_base_app, 
                     n_trials=optuna_trials_app
                 )
                 if current_best_hyperparams is None: # Check if Optuna returned None
@@ -4809,10 +4888,11 @@ def train_pivot_model(X_train, y_train, X_val, y_val, model_type='lgbm', **kwarg
     
     # Filter kwargs to only include those relevant for the specific model type
     if model_type == 'lgbm':
-        lgbm_valid_keys = ['num_leaves', 'learning_rate', 'max_depth', 'n_estimators', 'reg_alpha', 'reg_lambda', 'colsample_bytree', 'subsample', 'min_child_samples'] # Add more as tuned by Optuna
+        lgbm_valid_keys = ['num_leaves', 'learning_rate', 'max_depth', 'n_estimators', 'reg_alpha', 'reg_lambda', 'colsample_bytree', 'subsample', 'min_child_samples', 'n_jobs'] # Added n_jobs
         model_params.update({k: v for k, v in kwargs.items() if k in lgbm_valid_keys})
         # Ensure n_estimators is reasonable, Optuna might not always set it.
         if 'n_estimators' not in model_params: model_params['n_estimators'] = 100 # Default
+        if 'n_jobs' not in model_params: model_params['n_jobs'] = -1 # Default to use all cores if not specified
         model = lgb.LGBMClassifier(**model_params)
         model.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[early_stopping(stopping_rounds=10, verbose=-1)])
     elif model_type == 'rf':
@@ -4856,9 +4936,10 @@ def train_entry_model(X_train, y_train, X_val, y_val, model_type='lgbm', **kwarg
     model_params = {'class_weight': 'balanced', 'random_state': 42}
 
     if model_type == 'lgbm':
-        lgbm_valid_keys = ['num_leaves', 'learning_rate', 'max_depth', 'n_estimators', 'reg_alpha', 'reg_lambda', 'colsample_bytree', 'subsample', 'min_child_samples']
+        lgbm_valid_keys = ['num_leaves', 'learning_rate', 'max_depth', 'n_estimators', 'reg_alpha', 'reg_lambda', 'colsample_bytree', 'subsample', 'min_child_samples', 'n_jobs'] # Added n_jobs
         model_params.update({k: v for k, v in kwargs.items() if k in lgbm_valid_keys})
         if 'n_estimators' not in model_params: model_params['n_estimators'] = 100
+        if 'n_jobs' not in model_params: model_params['n_jobs'] = -1 # Default to use all cores if not specified
         
         model = lgb.LGBMClassifier(**model_params)
         model.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[early_stopping(stopping_rounds=10, verbose=-1)])
@@ -5158,7 +5239,8 @@ def run_optuna_tuning(df_universal_raw, static_entry_features_base_list, n_trial
         print(f"Running {n_trials_to_run} new Optuna trials...")
         study.optimize(
             lambda trial: objective_optuna(trial, df_universal_raw, static_entry_features_base_list),
-            n_trials=n_trials_to_run # Only run the remaining number of trials
+            n_trials=n_trials_to_run, # Only run the remaining number of trials
+            n_jobs=-1 # Use all available CPU cores for parallel trials
         )
 
     # Log best trial details
@@ -6075,14 +6157,106 @@ def display_summary_table(main_summary_df: pd.DataFrame,
 
 
 # --- Main Orchestration ---
-def get_processed_data_for_symbol(symbol_ticker, kline_interval, start_date, end_date):
+import hashlib
+
+def get_processed_data_for_symbol(symbol_ticker, kline_interval, start_date, end_date, force_reprocess=False):
     """
     Fetches, preprocesses, and engineers features for a single symbol.
+    Implements caching for the fully processed DataFrame.
     Returns a processed DataFrame, pivot feature names, and entry feature names.
     """
+    log_prefix = f"[DataProcessing-{symbol_ticker}]"
     print(f"\n--- Initial Data Processing for Symbol: {symbol_ticker} ---")
-    # 1. Data Collection using the new function
-    print(f"Getting/Downloading historical data for {symbol_ticker}...")
+
+    # Define processing parameters that affect the output DataFrame structure/values
+    # These will be used to create a hash for the cache filename.
+    # Using global constants directly here. If these become dynamic per symbol, they'd need to be passed in.
+    processing_params = {
+        "atr_period": ATR_PERIOD,
+        "pivot_n_left": PIVOT_N_LEFT,
+        "pivot_n_right": PIVOT_N_RIGHT,
+        "min_atr_distance": MIN_ATR_DISTANCE,
+        "min_bar_gap": MIN_BAR_GAP,
+        "fib_level_entry": FIB_LEVEL_ENTRY,
+        "fib_level_tp1": FIB_LEVEL_TP1,
+        "fib_level_tp2": FIB_LEVEL_TP2,
+        "fib_level_tp3_extension": FIB_LEVEL_TP3_EXTENSION
+        # Add any other parameters from app_settings that influence get_processed_data_for_symbol's output
+        # e.g., if feature engineering logic changes based on a setting.
+    }
+    params_str = json.dumps(processing_params, sort_keys=True)
+    params_hash = hashlib.md5(params_str.encode('utf-8')).hexdigest()[:8] # Short hash
+
+    # Sanitize interval, start_date, end_date for filename
+    safe_interval = kline_interval.replace(" ", "").lower()
+    safe_start_date = start_date.replace(" ", "_").replace(",", "")
+    safe_end_date = end_date.replace(" ", "_").replace(",", "") if end_date else "latest"
+    
+    cache_directory = "processed_data_cache"
+    os.makedirs(cache_directory, exist_ok=True)
+    cache_filename = f"{symbol_ticker}_{safe_interval}_{safe_start_date}_to_{safe_end_date}_params_{params_hash}.parquet"
+    cache_filepath = os.path.join(cache_directory, cache_filename)
+
+    # Check for force_reprocess flag (e.g. from app_settings.app_force_retrain_on_startup)
+    # This logic assumes force_reprocess might be passed down if global force_retrain is True.
+    # Alternatively, check global app_settings["app_force_retrain_on_startup"] here directly.
+    # For now, let's assume force_reprocess is passed if needed.
+    # A simpler way for the current structure is to check the global flag:
+    if app_settings.get("app_force_retrain_on_startup", False):
+        print(f"{log_prefix} Force reprocess is ON. Ignoring existing cache for {symbol_ticker}.")
+        force_reprocess = True # Ensure local flag is also true
+
+    if not force_reprocess and os.path.exists(cache_filepath):
+        try:
+            print(f"{log_prefix} Loading cached processed data from {cache_filepath}...")
+            # The cached file should store not just the DataFrame, but also the feature names.
+            # We can use Parquet metadata or a small companion JSON file.
+            # For simplicity, let's assume for now that feature names are consistent if params_hash matches.
+            # A more robust solution would store feature names alongside the cached DataFrame.
+            # For this implementation, we'll re-derive feature names after loading, assuming consistency.
+            df_processed_cached = pd.read_parquet(cache_filepath)
+            
+            # Re-derive feature names (assuming they are consistent for this params_hash)
+            # This requires running parts of the feature engineering again just to get names,
+            # which is not ideal. A better way is to store them with the cache.
+            # Quick fix: Store feature names in the Parquet metadata or a sidecar JSON.
+            # For now, we'll just re-run engineer_pivot_features and engineer_entry_features on a small sample
+            # if the main df is loaded from cache, just to get the names. This is inefficient.
+            # Let's assume the feature names are fixed given the ATR_PERIOD for now.
+            # This means engineer_pivot_features and engineer_entry_features must return consistent names
+            # if the ATR_PERIOD (part of params_hash) is the same.
+            
+            atr_col_name_cache = f'atr_{processing_params["atr_period"]}'
+            # We need to ensure the loaded df_processed_cached has the necessary columns for these calls
+            # or that the feature engineering functions can run on it to extract names without error.
+            # This is a structural challenge with caching DataFrames and needing associated metadata like feature lists.
+            
+            # Simplification for now: Assume feature names are static or can be derived from params_hash context.
+            # The `get_processed_data_for_symbol` returns (df, pivot_feature_names, entry_feature_names_base)
+            # So, if we cache df, we also need to cache these lists.
+            # Let's try to store them in Parquet metadata (if supported and simple) or sidecar JSON.
+
+            # --- Attempt to load feature names from a sidecar JSON ---
+            sidecar_path = cache_filepath.replace(".parquet", "_feature_names.json")
+            if os.path.exists(sidecar_path):
+                with open(sidecar_path, 'r') as f_sidecar:
+                    cached_feature_info = json.load(f_sidecar)
+                pivot_feature_names_cached = cached_feature_info.get("pivot_feature_names")
+                entry_feature_names_base_cached = cached_feature_info.get("entry_feature_names_base")
+                
+                if pivot_feature_names_cached and entry_feature_names_base_cached:
+                    print(f"{log_prefix} Successfully loaded processed data and feature names for {symbol_ticker} from cache.")
+                    return df_processed_cached, pivot_feature_names_cached, entry_feature_names_base_cached
+                else:
+                    print(f"{log_prefix} Cached data found, but feature names in sidecar file are incomplete. Reprocessing.")
+            else:
+                print(f"{log_prefix} Cached data found, but sidecar file for feature names missing. Reprocessing.")
+
+        except Exception as e:
+            print(f"{log_prefix} Error loading cached processed data for {symbol_ticker}: {e}. Reprocessing.")
+    
+    # If cache not found, or force_reprocess is True, or loading failed:
+    print(f"{log_prefix} Getting/Downloading raw historical data for {symbol_ticker}...")
     try:
         # Initialize Binance client if not already done (e.g. if main script part is not run first)
         global app_binance_client, app_trading_configs # Added app_trading_configs
@@ -6103,8 +6277,8 @@ def get_processed_data_for_symbol(symbol_ticker, kline_interval, start_date, end
             interval=kline_interval,
             start_date_str=start_date, # Overall start date for the dataset
             end_date_str=end_date,     # Overall end date for the dataset
-            data_directory="historical_data" # Standardized directory
-            # force_redownload_all can be a parameter to main script if needed
+            data_directory="historical_data", # Standardized directory
+            force_redownload_all=force_reprocess # Pass down force_reprocess flag
         )
         if historical_df is None or historical_df.empty: # Check for None as well
             print(f"No data obtained for {symbol_ticker} (None or empty DataFrame). Skipping.")
@@ -6122,7 +6296,7 @@ def get_processed_data_for_symbol(symbol_ticker, kline_interval, start_date, end
         traceback.print_exc()
         return None, None, None
 
-    print(f"Data obtained for {symbol_ticker}: {len(historical_df)} bars")
+    print(f"{log_prefix} Data obtained for {symbol_ticker}: {len(historical_df)} bars")
     if 'timestamp' not in historical_df.columns:
          historical_df.reset_index(inplace=True) # Should not be needed if get_or_download returns consistent format
     if 'timestamp' not in historical_df.columns and 'index' in historical_df.columns and pd.api.types.is_datetime64_any_dtype(historical_df['index']):
@@ -6131,12 +6305,15 @@ def get_processed_data_for_symbol(symbol_ticker, kline_interval, start_date, end
     historical_df['symbol'] = symbol_ticker # Add symbol identifier
 
     # 2. Preprocessing & Labeling
-    historical_df = calculate_atr(historical_df, period=ATR_PERIOD) # Ensure ATR_PERIOD is used
-    if historical_df is None: return None, None, None # Check after each processing step
+    # Use ATR_PERIOD from global constants (which is part of params_hash for caching)
     atr_col_name_dynamic = f'atr_{ATR_PERIOD}'
-    historical_df = generate_candidate_pivots(historical_df)
+    historical_df = calculate_atr(historical_df, period=ATR_PERIOD) 
+    if historical_df is None: return None, None, None 
+    
+    historical_df = generate_candidate_pivots(historical_df, n_left=PIVOT_N_LEFT, n_right=PIVOT_N_RIGHT)
     if historical_df is None: return None, None, None
-    historical_df = prune_and_label_pivots(historical_df, atr_col_name=atr_col_name_dynamic)
+    historical_df = prune_and_label_pivots(historical_df, atr_col_name=atr_col_name_dynamic, 
+                                           atr_distance_factor=MIN_ATR_DISTANCE, min_bar_gap=MIN_BAR_GAP)
     if historical_df is None: return None, None, None
     historical_df = simulate_fib_entries(historical_df, atr_col_name=atr_col_name_dynamic)
     if historical_df is None: return None, None, None
@@ -6147,39 +6324,59 @@ def get_processed_data_for_symbol(symbol_ticker, kline_interval, start_date, end
             if 'index' in historical_df.columns and 'timestamp' not in historical_df.columns:
                  historical_df.rename(columns={'index':'timestamp'}, inplace=True)
 
-    historical_df.dropna(subset=[f'atr_{ATR_PERIOD}'], inplace=True)
+    historical_df.dropna(subset=[atr_col_name_dynamic], inplace=True)
     historical_df.reset_index(drop=True, inplace=True)
 
     # 3. Feature Engineering
-    # atr_col_name_dynamic was defined above
     historical_df, pivot_feature_names = engineer_pivot_features(historical_df, atr_col_name=atr_col_name_dynamic)
-    if historical_df is None or pivot_feature_names is None: return None, None, None # Check features as well
+    if historical_df is None or pivot_feature_names is None: return None, None, None
     historical_df, entry_feature_names_base = engineer_entry_features(historical_df, atr_col_name=atr_col_name_dynamic, entry_features_base_list_arg=None)
     if historical_df is None or entry_feature_names_base is None: return None, None, None
 
     historical_df.replace([np.inf, -np.inf], np.nan, inplace=True)
-    min_required_data_for_features = 30
+    min_required_data_for_features = 30 # Should be consistent with what engineer_features might drop
     if len(historical_df) < min_required_data_for_features:
-        print(f"Not enough data after initial processing for {symbol_ticker} ({len(historical_df)} rows). Skipping.")
+        print(f"{log_prefix} Not enough data after initial processing for {symbol_ticker} ({len(historical_df)} rows). Skipping.")
         return None, None, None
 
+    # Ensure df_processed starts after any initial NaNs from rolling features etc.
+    # A common practice is to use iloc slice if feature engineering creates leading NaNs.
+    # For now, assuming engineer_features handles this or returns clean data.
+    # The current structure implies min_required_data_for_features is for this.
     df_processed = historical_df.iloc[min_required_data_for_features:].copy()
     
     if 'timestamp' not in df_processed.columns:
-        print(f"CRITICAL: 'timestamp' column lost for {symbol_ticker} during processing.")
-        return None, None, None # Cannot proceed without timestamp
+        print(f"{log_prefix} CRITICAL: 'timestamp' column lost for {symbol_ticker} during processing.")
+        return None, None, None 
 
-    if pivot_feature_names is None or not pivot_feature_names: # Check features list itself
-        print(f"CRITICAL: Pivot feature names list is None or empty for {symbol_ticker}.")
+    if pivot_feature_names is None or not pivot_feature_names: 
+        print(f"{log_prefix} CRITICAL: Pivot feature names list is None or empty for {symbol_ticker}.")
         return None, None, None
-    df_processed.dropna(subset=pivot_feature_names, inplace=True) # Ensure core features are present
+    df_processed.dropna(subset=pivot_feature_names, inplace=True) 
     df_processed.reset_index(drop=True, inplace=True)
 
-    if len(df_processed) < 100: # Minimum data for meaningful processing/splitting
-        print(f"Not enough final processed data for {symbol_ticker} ({len(df_processed)} rows). Skipping.")
+    if len(df_processed) < 100: 
+        print(f"{log_prefix} Not enough final processed data for {symbol_ticker} ({len(df_processed)} rows). Skipping.")
         return None, None, None
-        
-    print(f"Initial data processing complete for {symbol_ticker}: {len(df_processed)} rows")
+    
+    # Cache the processed DataFrame and feature names
+    try:
+        print(f"{log_prefix} Caching processed data for {symbol_ticker} to {cache_filepath}...")
+        df_processed.to_parquet(cache_filepath, index=False)
+        # Save feature names to sidecar JSON
+        feature_info_to_cache = {
+            "pivot_feature_names": pivot_feature_names,
+            "entry_feature_names_base": entry_feature_names_base
+        }
+        sidecar_path_to_save = cache_filepath.replace(".parquet", "_feature_names.json")
+        with open(sidecar_path_to_save, 'w') as f_sidecar_save:
+            json.dump(feature_info_to_cache, f_sidecar_save, indent=4)
+        print(f"{log_prefix} Successfully cached processed data and feature names for {symbol_ticker}.")
+    except Exception as e_cache:
+        print(f"{log_prefix} Error caching processed data for {symbol_ticker}: {e_cache}")
+        # Continue with the current df_processed even if caching fails
+
+    print(f"{log_prefix} Initial data processing complete for {symbol_ticker}: {len(df_processed)} rows")
     return df_processed, pivot_feature_names, entry_feature_names_base
 
 
