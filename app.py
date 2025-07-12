@@ -5918,12 +5918,13 @@ def run_backtest_scenario(scenario_name: str, df_processed: pd.DataFrame,
         # we can try to add it.
         temp_final_trades = final_trades_for_metrics.copy()
         if scenario_name == "Full ML Pipeline" and 'p_profit_test_ml' in locals() and len(p_profit_test_ml) == len(X_entry_test_ml):
-             # This assumes X_entry_test_ml has the same index as potential_pivots_ml
-             # And final_trades_for_metrics is a filtered version of potential_pivots_ml
-             if X_entry_test_ml.index.equals(potential_pivots_ml.index): # Check index alignment
-                 potential_pivots_ml['P_profit_score_calc'] = p_profit_test_ml
+             # This assumes X_entry_test_ml_raw has the same index as potential_pivots_ml,
+             # because X_entry_test_ml_raw is a direct slice of potential_pivots_ml.
+             if X_entry_test_ml_raw.index.equals(potential_pivots_ml.loc[X_entry_test_ml_raw.index].index): # Check index alignment using the raw df
+                 potential_pivots_ml['P_profit_score_calc'] = np.nan # Initialize column
+                 potential_pivots_ml.loc[X_entry_test_ml_raw.index, 'P_profit_score_calc'] = p_profit_test_ml
                  # Merge this back to temp_final_trades based on index
-                 temp_final_trades = temp_final_trades.join(potential_pivots_ml[['P_profit_score_calc']])
+                 temp_final_trades = temp_final_trades.join(potential_pivots_ml[['P_profit_score_calc']], how='left')
 
 
         for idx, trade_row in temp_final_trades.iterrows():
