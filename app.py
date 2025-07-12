@@ -225,7 +225,15 @@ def get_historical_bars(symbol, interval, start_str, end_str=None):
             return pd.DataFrame() # Return empty DataFrame on failure
         # If successful, app_binance_client is now set.
 
-    klines = app_binance_client.get_historical_klines(symbol, interval, start_str, end_str)
+    try:
+        klines = app_binance_client.get_historical_klines(symbol, interval, start_str, end_str)
+    except BinanceAPIException as e:
+        if e.code == -1121: # Invalid symbol
+            print(f"Error (get_historical_bars): Invalid symbol '{symbol}'. Returning empty DataFrame. Error: {e}")
+        else:
+            print(f"Error (get_historical_bars): Binance API Exception for {symbol}: {e}. Returning empty DataFrame.")
+        return pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+
     if not klines: # Check if klines list is empty
         print(f"Warning (get_historical_bars): No klines returned from API for {symbol} {interval} {start_str} {end_str}.")
         # Return DataFrame with expected columns but no data
@@ -322,15 +330,15 @@ def get_or_download_historical_data(symbol: str, interval: str,
         downloaded_df = get_historical_bars(symbol, interval, start_date_str, end_str=end_date_str)
         if downloaded_df is None or downloaded_df.empty:
             print(f"{log_prefix_parquet} No data downloaded for {symbol} (full download attempt). Returning empty DataFrame with headers.")
-            return pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            return pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
         
         print(f"{log_prefix_parquet} Downloaded full data. Shape: {downloaded_df.shape}. Sorting and saving...")
-        downloaded_df.sort_values('timestamp', inplace=True)
-        downloaded_df.drop_duplicates(subset=['timestamp'], keep='last', inplace=True)
+        downloaded_df.sort_index(inplace=True)
+        downloaded_df = downloaded_df[~downloaded_df.index.duplicated(keep='last')]
         
         try:
             print(f"{log_prefix_parquet} Attempting to write full data to Parquet. Shape: {downloaded_df.shape}. Path: {file_path}")
-            downloaded_df.to_parquet(file_path, index=False)
+            downloaded_df.to_parquet(file_path, index=True)
             print(f"{log_prefix_parquet} INFO: Wrote full data: {file_path}")
         except Exception as e:
             print(f"{log_prefix_parquet} ERROR: Failed writing full data to Parquet {file_path}: {e}")
@@ -360,25 +368,25 @@ def get_or_download_historical_data(symbol: str, interval: str,
 
             combined_df = pd.concat([existing_df, new_data_df], ignore_index=True)
             print(f"{log_prefix_parquet} Combined old and new data. Shape before final sort/dedup: {combined_df.shape}")
-            combined_df.sort_values('timestamp', inplace=True)
-            combined_df.drop_duplicates(subset=['timestamp'], keep='last', inplace=True)
+            combined_df.sort_index(inplace=True)
+            combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
             print(f"{log_prefix_parquet} Shape after final sort/dedup: {combined_df.shape}")
             
             try:
                 print(f"{log_prefix_parquet} Attempting to write appended data to Parquet. Shape: {combined_df.shape}. Path: {file_path}")
-                combined_df.to_parquet(file_path, index=False)
+                combined_df.to_parquet(file_path, index=True)
                 print(f"{log_prefix_parquet} INFO: Wrote appended data: {file_path}")
             except Exception as e:
                 print(f"{log_prefix_parquet} ERROR: Failed writing appended data to Parquet {file_path}: {e}")
             
             overall_start_dt = pd.to_datetime(start_date_str)
-            combined_df = combined_df[combined_df['timestamp'] >= overall_start_dt]
+            combined_df = combined_df[combined_df.index >= overall_start_dt]
             return combined_df
         else:
             print(f"No new data found for {symbol} since last record.")
             # Filter existing_df to respect original overall start_date_str
             overall_start_dt = pd.to_datetime(start_date_str)
-            existing_df = existing_df[existing_df['timestamp'] >= overall_start_dt]
+            existing_df = existing_df[existing_df.index >= overall_start_dt]
             return existing_df
 
 # --- Configuration Management ---
@@ -3791,6 +3799,9 @@ def start_app_main_flow():
     # 1. Load settings
     load_app_settings() # Loads or prompts for settings and saves them
     load_app_trading_configs() # Ensure trading configs are populated from app_settings
+    
+    # Excluded symbols
+    excluded_symbols = ["SUIUSDT", "LEOUSDT"]
 
     # 2. Check for ML Models
     # check_ml_models_exist now returns versioned paths based on current app_study_version
@@ -3854,6 +3865,8 @@ def start_app_main_flow():
             if training_symbols_list is None or not training_symbols_list: # Check None or empty
                 print(f"{log_prefix} CRITICAL: No training symbols loaded from any source. Defaulting to BTCUSDT for training.")
                 training_symbols_list = ["BTCUSDT"]
+                
+            training_symbols_list = [s for s in training_symbols_list if s not in excluded_symbols]
             
             kline_interval_train = app_settings.get("app_training_kline_interval", Client.KLINE_INTERVAL_15MINUTE)
             start_date_train = app_settings.get("app_training_start_date", "1 Jan, 2023")
@@ -4475,7 +4488,7 @@ def simulate_fib_entries(df, atr_col_name): # Added atr_col_name
     
     # Filter pivots to only include those that occur at or after the ATR warmup period.
     # The index 'i' from iterrows() is the DataFrame index of the pivot.
-    pivots = all_pivots[all_pivots.index >= min_pivot_index_for_valid_atr].copy()
+    pivots = all_pivots.iloc[min_pivot_index_for_valid_atr:].copy()
 
     if pivots.empty:
         print(f"DEBUG (simulate_fib_entries): No pivots found after ATR warmup period ({min_pivot_index_for_valid_atr}). Original pivots: {len(all_pivots)}")
@@ -4683,16 +4696,18 @@ def engineer_pivot_features(df, atr_col_name, force_live_bars_since_pivot_calc: 
     last_pivot_time = None
     df['ticks_since_last_pivot'] = 0
     # Ensure the index is a DatetimeIndex before proceeding
+    if 'timestamp' in df.columns:
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df.set_index('timestamp', inplace=True)
+
     if isinstance(df.index, pd.DatetimeIndex):
         for i, row in df.iterrows():
             if i in candidate_pivots.index:
                 last_pivot_time = i
             if last_pivot_time is not None:
-                # i and last_pivot_time are Timestamps from the index
                 time_diff_seconds = (i - last_pivot_time).total_seconds()
-                df.loc[i, 'ticks_since_last_pivot'] = time_diff_seconds / 60  # In minutes
+                df.loc[i, 'ticks_since_last_pivot'] = time_diff_seconds / 60
     else:
-        # Fallback or error if index is not datetime, which is unexpected for this feature
         print("Warning: DataFrame index is not a DatetimeIndex in engineer_pivot_features. 'ticks_since_last_pivot' will be 0.")
 
 
@@ -4827,7 +4842,7 @@ def train_pivot_model(X_train, y_train, X_val, y_val, model_type='lgbm', **kwarg
     else:
         raise ValueError("Unsupported model type for pivot detection.")
 
-    preds_val = model.predict(X_val)
+    preds_val = model.predict(X_val.values)
     precision_high = precision_score(y_val, preds_val, labels=[1], average='micro', zero_division=0)
     recall_high = recall_score(y_val, preds_val, labels=[1], average='micro', zero_division=0)
     precision_low = precision_score(y_val, preds_val, labels=[2], average='micro', zero_division=0)
@@ -4873,7 +4888,7 @@ def train_entry_model(X_train, y_train, X_val, y_val, model_type='lgbm', **kwarg
         raise ValueError("Unsupported model type for entry evaluation.")
     
     # Evaluate (example for binary classification)
-    preds_val_entry = model.predict(X_val)
+    preds_val_entry = model.predict(X_val.values)
     # y_val is binary (0 for not profitable, 1 for profitable)
     precision_profit = precision_score(y_val, preds_val_entry, pos_label=1, zero_division=0)
     recall_profit = recall_score(y_val, preds_val_entry, pos_label=1, zero_division=0)
@@ -4999,15 +5014,15 @@ def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot
 
     # --- Pivot Model Scaling ---
     pivot_scaler = StandardScaler()
-    X_pivot_train = pivot_scaler.fit_transform(X_pivot_train_raw)
-    X_pivot_val = pivot_scaler.transform(X_pivot_val_raw)
+    pivot_scaler = StandardScaler()
+    X_pivot_train = pd.DataFrame(pivot_scaler.fit_transform(X_pivot_train_raw), columns=trial_pivot_features)
+    X_pivot_val = pd.DataFrame(pivot_scaler.transform(X_pivot_val_raw), columns=trial_pivot_features)
     # --- End Pivot Model Scaling ---
 
     # Train Pivot Model
     if pivot_model_type == 'lgbm':
         pivot_model = lgb.LGBMClassifier(num_leaves=pivot_num_leaves, learning_rate=pivot_learning_rate,
                                          max_depth=pivot_max_depth, class_weight='balanced', random_state=42, n_estimators=100, verbosity=-1)
-        # LGBM can handle numpy arrays directly
         pivot_model.fit(X_pivot_train, y_pivot_train, eval_set=[(X_pivot_val, y_pivot_val)], callbacks=[early_stopping(stopping_rounds=5, verbose=False)])
     else: # rf
         pivot_model = RandomForestClassifier(n_estimators=100, max_depth=pivot_max_depth, class_weight='balanced', random_state=42)
@@ -5017,8 +5032,8 @@ def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot
     # However, predict_proba needs to be called on the original feature names if we are to put P_swing back into df_train/df_val.
     # For Optuna, the primary goal is to evaluate parameters. The P_swing for entry candidates can be derived from scaled data.
     # Let's get probabilities from scaled data.
-    p_swing_train_all_classes = pivot_model.predict_proba(X_pivot_train) # X_pivot_train is already scaled
-    p_swing_val_all_classes = pivot_model.predict_proba(X_pivot_val)     # X_pivot_val is already scaled
+    p_swing_train_all_classes = pivot_model.predict_proba(X_pivot_train.values) # X_pivot_train is already scaled
+    p_swing_val_all_classes = pivot_model.predict_proba(X_pivot_val.values)     # X_pivot_val is already scaled
     
     # Assign P_swing back to the original DataFrames (df_train, df_val) using their original indices
     # This requires that X_pivot_train_raw and X_pivot_val_raw indices are aligned with df_train and df_val
@@ -5053,7 +5068,7 @@ def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot
 
     # --- Entry Model Scaling & Training ---
     entry_scaler = StandardScaler()
-    X_entry_train_scaled = entry_scaler.fit_transform(X_entry_train_raw)
+    X_entry_train_scaled = pd.DataFrame(entry_scaler.fit_transform(X_entry_train_raw), columns=current_trial_full_entry_features)
 
     if entry_model_type == 'lgbm':
         entry_model = lgb.LGBMClassifier(num_leaves=entry_num_leaves, learning_rate=entry_learning_rate,
@@ -5078,7 +5093,7 @@ def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot
             entry_model.fit(X_entry_train_scaled, y_entry_train)
     else: # rf
         entry_model = RandomForestClassifier(n_estimators=100, max_depth=entry_max_depth, class_weight='balanced', random_state=42)
-        entry_model.fit(X_entry_train_scaled, y_entry_train) # Corrected to use X_entry_train_scaled
+        entry_model.fit(X_entry_train_scaled, y_entry_train)
 
     potential_pivots_val = df_val[df_val['P_swing'] >= p_swing_threshold].copy()
     potential_pivots_val = potential_pivots_val[potential_pivots_val['trade_outcome'] != -1]
@@ -5280,10 +5295,10 @@ def full_backtest(df_processed, pivot_model, entry_model, best_params, pivot_fea
     # Pivot Predictions
     X_pivot_test_raw = df_test[pivot_features].fillna(-1)
     if pivot_scaler:
-        X_pivot_test = pivot_scaler.transform(X_pivot_test_raw)
+        X_pivot_test = pd.DataFrame(pivot_scaler.transform(X_pivot_test_raw), columns=pivot_features)
     else:
-        X_pivot_test = X_pivot_test_raw.to_numpy()
-    p_swing_test_all_classes = pivot_model.predict_proba(X_pivot_test)
+        X_pivot_test = X_pivot_test_raw
+    p_swing_test_all_classes = pivot_model.predict_proba(X_pivot_test.values)
     df_test['P_swing'] = np.max(p_swing_test_all_classes[:, 1:], axis=1)
     df_test['predicted_pivot_class'] = np.argmax(p_swing_test_all_classes, axis=1)
 
@@ -5303,10 +5318,10 @@ def full_backtest(df_processed, pivot_model, entry_model, best_params, pivot_fea
 
     # Entry Predictions
     if entry_scaler:
-        X_entry_test = entry_scaler.transform(X_entry_test_raw)
+        X_entry_test = pd.DataFrame(entry_scaler.transform(X_entry_test_raw), columns=backtest_full_entry_features)
     else:
-        X_entry_test = X_entry_test_raw.to_numpy()
-    p_profit_test = entry_model.predict_proba(X_entry_test)[:, 1]
+        X_entry_test = X_entry_test_raw
+    p_profit_test = entry_model.predict_proba(X_entry_test.values)[:, 1]
 
     # Filter by P_profit threshold
     profit_threshold_backtest = best_params.get('profit_threshold', 0.6)
@@ -5395,14 +5410,14 @@ def run_backtest_scenario(scenario_name: str, df_processed: pd.DataFrame,
         X_pivot_test_raw = df_test[pivot_features].fillna(-1)
         if 'pivot_scaler' in locals():
             try:
-                X_pivot_test = pivot_scaler.transform(X_pivot_test_raw)
+                X_pivot_test = pd.DataFrame(pivot_scaler.transform(X_pivot_test_raw), columns=pivot_features)
             except Exception as e:
                 print(f"RunBacktestScenario WARNING ({scenario_name}): Failed to scale pivot features for Stage 1: {e}. Using raw.")
-                X_pivot_test = X_pivot_test_raw.to_numpy()
+                X_pivot_test = X_pivot_test_raw
         else:
-            X_pivot_test = X_pivot_test_raw.to_numpy()
+            X_pivot_test = X_pivot_test_raw
         
-        p_swing_test_all_classes = pivot_model.predict_proba(X_pivot_test)
+        p_swing_test_all_classes = pivot_model.predict_proba(X_pivot_test.values)
         df_test['P_swing'] = np.max(p_swing_test_all_classes[:, 1:], axis=1)
 
         p_swing_threshold = best_params.get('p_swing_threshold', 0.6)
@@ -5457,14 +5472,14 @@ def run_backtest_scenario(scenario_name: str, df_processed: pd.DataFrame,
 
         if 'entry_scaler' in locals():
             try:
-                X_entry_test_ml = entry_scaler.transform(X_entry_test_ml_raw)
+                X_entry_test_ml = pd.DataFrame(entry_scaler.transform(X_entry_test_ml_raw), columns=entry_features_base + ['P_swing', 'norm_dist_entry_pivot', 'norm_dist_entry_sl'])
             except Exception as e:
                 print(f"RunBacktestScenario WARNING ({scenario_name}): Failed to scale entry features: {e}. Using raw.")
-                X_entry_test_ml = X_entry_test_ml_raw.to_numpy()
+                X_entry_test_ml = X_entry_test_ml_raw
         else:
-            X_entry_test_ml = X_entry_test_ml_raw.to_numpy()
+            X_entry_test_ml = X_entry_test_ml_raw
 
-        p_profit_test_ml = entry_model.predict_proba(X_entry_test_ml)[:, 1]
+        p_profit_test_ml = entry_model.predict_proba(X_entry_test_ml.values)[:, 1]
         final_trades_for_metrics = potential_pivots_ml[p_profit_test_ml >= profit_threshold].copy()
         print(f"Full ML: Identified {len(final_trades_for_metrics)} full ML pipeline trade setups.")
     else:
@@ -6079,6 +6094,7 @@ def get_processed_data_for_symbol(config, symbol_ticker, kline_interval, start_d
         force_redownload_all=force_reprocess
     )
     if historical_df is None or historical_df.empty:
+        print(f"{log_prefix} No data for {symbol_ticker}. Skipping processing.")
         return None, None, None
 
     historical_df['symbol'] = symbol_ticker
