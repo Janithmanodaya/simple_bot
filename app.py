@@ -3,10 +3,8 @@ import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import RandomForestClassifier
+from catboost import CatBoostClassifier
 from sklearn.metrics import precision_score, recall_score, confusion_matrix
-import lightgbm as lgb
-from lightgbm.callback import early_stopping
 import optuna
 import joblib
 from binance.client import Client # Assuming you'll use python-binance
@@ -430,8 +428,8 @@ def load_app_settings(filepath=APP_CONFIG_FILE):
         "app_telegram_chat_id": None,
         "app_tp1_qty_pct": 0.25,
         "app_tp2_qty_pct": 0.50,
-        "app_pivot_model_path": "pivot_detector_model.joblib",
-        "app_entry_model_path": "entry_evaluator_model.joblib",
+        "app_pivot_model_path": "pivot_detector_model.cb",
+        "app_entry_model_path": "entry_evaluator_model.cb",
         "app_model_params_path": "best_model_params.json",
         "app_auto_start_trading_after_train": False,
         "app_force_retrain_on_startup": False,
@@ -2957,7 +2955,7 @@ def app_process_symbol_for_signal(symbol: str, client, current_app_settings: dic
     # `main.py`'s `process_symbol_adv_fib_ml_task` uses `sim_sl_dist_feat = atr_val_for_sim_features * sl_mult_feat`
     # where `sl_mult_feat` is `configs.get("fib_sl_atr_multiplier_exec")`.
     # Let's assume `app_settings` or `best_hyperparams` has a suitable `sim_sl_atr_multiplier`.
-    sim_sl_atr_mult = current_app_settings.get('app_sim_sl_atr_multiplier', 1.0) # Add to settings if needed
+        sim_sl_atr_mult = current_app_settings.get('app_sim_sl_atr_multiplier', 1.0) # Add to settings if needed
     
     sim_entry_for_features = current_candle['close']
     sim_sl_dist_for_features = atr_val_current * sim_sl_atr_mult
@@ -4798,29 +4796,18 @@ def engineer_entry_features(df, atr_col_name, entry_features_base_list_arg=None)
 # --- 3. Model Training & Validation ---
 
 # Modified to accept model specific kwargs
-def train_pivot_model(X_train, y_train, X_val, y_val, model_type='lgbm', **kwargs):
+def train_pivot_model(X_train, y_train, X_val, y_val, model_type='catboost', **kwargs):
     """Trains pivot detection model, accepting kwargs for model parameters."""
     print(f"DEBUG (train_pivot_model): Received kwargs: {kwargs}")
     
-    model_params = {'class_weight': 'balanced', 'random_state': 42}
+    model_params = {'random_state': 42, 'verbose': 0, 'allow_writing_files': False}
     
     # Filter kwargs to only include those relevant for the specific model type
-    if model_type == 'lgbm':
-        lgbm_valid_keys = ['num_leaves', 'learning_rate', 'max_depth', 'n_estimators', 'reg_alpha', 'reg_lambda', 'colsample_bytree', 'subsample', 'min_child_samples'] # Add more as tuned by Optuna
-        model_params.update({k: v for k, v in kwargs.items() if k in lgbm_valid_keys})
-        # Ensure n_estimators is reasonable, Optuna might not always set it.
-        if 'n_estimators' not in model_params: model_params['n_estimators'] = 100 # Default
-        model = lgb.LGBMClassifier(**model_params)
-        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[early_stopping(stopping_rounds=10, verbose=-1)])
-    elif model_type == 'rf':
-        rf_valid_keys = ['n_estimators', 'max_depth', 'min_samples_split', 'min_samples_leaf', 'max_features'] # Add more as tuned
-        model_params.update({k: v for k, v in kwargs.items() if k in rf_valid_keys})
-        if 'n_estimators' not in model_params: model_params['n_estimators'] = 100
-        if 'max_depth' not in model_params and 'max_depth' in kwargs : model_params['max_depth'] = kwargs['max_depth'] # Ensure max_depth from Optuna is used if provided
-        elif 'max_depth' not in model_params : model_params['max_depth'] = 7 # Default if not from Optuna
-
-        model = RandomForestClassifier(**model_params)
-        model.fit(X_train, y_train)
+    if model_type == 'catboost':
+        catboost_valid_keys = ['learning_rate', 'depth', 'l2_leaf_reg', 'iterations']
+        model_params.update({k: v for k, v in kwargs.items() if k in catboost_valid_keys})
+        model = CatBoostClassifier(**model_params)
+        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], early_stopping_rounds=10)
     else:
         raise ValueError("Unsupported model type for pivot detection.")
 
@@ -4828,7 +4815,7 @@ def train_pivot_model(X_train, y_train, X_val, y_val, model_type='lgbm', **kwarg
     preds_val = model.predict(X_val)
     # For multiclass:
     # Precision/Recall for high (label 1) and low (label 2) swings
-    precision_high = precision_score(y_val, preds_val, labels=[1], average='micro', zero_division=0) # Adjust labels/average as needed
+    precision_high = precision_score(y_val, preds_val, labels=[1], average='micro', zero_division=0)
     recall_high = recall_score(y_val, preds_val, labels=[1], average='micro', zero_division=0)
     precision_low = precision_score(y_val, preds_val, labels=[2], average='micro', zero_division=0)
     recall_low = recall_score(y_val, preds_val, labels=[2], average='micro', zero_division=0)
@@ -4845,29 +4832,18 @@ def train_pivot_model(X_train, y_train, X_val, y_val, model_type='lgbm', **kwarg
     # print(confusion_matrix(y_val, preds_val)) # Keep for debug if needed
     return model, pivot_val_metrics
 
-def train_entry_model(X_train, y_train, X_val, y_val, model_type='lgbm', **kwargs):
+def train_entry_model(X_train, y_train, X_val, y_val, model_type='catboost', **kwargs):
     """Trains entry profitability model, accepting kwargs for model parameters.
        Returns the trained model and its validation metrics."""
     print(f"DEBUG (train_entry_model): Received kwargs: {kwargs}")
 
-    model_params = {'class_weight': 'balanced', 'random_state': 42}
+    model_params = {'random_state': 42, 'verbose': 0, 'allow_writing_files': False}
 
-    if model_type == 'lgbm':
-        lgbm_valid_keys = ['num_leaves', 'learning_rate', 'max_depth', 'n_estimators', 'reg_alpha', 'reg_lambda', 'colsample_bytree', 'subsample', 'min_child_samples']
-        model_params.update({k: v for k, v in kwargs.items() if k in lgbm_valid_keys})
-        if 'n_estimators' not in model_params: model_params['n_estimators'] = 100
-        
-        model = lgb.LGBMClassifier(**model_params)
-        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[early_stopping(stopping_rounds=10, verbose=-1)])
-    elif model_type == 'rf':
-        rf_valid_keys = ['n_estimators', 'max_depth', 'min_samples_split', 'min_samples_leaf', 'max_features']
-        model_params.update({k: v for k, v in kwargs.items() if k in rf_valid_keys})
-        if 'n_estimators' not in model_params: model_params['n_estimators'] = 100
-        if 'max_depth' not in model_params and 'max_depth' in kwargs: model_params['max_depth'] = kwargs['max_depth']
-        elif 'max_depth' not in model_params: model_params['max_depth'] = 7
-
-        model = RandomForestClassifier(**model_params)
-        model.fit(X_train, y_train)
+    if model_type == 'catboost':
+        catboost_valid_keys = ['learning_rate', 'depth', 'l2_leaf_reg', 'iterations']
+        model_params.update({k: v for k, v in kwargs.items() if k in catboost_valid_keys})
+        model = CatBoostClassifier(**model_params)
+        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], early_stopping_rounds=10)
     else:
         raise ValueError("Unsupported model type for entry evaluation.")
     
@@ -4893,14 +4869,18 @@ def train_entry_model(X_train, y_train, X_val, y_val, model_type='lgbm', **kwarg
 def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot_features, entry_features_base
     """Optuna objective function. Performs data processing per trial."""
     # Hyperparameters to tune for models
-    pivot_model_type = trial.suggest_categorical('pivot_model_type', ['lgbm'])
-    pivot_num_leaves = trial.suggest_int('pivot_num_leaves', 20, 50) if pivot_model_type == 'lgbm' else None
-    pivot_learning_rate = trial.suggest_float('pivot_learning_rate', 0.01, 0.1) if pivot_model_type == 'lgbm' else None
-    pivot_max_depth = trial.suggest_int('pivot_max_depth', 5, 10)
-    entry_model_type = trial.suggest_categorical('entry_model_type', ['lgbm'])
-    entry_num_leaves = trial.suggest_int('entry_num_leaves', 20, 50) if entry_model_type == 'lgbm' else None
-    entry_learning_rate = trial.suggest_float('entry_learning_rate', 0.01, 0.1) if entry_model_type == 'lgbm' else None
-    entry_max_depth = trial.suggest_int('entry_max_depth', 5, 10)
+    pivot_model_type = trial.suggest_categorical('pivot_model_type', ['catboost'])
+    pivot_learning_rate = trial.suggest_float('pivot_learning_rate', 0.01, 0.3)
+    pivot_depth = trial.suggest_int('pivot_depth', 4, 10)
+    pivot_l2_leaf_reg = trial.suggest_float('pivot_l2_leaf_reg', 1e-3, 10.0, log=True)
+    pivot_iterations = trial.suggest_int('pivot_iterations', 50, 200)
+    
+    entry_model_type = trial.suggest_categorical('entry_model_type', ['catboost'])
+    entry_learning_rate = trial.suggest_float('entry_learning_rate', 0.01, 0.3)
+    entry_depth = trial.suggest_int('entry_depth', 4, 10)
+    entry_l2_leaf_reg = trial.suggest_float('entry_l2_leaf_reg', 1e-3, 10.0, log=True)
+    entry_iterations = trial.suggest_int('entry_iterations', 50, 200)
+
     # Thresholds
     p_swing_threshold = trial.suggest_float('p_swing_threshold', 0.2, 0.9) # Lowered min further
     profit_threshold = trial.suggest_float('profit_threshold', 0.2, 0.9) # Lowered min (used as Expected R threshold)
@@ -4997,13 +4977,18 @@ def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot
         return -96.0
 
     # Train Pivot Model
-    if pivot_model_type == 'lgbm':
-        pivot_model = lgb.LGBMClassifier(num_leaves=pivot_num_leaves, learning_rate=pivot_learning_rate,
-                                         max_depth=pivot_max_depth, class_weight='balanced', random_state=42, n_estimators=100, verbosity=-1)
-        pivot_model.fit(X_pivot_train, y_pivot_train, eval_set=[(X_pivot_val, y_pivot_val)], callbacks=[early_stopping(stopping_rounds=5, verbose=False)])
-    else: # rf
-        pivot_model = RandomForestClassifier(n_estimators=100, max_depth=pivot_max_depth, class_weight='balanced', random_state=42)
-        pivot_model.fit(X_pivot_train, y_pivot_train)
+    if pivot_model_type == 'catboost':
+        pivot_model = CatBoostClassifier(
+            iterations=pivot_iterations,
+            learning_rate=pivot_learning_rate,
+            depth=pivot_depth,
+            l2_leaf_reg=pivot_l2_leaf_reg,
+            random_state=42,
+            verbose=0
+        )
+        pivot_model.fit(X_pivot_train, y_pivot_train, eval_set=[(X_pivot_val, y_pivot_val)], early_stopping_rounds=10)
+    else:
+        raise ValueError(f"Unsupported pivot model type: {pivot_model_type}")
 
     p_swing_train_all_classes = pivot_model.predict_proba(X_pivot_train)
     p_swing_val_all_classes = pivot_model.predict_proba(X_pivot_val)
@@ -5035,20 +5020,25 @@ def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot
     if len(X_entry_train['P_swing'].unique()) < 2 or len(y_entry_train.unique()) < 2 or X_entry_train.empty:
         return -1.0
 
-    if entry_model_type == 'lgbm':
-        entry_model = lgb.LGBMClassifier(num_leaves=entry_num_leaves, learning_rate=entry_learning_rate,
-                                         max_depth=entry_max_depth, class_weight='balanced', random_state=42, n_estimators=100, verbosity=-1)
+    if entry_model_type == 'catboost':
+        entry_model = CatBoostClassifier(
+            iterations=entry_iterations,
+            learning_rate=entry_learning_rate,
+            depth=entry_depth,
+            l2_leaf_reg=entry_l2_leaf_reg,
+            random_state=42,
+            verbose=0
+        )
         if len(entry_train_candidates) > 20:
              X_entry_train_sub, X_entry_val_sub, y_entry_train_sub, y_entry_val_sub = train_test_split(X_entry_train, y_entry_train, test_size=0.2, stratify=y_entry_train if len(y_entry_train.unique()) > 1 else None, random_state=42)
              if len(X_entry_val_sub) > 0 and len(y_entry_val_sub.unique()) > 1:
-                entry_model.fit(X_entry_train_sub, y_entry_train_sub, eval_set=[(X_entry_val_sub, y_entry_val_sub)], callbacks=[early_stopping(stopping_rounds=5, verbose=False)])
+                entry_model.fit(X_entry_train_sub, y_entry_train_sub, eval_set=[(X_entry_val_sub, y_entry_val_sub)], early_stopping_rounds=10)
              else:
                 entry_model.fit(X_entry_train, y_entry_train) 
         else:
             entry_model.fit(X_entry_train, y_entry_train)
-    else: # rf
-        entry_model = RandomForestClassifier(n_estimators=100, max_depth=entry_max_depth, class_weight='balanced', random_state=42)
-        entry_model.fit(X_entry_train, y_entry_train)
+    else:
+        raise ValueError(f"Unsupported entry model type: {entry_model_type}")
 
     potential_pivots_val = df_val[df_val['P_swing'] >= p_swing_threshold].copy()
     potential_pivots_val = potential_pivots_val[potential_pivots_val['trade_outcome'] != -1]
@@ -5297,12 +5287,19 @@ def process_dataframe_with_params(df_initial, params, static_entry_features_base
 # --- Model Artifacts & Backtesting ---
 def save_model(model, filename="model.joblib"):
     """Saves a model to disk."""
-    joblib.dump(model, filename)
+    if isinstance(model, CatBoostClassifier):
+        model.save_model(filename)
+    else:
+        joblib.dump(model, filename)
     print(f"Model saved to {filename}")
 
 def load_model(filename="model.joblib"):
     """Loads a model from disk."""
-    model = joblib.load(filename)
+    if filename.endswith(".cb"):
+        model = CatBoostClassifier()
+        model.load_model(filename)
+    else:
+        model = joblib.load(filename)
     print(f"Model loaded from {filename}")
     return model
 
