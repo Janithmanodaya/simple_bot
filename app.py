@@ -244,10 +244,11 @@ def get_historical_bars(symbol, interval, start_str, end_str=None):
         'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
     ])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('timestamp', inplace=True)
     for col in ['open', 'high', 'low', 'close', 'volume', 'quote_asset_volume',
                 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume']:
         df[col] = pd.to_numeric(df[col])
-    df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+    df = df[['open', 'high', 'low', 'close', 'volume']]
     return df
 
 
@@ -294,11 +295,12 @@ def get_or_download_historical_data(symbol: str, interval: str,
                 print(f"{log_prefix_parquet} Existing data loaded. Shape: {existing_df.shape}")
                 # Ensure timestamp is datetime and sorted
                 existing_df['timestamp'] = pd.to_datetime(existing_df['timestamp'])
+                existing_df.set_index('timestamp', inplace=True)
                 existing_df.sort_index(inplace=True)
-                existing_df.drop_duplicates(subset=['timestamp'], keep='last', inplace=True) # Deduplicate just in case
+                existing_df = existing_df[~existing_df.index.duplicated(keep='last')]
                 
                 # Get the last timestamp in milliseconds for Binance API
-                last_timestamp_dt = existing_df['timestamp'].iloc[-1]
+                last_timestamp_dt = existing_df.index[-1]
                 last_timestamp_ms = int(last_timestamp_dt.timestamp() * 1000)
                 print(f"{log_prefix_parquet} Last record in existing data: {last_timestamp_dt}")
                 
@@ -338,7 +340,7 @@ def get_or_download_historical_data(symbol: str, interval: str,
         
         try:
             print(f"{log_prefix_parquet} Attempting to write full data to Parquet. Shape: {downloaded_df.shape}. Path: {file_path}")
-            downloaded_df.to_parquet(file_path, index=False)
+            downloaded_df.reset_index().to_parquet(file_path, index=False)
             print(f"{log_prefix_parquet} INFO: Wrote full data: {file_path}")
         except Exception as e:
             print(f"{log_prefix_parquet} ERROR: Failed writing full data to Parquet {file_path}: {e}")
@@ -363,18 +365,18 @@ def get_or_download_historical_data(symbol: str, interval: str,
 
         if new_data_df is not None and not new_data_df.empty:
             print(f"{log_prefix_parquet} Downloaded {len(new_data_df)} new bars for {symbol}. Shape: {new_data_df.shape}")
-            new_data_df.sort_values('timestamp', inplace=True)
-            new_data_df.drop_duplicates(subset=['timestamp'], keep='last', inplace=True)
+            new_data_df.sort_index(inplace=True)
+            new_data_df = new_data_df[~new_data_df.index.duplicated(keep='last')]
 
-            combined_df = pd.concat([existing_df, new_data_df], ignore_index=True)
+            combined_df = pd.concat([existing_df, new_data_df])
             print(f"{log_prefix_parquet} Combined old and new data. Shape before final sort/dedup: {combined_df.shape}")
-            combined_df.sort_values('timestamp', inplace=True)
+            combined_df.sort_index(inplace=True)
             combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
             print(f"{log_prefix_parquet} Shape after final sort/dedup: {combined_df.shape}")
             
             try:
                 print(f"{log_prefix_parquet} Attempting to write appended data to Parquet. Shape: {combined_df.shape}. Path: {file_path}")
-                combined_df.to_parquet(file_path, index=False)
+                combined_df.reset_index().to_parquet(file_path, index=False)
                 print(f"{log_prefix_parquet} INFO: Wrote appended data: {file_path}")
             except Exception as e:
                 print(f"{log_prefix_parquet} ERROR: Failed writing appended data to Parquet {file_path}: {e}")
@@ -3902,14 +3904,16 @@ def start_app_main_flow():
                     "min_bar_gap": MIN_BAR_GAP,
                     # Add other necessary parameters that get_processed_data_for_symbol might need
                 }
+                print(f"DEBUG: data_processing_config: {data_processing_config}")
 
                 future_to_symbol = {
-                    executor.submit(get_processed_data_for_symbol, 
-                                    best_hyperparams,
-                                    symbol_ticker, 
-                                    kline_interval_train, 
-                                    start_date_train, 
-                                    end_date_train): symbol_ticker 
+                    executor.submit(get_processed_data_for_symbol,
+                                    data_processing_config,
+                                    symbol_ticker,
+                                    kline_interval_train,
+                                    start_date_train,
+                                    end_date_train,
+                                    force_reprocess=force_retrain): symbol_ticker
                     for symbol_ticker in training_symbols_list
                 }
                 
@@ -4929,7 +4933,7 @@ def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot
 
     # --- Per-Trial Data Processing ---
     df_trial_processed = df_raw.copy() # Start with a fresh copy of the raw data for each trial
-    df_trial_processed.sort_index(inplace=True) # Ensure 0-based index for concatenated DFs
+    df_trial_processed.sort_values('timestamp', inplace=True)
 
     # 1. Calculate ATR for the current trial's period
     df_trial_processed = calculate_atr(df_trial_processed, period=current_atr_period)
@@ -5196,7 +5200,7 @@ def process_dataframe_with_params(df_initial, params, static_entry_features_base
     """
     print(f"Processing DataFrame with params: {params}")
     df_processed = df_initial.copy()
-    df_processed.sort_index(inplace=True) # Ensure 0-based index
+    df_processed.sort_values('timestamp', inplace=True)
 
     # Extract parameters, providing defaults if not all are in 'params' (e.g. if Optuna didn't tune some)
     atr_period = params.get('atr_period_opt', ATR_PERIOD)
@@ -6102,7 +6106,7 @@ def get_processed_data_for_symbol(config, symbol_ticker, kline_interval, start_d
     historical_df = simulate_fib_entries(historical_df, atr_col_name=atr_col_name_dynamic)
     
     historical_df.dropna(subset=[atr_col_name_dynamic], inplace=True)
-    historical_df.sort_index(inplace=True)
+    historical_df.sort_values('timestamp', inplace=True)
 
     historical_df, pivot_feature_names = engineer_pivot_features(historical_df, atr_col_name=atr_col_name_dynamic)
     historical_df, entry_feature_names_base = engineer_entry_features(historical_df, atr_col_name=atr_col_name_dynamic)
