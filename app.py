@@ -21,6 +21,16 @@ import telegram # For Telegram bot
 from telegram.ext import Application # If app.py were to run its own listener
 from concurrent.futures import TimeoutError as FutureTimeoutError # For Telegram sending
 
+from pivot_retrainer import (
+    get_label_distribution,
+    plot_probability_distribution,
+    get_dynamic_threshold,
+    get_tuned_hyperparameters,
+    add_momentum_features,
+    encode_contextual_indicators,
+    mark_categorical_features,
+)
+
 # --- Global Binance Client ---
 # This will be initialized by initialize_binance_client function
 app_binance_client = None
@@ -432,7 +442,7 @@ def load_app_settings(filepath=APP_CONFIG_FILE):
         "app_entry_model_path": "entry_evaluator_model.cb",
         "app_model_params_path": "best_model_params.json",
         "app_auto_start_trading_after_train": False,
-        "force_pivot_retrain": False,
+        "app_force_retrain_on_startup": False,
         # Add other ML training specific defaults if needed (e.g., Optuna trials)
         "app_optuna_trials": 20, # Default Optuna trials for app.py training
         "app_study_version": "pivot_v1_initial", # For Optuna study naming and artifact versioning
@@ -561,16 +571,16 @@ def load_app_settings(filepath=APP_CONFIG_FILE):
 
     # Force retrain on startup
     app_force_retrain_valid = False
-    if "force_pivot_retrain" in loaded_json_settings:
-        retrain_val = loaded_json_settings["force_pivot_retrain"]
+    if "app_force_retrain_on_startup" in loaded_json_settings:
+        retrain_val = loaded_json_settings["app_force_retrain_on_startup"]
         if isinstance(retrain_val, bool):
-            current_settings["force_pivot_retrain"] = retrain_val
+            current_settings["app_force_retrain_on_startup"] = retrain_val
             app_force_retrain_valid = True
     if not app_force_retrain_valid:
-        print("app.py: 'force_pivot_retrain' missing or invalid in settings file. Prompting user.")
-        current_settings["force_pivot_retrain"] = get_user_input(
+        print("app.py: 'app_force_retrain_on_startup' missing or invalid in settings file. Prompting user.")
+        current_settings["app_force_retrain_on_startup"] = get_user_input(
             "Force retrain models on startup (true/false)?",
-            current_settings.get("force_pivot_retrain", defaults["force_pivot_retrain"]),
+            current_settings.get("app_force_retrain_on_startup", defaults["app_force_retrain_on_startup"]),
             bool
         )
 
@@ -3714,7 +3724,7 @@ def start_app_main_flow():
     # check_ml_models_exist now returns versioned paths based on current app_study_version
     models_exist, versioned_pivot_model_path_check, versioned_entry_model_path_check, versioned_params_path_check = check_ml_models_exist()
     
-    force_retrain = app_settings.get("force_pivot_retrain", False)
+    force_retrain = app_settings.get("app_force_retrain_on_startup", False)
 
     # Main application loop / decision tree
     while True: # Loop to allow retraining and then returning to choices
@@ -3746,7 +3756,7 @@ def start_app_main_flow():
             if force_retrain:
                 print("Configuration set to force retrain models.")
                 force_retrain = False # Reset flag after use
-                app_settings["force_pivot_retrain"] = False # Also reset in runtime settings
+                app_settings["app_force_retrain_on_startup"] = False # Also reset in runtime settings
                 save_app_settings() # Persist the reset flag state
             else: # models_exist is False
                 print("ML models not found. Starting training process...")
@@ -3808,8 +3818,8 @@ def start_app_main_flow():
             try:
                 current_best_hyperparams = run_optuna_tuning(
                     universal_df_initial_processed_app.copy(),
-                    static_entry_features_base_list=processed_entry_feature_names_base_app, # Pass determined base names
-                    n_trials=optuna_trials_app
+                    static_entry_features_base_list=processed_entry_feature_names_base_app,
+                    n_trials=app_settings.get("app_optuna_trials", 20)
                 )
                 if current_best_hyperparams is None: # Check if Optuna returned None
                     print(f"Optuna tuning did not return valid parameters. Exiting."); sys.exit(1)
@@ -3872,9 +3882,6 @@ def start_app_main_flow():
             X_p_train = df_final_train[final_pivot_feats_to_use].fillna(-1)
             y_p_train = df_final_train['pivot_label']
             
-            # Get label distribution
-            get_label_distribution(df_final_train)
-
             print(f"\n{log_prefix} --- Pivot Label Distribution BEFORE Resampling (y_p_train) ---")
             print(f"{log_prefix} Raw Value Counts:")
             print(y_p_train.value_counts())
