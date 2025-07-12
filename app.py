@@ -4998,8 +4998,7 @@ def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot
             l2_leaf_reg=tuned_params['l2_leaf_reg'],
             random_state=42,
             verbose=0,
-            class_weights={0: 1, 1: 3},
-            classes=[0, 1, 2]
+            class_weights={0: 1, 1: 3, 2: 3}
         )
         pivot_model.fit(X_pivot_train, y_pivot_train, eval_set=[(X_pivot_val, y_pivot_val)], early_stopping_rounds=20)
     else:
