@@ -4068,31 +4068,34 @@ def start_app_main_flow():
                 # `checked_params_path` is the versioned path to the params file
                 with open(checked_params_path, 'r') as f:
                     loaded_params = json.load(f) 
-                if loaded_params is None or not loaded_params: 
-                    raise ValueError("Parameters file loaded as None or empty.")
-                best_hyperparams = loaded_params 
+                if loaded_params is None or not loaded_params:
+                    raise ValueError(f"Parameters file '{checked_params_path}' loaded as None or empty.")
                 
-                required_keys = ['pivot_feature_names_used', 'entry_feature_names_base_used', 'model_training_atr_period_used']
-                missing_keys = [key for key in required_keys if key not in best_hyperparams or not best_hyperparams[key]]
+                # Validate essential keys in loaded_params
+                required_keys = ['pivot_feature_names_used', 'entry_feature_names_base_used', 
+                                 'model_training_atr_period_used', 'p_swing_threshold', 'profit_threshold']
+                missing_keys = [key for key in required_keys if key not in loaded_params or not loaded_params[key]] # Check loaded_params
                 if missing_keys:
-                    print(f"[ERROR] Parameters file '{checked_params_path}' is incomplete. Missing or empty for keys: {missing_keys}.")
-                    raise ValueError(f"Incomplete parameters file, missing: {missing_keys}")
+                    raise ValueError(f"Parameters file '{checked_params_path}' is incomplete. Missing or empty for critical keys: {missing_keys}.")
+                
+                best_hyperparams = loaded_params # Assign to global after validation
+                print(f"Parameters successfully loaded and validated from '{checked_params_path}'.")
 
             except FileNotFoundError:
-                print(f"[ERROR] parameters file not found at '{checked_params_path}'.")
-                retry_train = input(f"Parameters file not found. Attempt to retrain models (which recreates this file)? (yes/no) [yes]: ").lower()
+                print(f"[ERROR] Parameters file not found at '{checked_params_path}' (expected by check_ml_models_exist). This could indicate an issue with file saving or pathing previously.")
+                retry_train = input(f"Critical: Parameters file missing. Attempt to retrain models? (yes/no) [yes]: ").lower()
                 if retry_train in ['no', 'n']: sys.exit(1)
                 force_retrain = True; models_exist_loop_check = False; universal_pivot_model = None; universal_entry_model = None; best_hyperparams = {}; continue
-            except (json.JSONDecodeError, ValueError) as e_params_load: 
-                print(f"[ERROR] loading or validating parameters file '{checked_params_path}': {e_params_load}")
-                retry_train = input(f"Error with parameters file. Attempt to retrain models? (yes/no) [yes]: ").lower()
+            except (json.JSONDecodeError, ValueError) as e_params_load: # Catches both JSON errors and our custom ValueErrors for structure
+                print(f"[ERROR] Error loading, decoding, or validating parameters file '{checked_params_path}': {e_params_load}")
+                retry_train = input(f"Critical: Parameters file corrupted or invalid. Attempt to retrain models? (yes/no) [yes]: ").lower()
                 if retry_train in ['no', 'n']: sys.exit(1)
                 force_retrain = True; models_exist_loop_check = False; universal_pivot_model = None; universal_entry_model = None; best_hyperparams = {}; continue
-            except Exception as e_params: 
-                print(f"[ERROR] loading parameters file '{checked_params_path}': {e_params}")
-                retry_train = input(f"Unexpected error loading parameters file. Attempt to retrain models? (yes/no) [yes]: ").lower()
+            except Exception as e_params_other: # Catch-all for other unexpected errors during params loading
+                print(f"[ERROR] Unexpected error loading parameters file '{checked_params_path}': {e_params_other}")
+                retry_train = input(f"Unexpected error with parameters file. Attempt to retrain models? (yes/no) [yes]: ").lower()
                 if retry_train in ['no', 'n']: sys.exit(1)
-                force_retrain = True; models_exist_loop_check = False; continue
+                force_retrain = True; models_exist_loop_check = False; universal_pivot_model = None; universal_entry_model = None; best_hyperparams = {}; continue
             
             print(f"Models and parameters for version '{current_study_version_for_loop}' loaded successfully.")
 
@@ -5159,71 +5162,72 @@ def run_optuna_tuning(df_universal_raw, static_entry_features_base_list, n_trial
         )
 
     # Log best trial details
+    best_trial_params = None
     try:
         best_trial_retrieved = study.best_trial
         print(f"Best Optuna trial for study '{study_version}':")
         print(f"  Value: {best_trial_retrieved.value}")
         print(f"  Params: {best_trial_retrieved.params}")
-    except ValueError: # Happens if no trials are completed (e.g., if n_trials_to_run was 0)
-        print(f"No completed trials found for study '{study_version}'. Cannot determine best trial.")
-        # If no trials, we can't proceed with model training based on these params.
-        # However, the user might want to just run with previously saved best_params if the study was already complete.
-        # For now, the function will return None if no best trial.
-        # The calling function (start_app_main_flow) needs to handle this.
-        # If best_params.json exists, it might be used. If not, training cannot proceed.
-        # Let's try to load params from the file if no best trial from study.
-        params_path_for_fallback = app_settings.get("app_model_params_path", "best_model_params.json")
-        if os.path.exists(params_path_for_fallback):
-            print(f"Attempting to load best parameters from existing file: {params_path_for_fallback}")
-            try:
-                with open(params_path_for_fallback, 'r') as f:
-                    loaded_fallback_params = json.load(f)
-                print("Successfully loaded fallback parameters.")
-                return loaded_fallback_params # Return previously saved params
-            except Exception as e_fallback_load:
-                print(f"Error loading fallback parameters from {params_path_for_fallback}: {e_fallback_load}")
-                return None # Truly no params available
-        else:
-            print(f"No best trial in study and no fallback parameter file ({params_path_for_fallback}) found.")
-            return None
-
-
-    # Save best_params to a JSON file, named with the study_version
-    # The model params path from app_settings is the *filename*, not the full path.
-    # We will save it inside the optuna_runs_path/study_version directory for versioning.
-    params_filename = app_settings.get("app_model_params_path", "best_model_params.json") # Default filename
-    versioned_params_dir = os.path.join(optuna_runs_path, study_version)
-    os.makedirs(versioned_params_dir, exist_ok=True)
-    versioned_params_path = os.path.join(versioned_params_dir, params_filename)
-
-    try:
-        best_trial_for_saving = study.best_trial
-        params_to_save = best_trial_for_saving.params.copy()
         
-        # Retrieve and add user attributes stored during the trial
-        params_to_save['pivot_feature_names_used'] = best_trial_for_saving.user_attrs.get('pivot_feature_names_used', [])
-        params_to_save['entry_feature_names_base_used'] = best_trial_for_saving.user_attrs.get('entry_feature_names_base_used', [])
-        params_to_save['model_training_atr_period_used'] = best_trial_for_saving.user_attrs.get('model_training_atr_period_used', None)
-        # Also save the full entry feature list if available
-        params_to_save['full_entry_feature_names_used'] = best_trial_for_saving.user_attrs.get('full_entry_feature_names_used', [])
-
-
-        # Add other metadata
+        # Prepare parameters to save, including user attributes
+        params_to_save = best_trial_retrieved.params.copy()
+        params_to_save['pivot_feature_names_used'] = best_trial_retrieved.user_attrs.get('pivot_feature_names_used', [])
+        params_to_save['entry_feature_names_base_used'] = best_trial_retrieved.user_attrs.get('entry_feature_names_base_used', [])
+        params_to_save['model_training_atr_period_used'] = best_trial_retrieved.user_attrs.get('model_training_atr_period_used', None)
+        params_to_save['full_entry_feature_names_used'] = best_trial_retrieved.user_attrs.get('full_entry_feature_names_used', [])
         params_to_save['_study_version'] = study_version
-        params_to_save['_best_trial_value'] = best_trial_for_saving.value
+        params_to_save['_best_trial_value'] = best_trial_retrieved.value
         params_to_save['_source_db_file'] = sqlite_db_path
-        params_to_save['_best_trial_number'] = best_trial_for_saving.number
+        params_to_save['_best_trial_number'] = best_trial_retrieved.number
+        
+        best_trial_params = params_to_save # This dict will be returned if saving is successful or if already complete
 
+        # Save best_params to a JSON file, named with the study_version
+        params_filename = os.path.basename(app_settings.get("app_model_params_path", "best_model_params.json"))
+        versioned_params_dir = os.path.join(optuna_runs_path, study_version)
+        os.makedirs(versioned_params_dir, exist_ok=True)
+        versioned_params_path = os.path.join(versioned_params_dir, params_filename)
 
         with open(versioned_params_path, 'w') as f:
             json.dump(params_to_save, f, indent=4)
         print(f"Best Optuna parameters for '{study_version}' saved to {versioned_params_path}")
-    except Exception as e:
-        print(f"Error saving Optuna best parameters for '{study_version}' to {versioned_params_path}: {e}")
-        # Even if saving fails, return the params for current run
-        return study.best_trial.params
 
-    return study.best_trial.params
+    except ValueError: # Happens if no trials are completed (e.g., if n_trials_to_run was 0 or all failed)
+        print(f"No completed trials found for study '{study_version}' to determine best trial from current run.")
+        # Attempt to load params from an existing versioned file if study was previously completed.
+        params_filename_for_fallback = os.path.basename(app_settings.get("app_model_params_path", "best_model_params.json"))
+        versioned_params_dir_for_fallback = os.path.join(optuna_runs_path, study_version)
+        versioned_params_path_for_fallback = os.path.join(versioned_params_dir_for_fallback, params_filename_for_fallback)
+
+        if os.path.exists(versioned_params_path_for_fallback):
+            print(f"Attempting to load parameters from existing versioned file: {versioned_params_path_for_fallback}")
+            try:
+                with open(versioned_params_path_for_fallback, 'r') as f:
+                    loaded_fallback_params = json.load(f)
+                
+                required_keys_fallback = ['pivot_feature_names_used', 'entry_feature_names_base_used', 'model_training_atr_period_used', 'p_swing_threshold', 'profit_threshold']
+                if all(key in loaded_fallback_params for key in required_keys_fallback):
+                    print("Successfully loaded parameters from existing versioned file.")
+                    best_trial_params = loaded_fallback_params # Use these as the "best"
+                else:
+                    print(f"Error: Loaded fallback parameters from {versioned_params_path_for_fallback} are incomplete. Missing one of {required_keys_fallback}.")
+                    best_trial_params = None 
+            except Exception as e_fallback_load:
+                print(f"Error loading parameters from {versioned_params_path_for_fallback}: {e_fallback_load}")
+                best_trial_params = None
+        else:
+            print(f"No versioned parameter file found at ({versioned_params_path_for_fallback}) for study '{study_version}'.")
+            best_trial_params = None
+            
+    except Exception as e_save: # Catch other errors during saving (e.g., permission issues)
+        print(f"Error saving Optuna best parameters for '{study_version}': {e_save}")
+        # If saving failed but we had a best_trial (e.g., from current run), best_trial_params might still hold its params.
+        # If best_trial_params is None here, it means either no best trial or saving failed AND params_to_save wasn't populated.
+        if best_trial_params is None: # Ensure it's explicitly None if error occurred before params_to_save was set
+             print("Returning None as best_trial_params due to saving error and no prior best trial data.")
+        # If best_trial_params *was* populated from study.best_trial before save error, it will be returned.
+
+    return best_trial_params
 
 
 def process_dataframe_with_params(df_initial, params, static_entry_features_base_list_arg=None):
