@@ -294,7 +294,7 @@ def get_or_download_historical_data(symbol: str, interval: str,
                 print(f"{log_prefix_parquet} Existing data loaded. Shape: {existing_df.shape}")
                 # Ensure timestamp is datetime and sorted
                 existing_df['timestamp'] = pd.to_datetime(existing_df['timestamp'])
-                existing_df.sort_values('timestamp', inplace=True)
+                existing_df.sort_index(inplace=True)
                 existing_df.drop_duplicates(subset=['timestamp'], keep='last', inplace=True) # Deduplicate just in case
                 
                 # Get the last timestamp in milliseconds for Binance API
@@ -338,7 +338,7 @@ def get_or_download_historical_data(symbol: str, interval: str,
         
         try:
             print(f"{log_prefix_parquet} Attempting to write full data to Parquet. Shape: {downloaded_df.shape}. Path: {file_path}")
-            downloaded_df.to_parquet(file_path, index=True)
+            downloaded_df.to_parquet(file_path, index=False)
             print(f"{log_prefix_parquet} INFO: Wrote full data: {file_path}")
         except Exception as e:
             print(f"{log_prefix_parquet} ERROR: Failed writing full data to Parquet {file_path}: {e}")
@@ -368,13 +368,13 @@ def get_or_download_historical_data(symbol: str, interval: str,
 
             combined_df = pd.concat([existing_df, new_data_df], ignore_index=True)
             print(f"{log_prefix_parquet} Combined old and new data. Shape before final sort/dedup: {combined_df.shape}")
-            combined_df.sort_index(inplace=True)
+            combined_df.sort_values('timestamp', inplace=True)
             combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
             print(f"{log_prefix_parquet} Shape after final sort/dedup: {combined_df.shape}")
             
             try:
                 print(f"{log_prefix_parquet} Attempting to write appended data to Parquet. Shape: {combined_df.shape}. Path: {file_path}")
-                combined_df.to_parquet(file_path, index=True)
+                combined_df.to_parquet(file_path, index=False)
                 print(f"{log_prefix_parquet} INFO: Wrote appended data: {file_path}")
             except Exception as e:
                 print(f"{log_prefix_parquet} ERROR: Failed writing appended data to Parquet {file_path}: {e}")
@@ -1256,6 +1256,7 @@ def execute_app_trade_signal(symbol: str, side: str,
             df_for_atr, atr_err = get_historical_bars(symbol, app_settings.get("app_trading_kline_interval"), f"{atr_period_for_tp3 + 50} days ago UTC"), None # Simplified fetch
             
             if atr_err is None and not df_for_atr.empty and len(df_for_atr) >= atr_period_for_tp3:
+                df_for_atr.set_index('timestamp', inplace=True)
                 df_for_atr = calculate_atr(df_for_atr, period=atr_period_for_tp3) # calculate_atr is from app.py
                 atr_val_for_tp3 = df_for_atr[f'atr_{atr_period_for_tp3}'].iloc[-1]
                 
@@ -2976,10 +2977,11 @@ def app_process_symbol_for_signal(symbol: str, client, current_app_settings: dic
     
     # --- Perform Additional Pre-Checks (RSI, etc.) ---
     # trade_side_potential is "long" or "short"
+    klines_df_with_timestamp_col = df_live_raw.reset_index()
     preconditions_ok, reject_reason = check_signal_preconditions(
         symbol, 
         trade_side_potential,  # "long" or "short"
-        df_live_raw, # Full klines DataFrame for RSI calculation
+        klines_df_with_timestamp_col, # Full klines DataFrame for RSI calculation
         current_app_settings, 
         live_pivot_features # Pass the already calculated pivot features
     )
@@ -3344,6 +3346,7 @@ def app_check_fib_proposals(client, current_app_settings: dict,
             if df_check_raw.empty or len(df_check_raw) < 3: # Need at least a few candles
                 print(f"{log_prefix_checker} Insufficient kline data for price touch check for {symbol}. Skipping.")
                 continue
+            df_check_raw.set_index('timestamp', inplace=True)
             
             # Use the most recent closed candles for price touch logic
             # For example, check the high/low of the last closed candle
@@ -3732,49 +3735,50 @@ def app_trading_signal_loop(current_app_settings: dict, pivot_model_loaded, entr
                     # If delays are needed (e.g. for API rate limits), they should be managed within app_process_symbol_for_signal
                     # or by adjusting the number of workers.
 
-            # --- Check Fibonacci Pre-Order Proposals (remains sequential after parallel scan) ---
-            if current_app_settings.get("use_fib_preorder", False): # Only run if feature is enabled
-                print(f"{log_prefix} Checking Fibonacci pre-order proposals...")
-                app_check_fib_proposals(
-                    client=app_binance_client,
-                    current_app_settings=current_app_settings,
-                    pivot_model_loaded=pivot_model_loaded, # Pass loaded models
-                    entry_model_loaded=entry_model_loaded,
-                    current_best_hyperparams=current_best_hyperparams
-                )
-            # --- End Fibonacci Pre-Order Proposal Check ---
+                # --- Check Fibonacci Pre-Order Proposals (remains sequential after parallel scan) ---
+                if current_app_settings.get("use_fib_preorder", False): # Only run if feature is enabled
+                    print(f"{log_prefix} Checking Fibonacci pre-order proposals...")
+                    app_check_fib_proposals(
+                        client=app_binance_client,
+                        current_app_settings=current_app_settings,
+                        pivot_model_loaded=pivot_model_loaded, # Pass loaded models
+                        entry_model_loaded=entry_model_loaded,
+                        current_best_hyperparams=current_best_hyperparams
+                    )
+                # --- End Fibonacci Pre-Order Proposal Check ---
 
-            # Monitor existing trades/signals (if any were placed)
-            # monitor_app_trades uses the global app_binance_client and app_active_trades
-            if current_app_settings.get('app_operational_mode') == 'live':
-                 print(f"{log_prefix} Monitoring active live trades...")
-                 monitor_app_trades() 
-            elif current_app_settings.get('app_operational_mode') == 'signal':
-                 # If signal mode also needs monitoring (e.g. for virtual SL/TP hits), call a similar function.
-                 # For now, monitor_app_trades is primarily for live order management.
-                 # We might need a separate `monitor_app_virtual_signals` or adapt `monitor_app_trades`.
-                 # The current `monitor_app_trades` has logic for "signal" mode signals if they are in `app_active_trades`.
-                 # The `execute_app_trade_signal` does not add to `app_active_trades` in signal mode.
-                 # This part needs refinement if signal mode requires active monitoring beyond just sending initial signal.
-                 # For now, let's assume `monitor_app_trades` is primarily for live logic.
-                 # If `app_process_symbol_for_signal` were to add signals to a list for tracking,
-                 # a `monitor_app_signals` function would go here.
-                 pass
-            
-            # Save decision log periodically (e.g., every cycle if new entries, or based on buffer)
-            save_decision_log_to_csv() # Will save if buffer is full or if forced (not forced here)
+                # Monitor existing trades/signals (if any were placed)
+                # monitor_app_trades uses the global app_binance_client and app_active_trades
+                if current_app_settings.get('app_operational_mode') == 'live':
+                     print(f"{log_prefix} Monitoring active live trades...")
+                     monitor_app_trades() 
+                elif current_app_settings.get('app_operational_mode') == 'signal':
+                     # If signal mode also needs monitoring (e.g. for virtual SL/TP hits), call a similar function.
+                     # For now, monitor_app_trades is primarily for live order management.
+                     # We might need a separate `monitor_app_virtual_signals` or adapt `monitor_app_trades`.
+                     # The current `monitor_app_trades` has logic for "signal" mode signals if they are in `app_active_trades`.
+                     # The `execute_app_trade_signal` does not add to `app_active_trades` in signal mode.
+                     # This part needs refinement if signal mode requires active monitoring beyond just sending initial signal.
+                     # For now, let's assume `monitor_app_trades` is primarily for live logic.
+                     # If `app_process_symbol_for_signal` were to add signals to a list for tracking,
+                     # a `monitor_app_signals` function would go here.
+                     pass
+                
+                # Save decision log periodically (e.g., every cycle if new entries, or based on buffer)
+                save_decision_log_to_csv() # Will save if buffer is full or if forced (not forced here)
 
 
-            # Loop delay
-            scan_interval_seconds = current_app_settings.get("app_scan_interval_seconds", 60) # Default to 60 seconds
-            loop_duration = time.time() - loop_start_time
-            sleep_time = max(0, scan_interval_seconds - loop_duration)
-            
-            if sleep_time > 0:
-                print(f"{log_prefix} Cycle completed in {loop_duration:.2f}s. Sleeping for {sleep_time:.2f}s...")
-                time.sleep(sleep_time)
-            else:
-                print(f"{log_prefix} Cycle completed in {loop_duration:.2f}s. Starting next cycle immediately (scan interval too short or processing too long).")
+                # Loop delay
+                scan_interval_seconds = current_app_settings.get("app_scan_interval_seconds", 60) # Default to 60 seconds
+                loop_duration = time.time() - loop_start_time
+                sleep_time = max(0, scan_interval_seconds - loop_duration)
+                
+                if sleep_time > 0:
+                    print(f"{log_prefix} Cycle completed in {loop_duration:.2f}s. Sleeping for {sleep_time:.2f}s...")
+                    time.sleep(sleep_time)
+                else:
+                    print(f"{log_prefix} Cycle completed in {loop_duration:.2f}s. Starting next cycle immediately (scan interval too short or processing too long).")
+
 
     except KeyboardInterrupt:
         print(f"\n{log_prefix} Loop interrupted by user (Ctrl+C). Shutting down...")
@@ -3805,12 +3809,11 @@ def start_app_main_flow():
 
     # 2. Check for ML Models
     # check_ml_models_exist now returns versioned paths based on current app_study_version
-    models_exist, versioned_pivot_model_path_check, versioned_entry_model_path_check, versioned_params_path_check = check_ml_models_exist()
-    
     force_retrain = app_settings.get("app_force_retrain_on_startup", False)
 
     # Main application loop / decision tree
     while True: # Loop to allow retraining and then returning to choices
+        models_exist, versioned_pivot_model_path_check, versioned_entry_model_path_check, versioned_params_path_check = check_ml_models_exist()
         # Re-check model existence at the start of each loop iteration, as paths might change if study_version is altered by user/program
         # This ensures that if training happens, the subsequent load attempt uses the correct versioned paths.
         current_study_version_for_loop = app_settings.get("app_study_version", "default_study_v1")
@@ -3902,7 +3905,7 @@ def start_app_main_flow():
 
                 future_to_symbol = {
                     executor.submit(get_processed_data_for_symbol, 
-                                    data_processing_config,
+                                    best_hyperparams,
                                     symbol_ticker, 
                                     kline_interval_train, 
                                     start_date_train, 
@@ -4088,8 +4091,8 @@ def start_app_main_flow():
             print(f"Pivot scaler for '{current_study_version_for_loop}' saved to {current_version_pivot_scaler_path}")
 
             print(f"DEBUG: Args passed to train_pivot_model (final): {pivot_model_args}")
-            temp_pivot_model, _ = train_pivot_model(X_p_train_resampled_scaled, y_p_train_resampled, 
-                                                    X_p_train_resampled_scaled, y_p_train_resampled, # Using scaled for validation
+            temp_pivot_model, _ = train_pivot_model(X_p_train_resampled, y_p_train_resampled, 
+                                                    X_p_train_resampled, y_p_train_resampled, # Using scaled for validation
                                                     **pivot_model_args)
             if temp_pivot_model is None: print("CRITICAL: Pivot model training failed. Exiting."); sys.exit(1)
             
@@ -4142,8 +4145,8 @@ def start_app_main_flow():
                     
                     print(f"DEBUG: Args passed to train_entry_model (final): {entry_model_args}")
                     # Train with scaled data
-                    temp_entry_model, _ = train_entry_model(X_e_train_scaled, y_e_train, 
-                                                            X_e_train_scaled, y_e_train, # Using scaled for validation
+                    temp_entry_model, _ = train_entry_model(X_e_train, y_e_train, 
+                                                            X_e_train, y_e_train, # Using scaled for validation
                                                             **entry_model_args)
                     if temp_entry_model is None: 
                         print(f"{log_prefix} Entry model training returned None. Marking as not trained.")
@@ -4192,7 +4195,7 @@ def start_app_main_flow():
                     print(f"WARNING: Entry scaler not found at '{entry_scaler_path}' for summary generation.")
 
                 generate_training_backtest_summary(
-                    df_processed_full_dataset=df_final_train, 
+                    df_processed_full_dataset=df_processed_full_dataset, 
                     pivot_model=universal_pivot_model,
                     entry_model=universal_entry_model,
                     best_params_from_optuna=best_hyperparams,
@@ -4265,7 +4268,7 @@ def start_app_main_flow():
                 print(f"[ERROR] loading entry model from '{checked_entry_path}': {e}")
                 retry_train = input(f"Error loading entry model. Attempt to retrain models? (yes/no) [yes]: ").lower()
                 if retry_train in ['no', 'n']: sys.exit(1)
-                force_retrain = True; models_exist_loop_check = False; continue
+                force_retrain = True; models_exist_loop_check = False; continue # models_exist_loop_check to trigger retrain path
 
             try:
                 # `checked_params_path` is the versioned path to the params file
@@ -4298,7 +4301,7 @@ def start_app_main_flow():
                 print(f"[ERROR] Unexpected error loading parameters file '{checked_params_path}': {e_params_other}")
                 retry_train = input(f"Unexpected error with parameters file. Attempt to retrain models? (yes/no) [yes]: ").lower()
                 if retry_train in ['no', 'n']: sys.exit(1)
-                force_retrain = True; models_exist_loop_check = False; universal_pivot_model = None; universal_entry_model = None; best_hyperparams = {}; continue
+                force_retrain = True; models_exist_loop_check = False; universal_pivot_model = None; universal_entry_model = None; best_hyperparams = {}; continue # models_exist_loop_check to trigger retrain path
             
             print(f"Models and parameters for version '{current_study_version_for_loop}' loaded successfully.")
 
@@ -4320,7 +4323,7 @@ def start_app_main_flow():
             if universal_pivot_model and best_hyperparams:
                 pivot_scaler_path = app_settings.get("app_pivot_scaler_path")
                 pivot_scaler = load_model(pivot_scaler_path) if pivot_scaler_path and os.path.exists(pivot_scaler_path) else None
-                test_pivot_detector(universal_pivot_model, pivot_scaler, best_hyperparams)
+                test_pivot_detector(universal_pivot_model, pivot_scaler, best_params)
             else:
                 print("Models not loaded. Please train or load models first.")
         elif user_action == '4':
@@ -4698,7 +4701,7 @@ def engineer_pivot_features(df, atr_col_name, force_live_bars_since_pivot_calc: 
     # Ensure the index is a DatetimeIndex before proceeding
     if 'timestamp' in df.columns:
         df['timestamp'] = pd.to_datetime(df['timestamp'])
-        df.set_index('timestamp', inplace=True)
+        df.set_index(pd.to_datetime(df['timestamp']), inplace=True)
 
     if isinstance(df.index, pd.DatetimeIndex):
         for i, row in df.iterrows():
@@ -4785,13 +4788,6 @@ def engineer_entry_features(df, atr_col_name, entry_features_base_list_arg=None)
         df['day_of_week'] = np.nan
 
 
-    # Regime cluster label (e.g. low/high vol from K-means) - Placeholder
-    # This would require a separate clustering step on volatility or other features.
-    df['day_of_week'] = df['timestamp'].dt.dayofweek
-
-    # Regime cluster label (e.g. low/high vol from K-means) - Placeholder
-    # This would require a separate clustering step on volatility or other features.
-    df['vol_regime'] = 0 # Example: 0 for low, 1 for high. Needs actual implementation.
 
     # Meta-Feature: P_swing (This will be added when preparing data for the entry model)
 
@@ -4933,7 +4929,7 @@ def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot
 
     # --- Per-Trial Data Processing ---
     df_trial_processed = df_raw.copy() # Start with a fresh copy of the raw data for each trial
-    df_trial_processed.reset_index(drop=True, inplace=True) # Ensure 0-based index for concatenated DFs
+    df_trial_processed.sort_index(inplace=True) # Ensure 0-based index for concatenated DFs
 
     # 1. Calculate ATR for the current trial's period
     df_trial_processed = calculate_atr(df_trial_processed, period=current_atr_period)
@@ -4956,7 +4952,7 @@ def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot
     # Drop rows with NaN in critical columns that might have been introduced or not handled by ATR/simulation
     # This is important before feature engineering
     df_trial_processed.dropna(subset=[atr_col_name_optuna, 'low', 'high', 'close'], inplace=True) # Add other critical columns if necessary
-    df_trial_processed.reset_index(drop=True, inplace=True)
+    df_trial_processed.sort_index(inplace=True)
 
     if len(df_trial_processed) < 100: # Check if enough data remains after initial processing
         print(f"Warning: Not enough data ({len(df_trial_processed)} rows) after initial trial processing. Skipping trial.")
@@ -5200,7 +5196,7 @@ def process_dataframe_with_params(df_initial, params, static_entry_features_base
     """
     print(f"Processing DataFrame with params: {params}")
     df_processed = df_initial.copy()
-    df_processed.reset_index(drop=True, inplace=True) # Ensure 0-based index
+    df_processed.sort_index(inplace=True) # Ensure 0-based index
 
     # Extract parameters, providing defaults if not all are in 'params' (e.g. if Optuna didn't tune some)
     atr_period = params.get('atr_period_opt', ATR_PERIOD)
@@ -5229,7 +5225,7 @@ def process_dataframe_with_params(df_initial, params, static_entry_features_base
     df_processed = simulate_fib_entries(df_processed, atr_col_name=atr_col_name)
     
     df_processed.dropna(subset=[atr_col_name, 'low', 'high', 'close'], inplace=True)
-    df_processed.reset_index(drop=True, inplace=True)
+    df_processed.sort_index(inplace=True)
 
     if len(df_processed) < 30: # Min data check
         print(f"Warning: Not enough data ({len(df_processed)} rows) after initial processing with best_params.")
@@ -6106,14 +6102,14 @@ def get_processed_data_for_symbol(config, symbol_ticker, kline_interval, start_d
     historical_df = simulate_fib_entries(historical_df, atr_col_name=atr_col_name_dynamic)
     
     historical_df.dropna(subset=[atr_col_name_dynamic], inplace=True)
-    historical_df.reset_index(drop=True, inplace=True)
+    historical_df.sort_index(inplace=True)
 
     historical_df, pivot_feature_names = engineer_pivot_features(historical_df, atr_col_name=atr_col_name_dynamic)
     historical_df, entry_feature_names_base = engineer_entry_features(historical_df, atr_col_name=atr_col_name_dynamic)
 
     df_processed = historical_df.iloc[30:].copy()
     df_processed.dropna(subset=pivot_feature_names, inplace=True)
-    df_processed.reset_index(drop=True, inplace=True)
+    df_processed.sort_index(inplace=True)
 
     if len(df_processed) < 100:
         return None, None, None
@@ -6140,7 +6136,7 @@ def test_pivot_detector(pivot_model, pivot_scaler, best_params):
 
     for symbol in symbols:
         df_symbol = df_golden[df_golden['symbol'] == symbol].copy()
-        true_pivot_indices = df_symbol[df_symbol['is_pivot'] == 1].index
+        true_pivot_indices = df_symbol[df_symbol['is_pivot'] == 1]
 
         # Feature Engineering
         atr_period = best_params.get('atr_period_opt', ATR_PERIOD)
