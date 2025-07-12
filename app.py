@@ -5240,7 +5240,7 @@ def run_optuna_tuning(df_universal_raw, static_entry_features_base_list, n_trial
         study.optimize(
             lambda trial: objective_optuna(trial, df_universal_raw, static_entry_features_base_list),
             n_trials=n_trials_to_run, # Only run the remaining number of trials
-            n_jobs=-1 # Use all available CPU cores for parallel trials
+            n_jobs=1 # Use sequential processing to avoid SQLite locking issues
         )
 
     # Log best trial details
