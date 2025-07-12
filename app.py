@@ -7,8 +7,6 @@ from catboost import CatBoostClassifier
 from sklearn.metrics import precision_score, recall_score, confusion_matrix
 import optuna
 import joblib
-from pivot_retrainer import get_label_distribution, augment_positive_examples, apply_smote, add_momentum_features, encode_contextual_indicators, mark_categorical_features, get_tuned_hyperparameters, plot_probability_distribution, get_dynamic_threshold, fallback_rule
-from validation import backtest_comparison, live_shadow_mode, automated_alerts
 from binance.client import Client # Assuming you'll use python-binance
 from binance.exceptions import BinanceAPIException, BinanceRequestException
 import time
@@ -434,13 +432,14 @@ def load_app_settings(filepath=APP_CONFIG_FILE):
         "app_entry_model_path": "entry_evaluator_model.cb",
         "app_model_params_path": "best_model_params.json",
         "app_auto_start_trading_after_train": False,
-        "app_force_retrain_on_startup": False,
+        "force_pivot_retrain": False,
         # Add other ML training specific defaults if needed (e.g., Optuna trials)
         "app_optuna_trials": 20, # Default Optuna trials for app.py training
         "app_study_version": "pivot_v1_initial", # For Optuna study naming and artifact versioning
         "app_optuna_runs_path": "optuna_runs",  # Base directory for Optuna .db files and other artifacts
         "app_use_dynamic_threshold": True, # New: Toggle for dynamic/fixed pivot threshold
         "app_fixed_pivot_threshold": 0.7,  # New: Fixed pivot threshold value
+        "app_fixed_pivot_threshold_override": None,
         
         # New settings for the trading/signal loop
         "app_trading_symbols": "BTCUSDT", # Comma-separated list of symbols
@@ -562,16 +561,16 @@ def load_app_settings(filepath=APP_CONFIG_FILE):
 
     # Force retrain on startup
     app_force_retrain_valid = False
-    if "app_force_retrain_on_startup" in loaded_json_settings:
-        retrain_val = loaded_json_settings["app_force_retrain_on_startup"]
+    if "force_pivot_retrain" in loaded_json_settings:
+        retrain_val = loaded_json_settings["force_pivot_retrain"]
         if isinstance(retrain_val, bool):
-            current_settings["app_force_retrain_on_startup"] = retrain_val
+            current_settings["force_pivot_retrain"] = retrain_val
             app_force_retrain_valid = True
     if not app_force_retrain_valid:
-        print("app.py: 'app_force_retrain_on_startup' missing or invalid in settings file. Prompting user.")
-        current_settings["app_force_retrain_on_startup"] = get_user_input(
+        print("app.py: 'force_pivot_retrain' missing or invalid in settings file. Prompting user.")
+        current_settings["force_pivot_retrain"] = get_user_input(
             "Force retrain models on startup (true/false)?",
-            current_settings.get("app_force_retrain_on_startup", defaults["app_force_retrain_on_startup"]),
+            current_settings.get("force_pivot_retrain", defaults["force_pivot_retrain"]),
             bool
         )
 
@@ -2494,6 +2493,14 @@ def app_calculate_live_pivot_features(df_live: pd.DataFrame, atr_period: int, pi
     print(f"[DEBUG] Final Live Pivot Features Sent to Model ({df.name if hasattr(df, 'name') else 'N/A'} @ {df.index[-1]}): {log_dict_str}")
     # --- End Enhanced Logging ---
 
+    # Log feature distributions
+    feature_dist_log = {}
+    for feature in pivot_feature_names:
+        feature_dist_log[feature] = {'min': df_with_features[feature].min(), 'max': df_with_features[feature].max()}
+    
+    with open('feature_distribution_log.json', 'w') as f:
+        json.dump(feature_dist_log, f, indent=4)
+
     return live_features_series
 
 def app_calculate_live_entry_features(df_live: pd.DataFrame, atr_period: int, entry_feature_names_base: list,
@@ -2695,6 +2702,7 @@ def app_process_symbol_for_signal(symbol: str, client, current_app_settings: dic
     # Fixed threshold is from app_settings.json
     fixed_pivot_threshold_config = current_app_settings.get('app_fixed_pivot_threshold', 0.7) # Default if not in settings
     use_dynamic_threshold_mode = current_app_settings.get('app_use_dynamic_threshold', True) # Default to dynamic
+    fixed_pivot_threshold_override = current_app_settings.get('app_fixed_pivot_threshold_override')
 
     p_profit_thresh_config = current_best_hyperparams.get('profit_threshold') # For entry model
 
@@ -2726,7 +2734,12 @@ def app_process_symbol_for_signal(symbol: str, client, current_app_settings: dic
 
 
     # --- Determine p_swing_thresh_to_use ---
-    if use_dynamic_threshold_mode:
+    if fixed_pivot_threshold_override is not None:
+        p_swing_thresh_to_use = fixed_pivot_threshold_override
+        threshold_mode_in_use = "Fixed (Override)"
+        reference_threshold_val = dynamic_pivot_threshold if valid_dynamic_pivot_thresh else "N/A (Invalid Dynamic)"
+        reference_threshold_type = "Dynamic"
+    elif use_dynamic_threshold_mode:
         if valid_dynamic_pivot_thresh:
             p_swing_thresh_to_use = dynamic_pivot_threshold
             threshold_mode_in_use = "Dynamic"
@@ -3701,7 +3714,7 @@ def start_app_main_flow():
     # check_ml_models_exist now returns versioned paths based on current app_study_version
     models_exist, versioned_pivot_model_path_check, versioned_entry_model_path_check, versioned_params_path_check = check_ml_models_exist()
     
-    force_retrain = app_settings.get("app_force_retrain_on_startup", False)
+    force_retrain = app_settings.get("force_pivot_retrain", False)
 
     # Main application loop / decision tree
     while True: # Loop to allow retraining and then returning to choices
@@ -3733,7 +3746,7 @@ def start_app_main_flow():
             if force_retrain:
                 print("Configuration set to force retrain models.")
                 force_retrain = False # Reset flag after use
-                app_settings["app_force_retrain_on_startup"] = False # Also reset in runtime settings
+                app_settings["force_pivot_retrain"] = False # Also reset in runtime settings
                 save_app_settings() # Persist the reset flag state
             else: # models_exist is False
                 print("ML models not found. Starting training process...")
@@ -4134,19 +4147,28 @@ def start_app_main_flow():
             # If the loop exits, the application can then terminate.
             print(f"{log_prefix} Trading/signal loop has exited. Application will now terminate.")
             sys.exit(0) # Exit after the loop finishes
-        
-        elif user_action == '2':
-            print("User chose to retrain models.")
-            force_retrain = True 
-            models_exist = False 
-            universal_pivot_model, universal_entry_model, best_hyperparams = None, None, {} # Clear loaded models
-            continue 
-        
-        elif user_action == '3':
-            print("Exiting application.")
-            sys.exit(0)
-        else:
-            print("Invalid choice. Please try again.")
+
+
+from imblearn.over_sampling import SMOTE
+
+def apply_smote(X, y):
+    """
+    Applies SMOTE to handle class imbalance.
+    """
+    print("Applying SMOTE...")
+    n_samples = y.value_counts()
+    k_neighbors = n_samples.min() - 1 if n_samples.min() > 1 else 1
+    if k_neighbors == 0:
+        k_neighbors = 1
+    
+    smote = SMOTE(random_state=42, k_neighbors=k_neighbors)
+    X_resampled, y_resampled = smote.fit_resample(X, y)
+    
+    # Check class balance post-SMOTE
+    print("Class balance post-SMOTE:")
+    print(pd.Series(y_resampled).value_counts())
+    
+    return X_resampled, y_resampled
 
 def calculate_atr(df, period=ATR_PERIOD):
     """Calculates Average True Range."""
