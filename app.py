@@ -437,6 +437,8 @@ def load_app_settings(filepath=APP_CONFIG_FILE):
         "app_force_retrain_on_startup": False,
         # Add other ML training specific defaults if needed (e.g., Optuna trials)
         "app_optuna_trials": 20, # Default Optuna trials for app.py training
+        "app_study_version": "pivot_v1_initial", # For Optuna study naming and artifact versioning
+        "app_optuna_runs_path": "optuna_runs",  # Base directory for Optuna .db files and other artifacts
         "app_use_dynamic_threshold": True, # New: Toggle for dynamic/fixed pivot threshold
         "app_fixed_pivot_threshold": 0.7,  # New: Fixed pivot threshold value
         
@@ -2266,26 +2268,51 @@ def get_dynamic_trade_parameters(symbol: str, current_market_data_df: pd.DataFra
 
 # --- ML Model File Utilities ---
 def check_ml_models_exist():
-    """Checks if the ML model files specified in app_settings exist."""
+    """
+    Checks if the ML model files specified in app_settings exist,
+    constructing paths based on current study_version and optuna_runs_path.
+    Returns True and the constructed paths if all exist, False and paths otherwise.
+    """
     global app_settings
-    pivot_model_path = app_settings.get("app_pivot_model_path", "app_pivot_model.joblib")
-    entry_model_path = app_settings.get("app_entry_model_path", "app_entry_model.joblib")
-    models_params_path = app_settings.get("app_model_params_path", "best_model_params.json") # Corrected default
+    
+    study_version = app_settings.get("app_study_version", "default_study_v1")
+    optuna_runs_path = app_settings.get("app_optuna_runs_path", "optuna_runs")
+    versioned_artifact_dir = os.path.join(optuna_runs_path, study_version)
 
-    pivot_exists = os.path.exists(pivot_model_path)
-    entry_exists = os.path.exists(entry_model_path)
-    params_exist = os.path.exists(models_params_path) # Also check for model params file
+    # Get base filenames from settings, or use defaults if settings keys are missing
+    pivot_model_basename = os.path.basename(app_settings.get("app_pivot_model_path", "app_pivot_model.joblib"))
+    entry_model_basename = os.path.basename(app_settings.get("app_entry_model_path", "app_entry_model.joblib"))
+    params_basename = os.path.basename(app_settings.get("app_model_params_path", "best_model_params.json"))
+
+    # Construct versioned paths
+    # Ensure these paths are what will be used for loading if they exist.
+    # The app_settings might still point to old non-versioned paths if training hasn't run with new setup.
+    # This check is for *current version's* artifacts.
+    versioned_pivot_model_path = os.path.join(versioned_artifact_dir, pivot_model_basename)
+    versioned_entry_model_path = os.path.join(versioned_artifact_dir, entry_model_basename)
+    versioned_params_path = os.path.join(versioned_artifact_dir, params_basename)
+    
+    print(f"Checking for ML artifacts in versioned directory: {versioned_artifact_dir}")
+    print(f"  - Pivot Model: {versioned_pivot_model_path}")
+    print(f"  - Entry Model: {versioned_entry_model_path}")
+    print(f"  - Params File: {versioned_params_path}")
+
+    pivot_exists = os.path.exists(versioned_pivot_model_path)
+    entry_exists = os.path.exists(versioned_entry_model_path)
+    params_exist = os.path.exists(versioned_params_path)
 
     if pivot_exists and entry_exists and params_exist:
-        print(f"ML Models and params found: Pivot='{pivot_model_path}', Entry='{entry_model_path}', Params='{models_params_path}'")
-        return True, pivot_model_path, entry_model_path, models_params_path
+        print(f"All ML artifacts for version '{study_version}' found.")
+        # Return the versioned paths as these are what should be loaded for this version
+        return True, versioned_pivot_model_path, versioned_entry_model_path, versioned_params_path
     else:
         missing_files = []
-        if not pivot_exists: missing_files.append(pivot_model_path)
-        if not entry_exists: missing_files.append(entry_model_path)
-        if not params_exist: missing_files.append(models_params_path)
-        print(f"ML Model(s) or params file NOT found. Missing: {', '.join(missing_files)}")
-        return False, pivot_model_path, entry_model_path, models_params_path
+        if not pivot_exists: missing_files.append(versioned_pivot_model_path)
+        if not entry_exists: missing_files.append(versioned_entry_model_path)
+        if not params_exist: missing_files.append(versioned_params_path)
+        print(f"ML artifact(s) for version '{study_version}' NOT found. Missing: {', '.join(missing_files)}")
+        # Return versioned paths even if missing, so caller knows what was checked
+        return False, versioned_pivot_model_path, versioned_entry_model_path, versioned_params_path
 
 # --- End ML Model File Utilities ---
 
@@ -3669,13 +3696,38 @@ def start_app_main_flow():
     load_app_trading_configs() # Ensure trading configs are populated from app_settings
 
     # 2. Check for ML Models
-    models_exist, pivot_model_path, entry_model_path, params_path = check_ml_models_exist()
+    # check_ml_models_exist now returns versioned paths based on current app_study_version
+    models_exist, versioned_pivot_model_path_check, versioned_entry_model_path_check, versioned_params_path_check = check_ml_models_exist()
     
     force_retrain = app_settings.get("app_force_retrain_on_startup", False)
 
     # Main application loop / decision tree
     while True: # Loop to allow retraining and then returning to choices
-        if not models_exist or force_retrain:
+        # Re-check model existence at the start of each loop iteration, as paths might change if study_version is altered by user/program
+        # This ensures that if training happens, the subsequent load attempt uses the correct versioned paths.
+        current_study_version_for_loop = app_settings.get("app_study_version", "default_study_v1")
+        current_optuna_runs_path_for_loop = app_settings.get("app_optuna_runs_path", "optuna_runs")
+        current_versioned_artifact_dir = os.path.join(current_optuna_runs_path_for_loop, current_study_version_for_loop)
+
+        # Determine expected artifact paths for the *current* version for this loop iteration
+        # These are what we'd try to load if not retraining, or where new artifacts will be saved.
+        # Base filenames are from app_settings, but could default if app_settings keys are missing.
+        # (check_ml_models_exist already does this basename logic, but repeating for clarity here if we directly use these paths later)
+        _pivot_basename = os.path.basename(app_settings.get("app_pivot_model_path", "app_pivot_model.joblib"))
+        _entry_basename = os.path.basename(app_settings.get("app_entry_model_path", "app_entry_model.joblib"))
+        _params_basename = os.path.basename(app_settings.get("app_model_params_path", "best_model_params.json"))
+
+        # These are the paths for the *current* study version being processed in this loop iteration.
+        current_version_pivot_path = os.path.join(current_versioned_artifact_dir, _pivot_basename)
+        current_version_entry_path = os.path.join(current_versioned_artifact_dir, _entry_basename)
+        current_version_params_path = os.path.join(current_versioned_artifact_dir, _params_basename)
+
+        # Re-run check_ml_models_exist to get its view of existence for the current version.
+        # The paths returned by it will be the versioned ones.
+        models_exist_loop_check, checked_pivot_path, checked_entry_path, checked_params_path = check_ml_models_exist()
+
+
+        if not models_exist_loop_check or force_retrain:
             if force_retrain:
                 print("Configuration set to force retrain models.")
                 force_retrain = False # Reset flag after use
@@ -3773,35 +3825,38 @@ def start_app_main_flow():
                 current_best_hyperparams['model_training_atr_period_used'] = tuned_atr_period
                 # --- End feature name correction ---
 
-                with open(params_path, 'w') as f: json.dump(current_best_hyperparams, f, indent=4)
-                print(f"Best Optuna parameters (including dynamically generated feature names and ATR period) saved to {params_path}")
+                # Optuna already saves parameters to a versioned file (e.g., optuna_runs/study_v1/best_model_params.json)
+                # No need to explicitly save here with `params_path` which might be non-versioned.
+                # The `current_version_params_path` is the correct one for this version.
+                # `run_optuna_tuning` now handles saving to the versioned path.
+                # We just need to ensure `best_hyperparams` (global) is updated with the result.
+                # with open(params_path, 'w') as f: json.dump(current_best_hyperparams, f, indent=4)
+                # print(f"Best Optuna parameters (including dynamically generated feature names and ATR period) saved to {params_path}")
                 best_hyperparams = current_best_hyperparams # Update global
+                print(f"Optuna tuning complete. Best parameters for '{current_study_version_for_loop}' (from Optuna) are now in 'best_hyperparams' global and saved to its versioned JSON file.")
+
             except Exception as e: print(f"Optuna tuning failed: {e}. Exiting."); import traceback; traceback.print_exc(); sys.exit(1) # Added traceback
 
             # Use feature names directly from the now-corrected best_hyperparams for final model training
-            final_pivot_feats_to_use = best_hyperparams.get('pivot_feature_names_used') # Use .get()
-            final_entry_base_feats_to_use = best_hyperparams.get('entry_feature_names_base_used') # Use .get()
-            if final_pivot_feats_to_use is None or final_entry_base_feats_to_use is None:
-                print("CRITICAL: Feature names not found in best_hyperparams after Optuna. Exiting."); sys.exit(1)
-
+            final_pivot_feats_to_use = best_hyperparams.get('pivot_feature_names_used') 
+            final_entry_base_feats_to_use = best_hyperparams.get('entry_feature_names_base_used') 
+            if final_pivot_feats_to_use is None or not final_pivot_feats_to_use: # Also check if empty list
+                print("CRITICAL: Pivot feature names list not found or empty in best_hyperparams after Optuna. Exiting."); sys.exit(1)
+            if final_entry_base_feats_to_use is None or not final_entry_base_feats_to_use: # Also check if empty list
+                print("CRITICAL: Entry base feature names list not found or empty in best_hyperparams after Optuna. Exiting."); sys.exit(1)
             
             # Pass the correctly defined final_entry_base_feats_to_use to process_dataframe_with_params
             df_final_train, processed_pivot_features_final, processed_entry_features_base_final = process_dataframe_with_params(
                 universal_df_initial_processed_app.copy(), 
-                best_hyperparams, # Contains the correct ATR period and feature name lists
-                static_entry_features_base_list_arg=final_entry_base_feats_to_use # Pass the list based on tuned ATR
+                best_hyperparams, 
+                static_entry_features_base_list_arg=final_entry_base_feats_to_use 
             )
-            # df_final_train should now be processed using the tuned ATR period, and its features should align.
-            # processed_pivot_features_final and processed_entry_features_base_final from this function
-            # should match what's in best_hyperparams if process_dataframe_with_params is consistent.
 
             if df_final_train is None: print("CRITICAL: Failed to process data with best params. Exiting."); sys.exit(1)
 
-            # Ensure X_p_train uses the feature list that the model will expect, which is from best_hyperparams
             X_p_train = df_final_train[final_pivot_feats_to_use].fillna(-1)
             y_p_train = df_final_train['pivot_label']
 
-            # Log class distribution for pivot labels
             print(f"\n{log_prefix} --- Pivot Label Distribution BEFORE Resampling (y_p_train) ---")
             print(f"{log_prefix} Raw Value Counts:")
             print(y_p_train.value_counts())
@@ -3864,8 +3919,13 @@ def start_app_main_flow():
                                                     X_p_train_resampled, y_p_train_resampled, # Using resampled for validation during this fit
                                                     **pivot_model_args)
             if temp_pivot_model is None: print("CRITICAL: Pivot model training failed. Exiting."); sys.exit(1)
-            save_model(temp_pivot_model, pivot_model_path)
+            
+            # Save model to versioned path
+            os.makedirs(current_versioned_artifact_dir, exist_ok=True) # Ensure directory exists
+            save_model(temp_pivot_model, current_version_pivot_path) 
+            app_settings["app_pivot_model_path"] = current_version_pivot_path # Update setting to new path
             universal_pivot_model = temp_pivot_model
+            print(f"Pivot model for '{current_study_version_for_loop}' saved to {current_version_pivot_path}")
 
             # For calculating P_swing on the original (non-resampled) df_final_train for entry candidate filtering:
             # This is important because we want to evaluate P_swing on the original data distribution.
@@ -3900,8 +3960,16 @@ def start_app_main_flow():
                     
                     print(f"DEBUG: Args passed to train_entry_model: {entry_model_args}")
                     temp_entry_model, _ = train_entry_model(X_e_train, y_e_train, X_e_train, y_e_train, **entry_model_args)
-                    if temp_entry_model is None: print(f"{log_prefix} Entry model training returned None. Marking as not trained."); universal_entry_model = None
-                    else: save_model(temp_entry_model, entry_model_path); universal_entry_model = temp_entry_model; print(f"{log_prefix} Entry model trained and saved.")
+                    if temp_entry_model is None: 
+                        print(f"{log_prefix} Entry model training returned None. Marking as not trained."); 
+                        universal_entry_model = None
+                    else: 
+                        # Save entry model to versioned path
+                        os.makedirs(current_versioned_artifact_dir, exist_ok=True) # Ensure directory exists
+                        save_model(temp_entry_model, current_version_entry_path)
+                        app_settings["app_entry_model_path"] = current_version_entry_path # Update setting
+                        universal_entry_model = temp_entry_model
+                        print(f"{log_prefix} Entry model for '{current_study_version_for_loop}' trained and saved to {current_version_entry_path}.")
                 else:
                     print(f"{log_prefix} Entry model training SKIPPED: Insufficient data diversity for training. X_e_train length: {len(X_e_train)}, y_e_train unique values: {y_e_train.unique() if len(X_e_train) > 0 else 'N/A'}.")
                     universal_entry_model = None # Ensure it's None if skipped
@@ -3950,63 +4018,83 @@ def start_app_main_flow():
                     sys.exit(0)
             # If auto_start or user chose yes, fall through to model loading and trading choice.
             # Note: Models are already in global vars if training just happened.
+            
+            # After training, update app_settings with the new versioned paths and save.
+            # current_version_pivot_path, current_version_entry_path, current_version_params_path
+            # are already the correct paths for the version just trained.
+            # run_optuna_tuning saved params to current_version_params_path.
+            # Model saving logic above saved models to current_version_pivot_path and current_version_entry_path.
+            app_settings["app_pivot_model_path"] = current_version_pivot_path
+            app_settings["app_entry_model_path"] = current_version_entry_path
+            app_settings["app_model_params_path"] = current_version_params_path # This should be just the filename for consistency, path is derived
+            # Let's ensure app_model_params_path stores only the basename, as its full path is derived.
+            # The value in current_version_params_path is the full path.
+            app_settings["app_model_params_path"] = os.path.basename(current_version_params_path)
+
+            save_app_settings() # Persist these potentially updated paths
+            print(f"App settings updated and saved with artifact paths for version '{current_study_version_for_loop}'.")
+
 
         # Models exist (either initially or after training, or loaded below)
         # Try to load models and params into global vars if they are not already 
         # (e.g. on fresh start with existing files, or if training was skipped and we fell through)
-        # Also ensure best_hyperparams is not an empty dict if models are loaded
+        # Also ensure best_hyperparams is not an empty dict if models are loaded.
+        # Paths used for loading should be the versioned paths determined at the start of this loop iteration
+        # or returned by check_ml_models_exist.
+        # `checked_pivot_path`, `checked_entry_path`, `checked_params_path` are the versioned paths to load from.
+
         if universal_pivot_model is None or universal_entry_model is None or best_hyperparams is None or not best_hyperparams:
-            print("Loading trained ML models and parameters...")
+            print(f"Loading trained ML models and parameters for version '{current_study_version_for_loop}'...")
             try:
-                universal_pivot_model = load_model(pivot_model_path)
-                if universal_pivot_model is None: raise FileNotFoundError("Pivot model loaded as None.")
+                # Use the versioned paths returned by check_ml_models_exist or constructed for the current version
+                universal_pivot_model = load_model(checked_pivot_path) 
+                if universal_pivot_model is None: raise FileNotFoundError(f"Pivot model loaded as None from {checked_pivot_path}.")
             except Exception as e:
-                print(f"[ERROR] loading pivot model from '{pivot_model_path}': {e}")
-                # Decide if to offer retry_train or just exit
+                print(f"[ERROR] loading pivot model from '{checked_pivot_path}': {e}")
                 retry_train = input(f"Error loading pivot model. Attempt to retrain models? (yes/no) [yes]: ").lower()
                 if retry_train in ['no', 'n']: sys.exit(1)
-                force_retrain = True; models_exist = False; continue
+                force_retrain = True; models_exist_loop_check = False; continue # models_exist_loop_check to trigger retrain path
             
             try:
-                universal_entry_model = load_model(entry_model_path)
-                if universal_entry_model is None: raise FileNotFoundError("Entry model loaded as None.")
+                universal_entry_model = load_model(checked_entry_path)
+                if universal_entry_model is None: raise FileNotFoundError(f"Entry model loaded as None from {checked_entry_path}.")
             except Exception as e:
-                print(f"[ERROR] loading entry model from '{entry_model_path}': {e}")
+                print(f"[ERROR] loading entry model from '{checked_entry_path}': {e}")
                 retry_train = input(f"Error loading entry model. Attempt to retrain models? (yes/no) [yes]: ").lower()
                 if retry_train in ['no', 'n']: sys.exit(1)
-                force_retrain = True; models_exist = False; continue
+                force_retrain = True; models_exist_loop_check = False; continue
 
             try:
-                with open(params_path, 'r') as f:
+                # `checked_params_path` is the versioned path to the params file
+                with open(checked_params_path, 'r') as f:
                     loaded_params = json.load(f) 
-                if loaded_params is None or not loaded_params: # Check for None or empty dict
+                if loaded_params is None or not loaded_params: 
                     raise ValueError("Parameters file loaded as None or empty.")
-                best_hyperparams = loaded_params # This loads params like thresholds and feature names
+                best_hyperparams = loaded_params 
                 
-                # Add a check for essential keys after loading
                 required_keys = ['pivot_feature_names_used', 'entry_feature_names_base_used', 'model_training_atr_period_used']
                 missing_keys = [key for key in required_keys if key not in best_hyperparams or not best_hyperparams[key]]
                 if missing_keys:
-                    print(f"[ERROR] Parameters file '{params_path}' is incomplete. Missing or empty for keys: {missing_keys}.")
-                    raise ValueError(f"Incomplete parameters file, missing: {missing_keys}") # This will be caught by the generic except below
+                    print(f"[ERROR] Parameters file '{checked_params_path}' is incomplete. Missing or empty for keys: {missing_keys}.")
+                    raise ValueError(f"Incomplete parameters file, missing: {missing_keys}")
 
             except FileNotFoundError:
-                print(f"[ERROR] parameters file not found at '{params_path}'.")
+                print(f"[ERROR] parameters file not found at '{checked_params_path}'.")
                 retry_train = input(f"Parameters file not found. Attempt to retrain models (which recreates this file)? (yes/no) [yes]: ").lower()
                 if retry_train in ['no', 'n']: sys.exit(1)
-                force_retrain = True; models_exist = False; universal_pivot_model = None; universal_entry_model = None; best_hyperparams = {}; continue
-            except (json.JSONDecodeError, ValueError) as e_params_load: # Catch ValueError from our check or JSON errors
-                print(f"[ERROR] loading or validating parameters file '{params_path}': {e_params_load}")
+                force_retrain = True; models_exist_loop_check = False; universal_pivot_model = None; universal_entry_model = None; best_hyperparams = {}; continue
+            except (json.JSONDecodeError, ValueError) as e_params_load: 
+                print(f"[ERROR] loading or validating parameters file '{checked_params_path}': {e_params_load}")
                 retry_train = input(f"Error with parameters file. Attempt to retrain models? (yes/no) [yes]: ").lower()
                 if retry_train in ['no', 'n']: sys.exit(1)
-                force_retrain = True; models_exist = False; universal_pivot_model = None; universal_entry_model = None; best_hyperparams = {}; continue
-            except Exception as e_params: # Catch any other unexpected error during params loading
-                print(f"[ERROR] loading parameters file '{params_path}': {e_params}")
+                force_retrain = True; models_exist_loop_check = False; universal_pivot_model = None; universal_entry_model = None; best_hyperparams = {}; continue
+            except Exception as e_params: 
+                print(f"[ERROR] loading parameters file '{checked_params_path}': {e_params}")
                 retry_train = input(f"Unexpected error loading parameters file. Attempt to retrain models? (yes/no) [yes]: ").lower()
                 if retry_train in ['no', 'n']: sys.exit(1)
-                force_retrain = True; models_exist = False; continue
+                force_retrain = True; models_exist_loop_check = False; continue
             
-            print("Models and parameters loaded successfully.")
+            print(f"Models and parameters for version '{current_study_version_for_loop}' loaded successfully.")
 
         # --- User Action Choice ---
         print("\n--- Application Menu ---")
@@ -5009,39 +5097,131 @@ def objective_optuna(trial, df_raw, static_entry_features_base): # Removed pivot
         # Example: 1 trade, net_r = -1. Penalty = 2. Objective = -1-2 = -3.
 
     final_objective_value = net_r - trade_count_penalty
+
+    # Store feature names and ATR period used in this trial as user attributes
+    # These will be retrieved when saving the best trial's parameters.
+    trial.set_user_attr("pivot_feature_names_used", trial_pivot_features)
+    trial.set_user_attr("entry_feature_names_base_used", trial_entry_features_base)
+    trial.set_user_attr("model_training_atr_period_used", current_atr_period)
+    trial.set_user_attr("full_entry_feature_names_used", current_trial_full_entry_features)
+
+
     return final_objective_value
 
 
 def run_optuna_tuning(df_universal_raw, static_entry_features_base_list, n_trials=50): # Renamed df_processed to df_universal_raw, changed features params
-    """Runs Optuna hyperparameter tuning."""
-    study = optuna.create_study(direction='maximize')
-    # Pass the raw DataFrame and the list of static base entry features to objective_optuna
-    study.optimize(lambda trial: objective_optuna(trial, df_universal_raw, static_entry_features_base_list),
-                   n_trials=n_trials,
-                   # Consider using a time-series aware sampler/pruner if available and suitable
-                   # For now, default sampler.
-                   )
-    print("Best Optuna trial:", study.best_trial.params)
+    """Runs Optuna hyperparameter tuning and stores results in SQLite."""
+    global app_settings # Access global app_settings for version and path
 
-    # Save best_params to a JSON file
+    study_version = app_settings.get("app_study_version", "default_study_v1")
+    optuna_runs_path = app_settings.get("app_optuna_runs_path", "optuna_runs")
+
+    # Create the directory for Optuna runs if it doesn't exist
+    os.makedirs(optuna_runs_path, exist_ok=True)
+
+    # Construct SQLite URL
+    study_db_filename = f"{study_version}.db"
+    sqlite_db_path = os.path.join(optuna_runs_path, study_db_filename)
+    storage_url = f"sqlite:///{sqlite_db_path}"
+
+    print(f"Optuna study version: {study_version}")
+    print(f"Optuna study database: {storage_url}")
+
+    # Create or load the study
+    # Optuna will create the study if it doesn't exist in the DB, or load it if it does.
+    # The study_name within the DB will be our study_version.
+    study = optuna.create_study(
+        study_name=study_version, # Use study_version as the study_name within the database
+        storage=storage_url,
+        direction='maximize',
+        load_if_exists=True # This is key for resuming
+    )
+
+    # Check if we should prune based on previous trials (if resuming)
+    # Example: Prune if a trial is substantially worse than the mean of completed trials
+    # This is an advanced feature and can be added later if desired.
+    # For now, we use default pruner or one set by sampler.
+
+    # Check current number of trials vs target, and only run new ones
+    n_completed_trials = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
+    n_trials_to_run = n_trials - n_completed_trials
+
+    print(f"Target Optuna trials: {n_trials}")
+    print(f"Completed Optuna trials for '{study_version}': {n_completed_trials}")
+
+    if n_trials_to_run <= 0:
+        print(f"Study '{study_version}' already has {n_completed_trials} completed trials (target {n_trials}). No new trials will be run.")
+    else:
+        print(f"Running {n_trials_to_run} new Optuna trials...")
+        study.optimize(
+            lambda trial: objective_optuna(trial, df_universal_raw, static_entry_features_base_list),
+            n_trials=n_trials_to_run # Only run the remaining number of trials
+        )
+
+    # Log best trial details
     try:
-        import json
-        # Include feature names and ATR period used for training if they are fixed or derived
-        # For now, just saving Optuna's direct output.
-        # Consider adding 'pivot_feature_names': pivot_features, 'entry_features_base': entry_features_base,
-        # 'model_atr_period': ATR_PERIOD to this dictionary before saving.
-        params_to_save = study.best_trial.params.copy()
-        # Example of adding more info:
-        # params_to_save['_comment'] = "Add feature names and other relevant training settings here"
-        # params_to_save['pivot_feature_names_example'] = ['atr_14', 'range_atr_norm', ...] # Replace with actual list
-        # params_to_save['model_training_atr_period'] = ATR_PERIOD
+        best_trial_retrieved = study.best_trial
+        print(f"Best Optuna trial for study '{study_version}':")
+        print(f"  Value: {best_trial_retrieved.value}")
+        print(f"  Params: {best_trial_retrieved.params}")
+    except ValueError: # Happens if no trials are completed (e.g., if n_trials_to_run was 0)
+        print(f"No completed trials found for study '{study_version}'. Cannot determine best trial.")
+        # If no trials, we can't proceed with model training based on these params.
+        # However, the user might want to just run with previously saved best_params if the study was already complete.
+        # For now, the function will return None if no best trial.
+        # The calling function (start_app_main_flow) needs to handle this.
+        # If best_params.json exists, it might be used. If not, training cannot proceed.
+        # Let's try to load params from the file if no best trial from study.
+        params_path_for_fallback = app_settings.get("app_model_params_path", "best_model_params.json")
+        if os.path.exists(params_path_for_fallback):
+            print(f"Attempting to load best parameters from existing file: {params_path_for_fallback}")
+            try:
+                with open(params_path_for_fallback, 'r') as f:
+                    loaded_fallback_params = json.load(f)
+                print("Successfully loaded fallback parameters.")
+                return loaded_fallback_params # Return previously saved params
+            except Exception as e_fallback_load:
+                print(f"Error loading fallback parameters from {params_path_for_fallback}: {e_fallback_load}")
+                return None # Truly no params available
+        else:
+            print(f"No best trial in study and no fallback parameter file ({params_path_for_fallback}) found.")
+            return None
 
 
-        with open("best_model_params.json", 'w') as f:
+    # Save best_params to a JSON file, named with the study_version
+    # The model params path from app_settings is the *filename*, not the full path.
+    # We will save it inside the optuna_runs_path/study_version directory for versioning.
+    params_filename = app_settings.get("app_model_params_path", "best_model_params.json") # Default filename
+    versioned_params_dir = os.path.join(optuna_runs_path, study_version)
+    os.makedirs(versioned_params_dir, exist_ok=True)
+    versioned_params_path = os.path.join(versioned_params_dir, params_filename)
+
+    try:
+        best_trial_for_saving = study.best_trial
+        params_to_save = best_trial_for_saving.params.copy()
+        
+        # Retrieve and add user attributes stored during the trial
+        params_to_save['pivot_feature_names_used'] = best_trial_for_saving.user_attrs.get('pivot_feature_names_used', [])
+        params_to_save['entry_feature_names_base_used'] = best_trial_for_saving.user_attrs.get('entry_feature_names_base_used', [])
+        params_to_save['model_training_atr_period_used'] = best_trial_for_saving.user_attrs.get('model_training_atr_period_used', None)
+        # Also save the full entry feature list if available
+        params_to_save['full_entry_feature_names_used'] = best_trial_for_saving.user_attrs.get('full_entry_feature_names_used', [])
+
+
+        # Add other metadata
+        params_to_save['_study_version'] = study_version
+        params_to_save['_best_trial_value'] = best_trial_for_saving.value
+        params_to_save['_source_db_file'] = sqlite_db_path
+        params_to_save['_best_trial_number'] = best_trial_for_saving.number
+
+
+        with open(versioned_params_path, 'w') as f:
             json.dump(params_to_save, f, indent=4)
-        print(f"Best Optuna parameters saved to best_model_params.json")
+        print(f"Best Optuna parameters for '{study_version}' saved to {versioned_params_path}")
     except Exception as e:
-        print(f"Error saving Optuna best parameters: {e}")
+        print(f"Error saving Optuna best parameters for '{study_version}' to {versioned_params_path}: {e}")
+        # Even if saving fails, return the params for current run
+        return study.best_trial.params
 
     return study.best_trial.params
 
