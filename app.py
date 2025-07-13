@@ -2333,7 +2333,12 @@ def app_calculate_live_pivot_features(df_live: pd.DataFrame, atr_period: int, pi
     # Log feature distributions
     feature_dist_log = {}
     for feature in pivot_feature_names:
-        feature_dist_log[feature] = {'min': df_with_features[feature].min(), 'max': df_with_features[feature].max()}
+        min_val = df_with_features[feature].min()
+        max_val = df_with_features[feature].max()
+        feature_dist_log[feature] = {
+            'min': float(min_val) if pd.notna(min_val) else None,
+            'max': float(max_val) if pd.notna(max_val) else None
+        }
     
     with open('feature_distribution_log.json', 'w') as f:
         json.dump(feature_dist_log, f, indent=4)
@@ -3990,7 +3995,13 @@ def apply_smote(X, y):
     """
     print("Applying SMOTE...")
     n_samples = y.value_counts()
-    k_neighbors = n_samples.min() - 1 if n_samples.min() > 1 else 1
+    
+    # Adjust k_neighbors for large datasets
+    if n_samples.min() > 10000: # If the smallest class is very large
+        k_neighbors = 50 # Use a smaller, fixed number of neighbors
+    else:
+        k_neighbors = n_samples.min() - 1 if n_samples.min() > 1 else 1
+
     if k_neighbors == 0:
         k_neighbors = 1
     
