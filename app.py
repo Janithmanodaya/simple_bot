@@ -43,7 +43,7 @@ import json # For JSON operations
 # --- Global App Settings ---
 # This will be populated by load_app_settings
 app_settings = {}
-APP_CONFIG_FILE = "app_settings.json" # Changed from APP_TRADE_CONFIG_FILE and to JSON
+APP_CONFIG_FILE = "app_settings.csv"
 
 # --- Global App Trading Configs ---
 # This will be populated by load_app_trading_configs, likely from app_settings
@@ -422,15 +422,15 @@ def get_user_input(prompt, default_value, value_type=str, choices=None):
 
 def load_app_settings(filepath=APP_CONFIG_FILE):
     """
-    Loads app settings from a JSON file.
-    Uses defaults and prompts user if the file or specific settings are not found/incomplete.
+    Loads app settings from a CSV file.
+    Uses defaults if the file or specific settings are not found.
     Populates the global `app_settings` dictionary.
     """
-    global app_settings # Use the renamed global dict
+    global app_settings
 
     defaults = {
         "app_trading_environment": "mainnet",
-        "app_operational_mode": "signal", # 'live', 'signal', or 'train_only'
+        "app_operational_mode": "signal",
         "app_risk_percent": 0.01,
         "app_leverage": 20,
         "app_allow_exceed_risk_for_min_notional": False,
@@ -443,241 +443,90 @@ def load_app_settings(filepath=APP_CONFIG_FILE):
         "app_model_params_path": "best_model_params.json",
         "app_auto_start_trading_after_train": False,
         "app_force_retrain_on_startup": False,
-        # Add other ML training specific defaults if needed (e.g., Optuna trials)
-        "app_optuna_trials": 20, # Default Optuna trials for app.py training
-        "app_study_version": "pivot_v1_initial", # For Optuna study naming and artifact versioning
-        "app_optuna_runs_path": "optuna_runs",  # Base directory for Optuna .db files and other artifacts
-        "app_use_dynamic_threshold": True, # New: Toggle for dynamic/fixed pivot threshold
-        "app_fixed_pivot_threshold": 0.7,  # New: Fixed pivot threshold value
+        "app_optuna_trials": 20,
+        "app_study_version": "pivot_v1_initial",
+        "app_optuna_runs_path": "optuna_runs",
+        "app_use_dynamic_threshold": True,
+        "app_fixed_pivot_threshold": 0.7,
         "app_fixed_pivot_threshold_override": None,
-        
-        # New settings for the trading/signal loop
-        "app_trading_symbols": "BTCUSDT", # Comma-separated list of symbols
-        "app_trading_kline_interval": Client.KLINE_INTERVAL_15MINUTE, # Kline interval for live processing
-        "app_scan_interval_seconds": 60,    # How often the main loop runs
-        "app_delay_between_symbols_seconds": 2, # Delay between processing multiple symbols in a cycle
-        "app_sim_sl_atr_multiplier": 1.0,   # ATR multiplier for SL simulation for entry feature calculation
-        "app_sl_atr_multiplier": 2.0,       # ATR multiplier for actual trade SL
-        "app_tp_rr_ratio": 1.5,             # R:R ratio for actual trade TP
-        "app_symbols_csv_path": "app_symbols.csv", # Default path for symbols CSV
-        "app_training_symbols_source_type": "list", # "list" or "csv"
-        "app_training_symbols_list_str": "BTCUSDT,ETHUSDT", # Comma-separated list if source_type is "list"
-        "app_notify_on_trade": True, # New: Toggle for trade/signal execution messages
-        "app_min_volume_spike_ratio": 1.5, # New setting for Volume-Based Trend-Strength Filter
-        "app_atr_period_sl_tp": 14, # ATR period for SL/TP lifecycle management (also used for RSI period for now)
-        "app_tp3_atr_multiplier": 2.0, # ATR multiplier for floating TP3
-        "app_breakeven_buffer_pct": 0.001, # 0.1% buffer for breakeven SL
-        "app_max_trade_duration_hours": 24, # Max hours a trade can remain open
-        "app_rsi_max_long": 70.0, # Max RSI for LONG entry
-        "app_rsi_min_long": 0.0,  # Min RSI for LONG entry (0 effectively means no lower bound)
-        "app_rsi_min_short": 30.0, # Min RSI for SHORT entry
-        "app_rsi_max_short": 100.0, # Max RSI for SHORT entry (100 effectively means no upper bound)
-        "app_reject_notify_telegram": True, # Toggle for sending Telegram notifications for pre-check rejections
-        "use_fib_preorder": False, # Default for the new Fibonacci pre-order logic
-        "fib_proposal_validity_minutes": 15, # Default validity for Fib proposals
-        "fib_leg_lookback_candles": 50, # Default lookback for finding the other end of Fib leg
-        "app_simulate_limit_orders": False # Default for dry-run/paper trading mode for Fib limits
+        "app_trading_symbols": "BTCUSDT",
+        "app_trading_kline_interval": Client.KLINE_INTERVAL_15MINUTE,
+        "app_scan_interval_seconds": 60,
+        "app_delay_between_symbols_seconds": 2,
+        "app_sim_sl_atr_multiplier": 1.0,
+        "app_sl_atr_multiplier": 2.0,
+        "app_tp_rr_ratio": 1.5,
+        "app_symbols_csv_path": "app_symbols.csv",
+        "app_training_symbols_source_type": "list",
+        "app_training_symbols_list_str": "BTCUSDT,ETHUSDT",
+        "app_notify_on_trade": True,
+        "app_min_volume_spike_ratio": 1.5,
+        "app_atr_period_sl_tp": 14,
+        "app_tp3_atr_multiplier": 2.0,
+        "app_breakeven_buffer_pct": 0.001,
+        "app_max_trade_duration_hours": 24,
+        "app_rsi_max_long": 70.0,
+        "app_rsi_min_long": 0.0,
+        "app_rsi_min_short": 30.0,
+        "app_rsi_max_short": 100.0,
+        "app_reject_notify_telegram": True,
+        "use_fib_preorder": False,
+        "fib_proposal_validity_minutes": 15,
+        "fib_leg_lookback_candles": 50,
+        "app_simulate_limit_orders": False
     }
 
-    loaded_json_settings = {}
-    config_file_exists = os.path.exists(filepath)
-
-    if config_file_exists:
+    loaded_settings = {}
+    if os.path.exists(filepath):
         try:
-            with open(filepath, 'r') as f:
-                loaded_json_settings = json.load(f)
+            df = pd.read_csv(filepath)
+            for _, row in df.iterrows():
+                name = row['name']
+                value = row['value']
+                # Attempt to convert to boolean or numeric types
+                if isinstance(value, str):
+                    if value.lower() == 'true':
+                        value = True
+                    elif value.lower() == 'false':
+                        value = False
+                    else:
+                        try:
+                            value = float(value)
+                            if value.is_integer():
+                                value = int(value)
+                        except (ValueError, TypeError):
+                            pass  # Keep as string
+                loaded_settings[name] = value
             print(f"app.py: Settings loaded from '{filepath}'.")
-        except json.JSONDecodeError:
-            print(f"app.py: Error decoding JSON from '{filepath}'. File might be corrupted. Using defaults and prompting.")
-            # config_file_exists = False # Treat as if file doesn't exist for prompting
         except Exception as e:
-            print(f"app.py: Error loading settings from '{filepath}': {e}. Using defaults and prompting.")
-            # config_file_exists = False
+            print(f"app.py: Error loading settings from '{filepath}': {e}. Using defaults.")
     else:
-        print(f"app.py: Settings file '{filepath}' not found. Using default settings and prompting for essentials.")
+        print(f"app.py: Settings file '{filepath}' not found. Using default settings.")
 
-    # Start with defaults, then override with loaded JSON settings
+    # Start with defaults, then override with loaded settings
     current_settings = defaults.copy()
-    current_settings.update(loaded_json_settings) # Loaded values override defaults
+    current_settings.update(loaded_settings)
 
-    # --- Conditional prompting for essential/missing settings ---
-
-    # Environment
-    app_trading_env_valid = False
-    if "app_trading_environment" in loaded_json_settings:
-        env_val = loaded_json_settings["app_trading_environment"]
-        if env_val in ['mainnet', 'testnet']:
-            current_settings["app_trading_environment"] = env_val
-            app_trading_env_valid = True
-    if not app_trading_env_valid:
-        print("app.py: 'app_trading_environment' missing or invalid in settings file. Prompting user.")
-        current_settings["app_trading_environment"] = get_user_input(
-            "Trading environment ('mainnet' or 'testnet')",
-            current_settings.get("app_trading_environment", defaults["app_trading_environment"]),
-            str, choices=['mainnet', 'testnet']
-        )
-
-    # Risk Percent
-    app_risk_percent_valid = False
-    if "app_risk_percent" in loaded_json_settings:
-        try:
-            risk_val = float(loaded_json_settings["app_risk_percent"])
-            if 0 < risk_val <= 1.0: # Validation: e.g., 0.01 for 1%
-                current_settings["app_risk_percent"] = risk_val
-                app_risk_percent_valid = True
-        except ValueError:
-            pass # Invalid float, will prompt
-    if not app_risk_percent_valid:
-        print("app.py: 'app_risk_percent' missing or invalid in settings file. Prompting user.")
-        current_settings["app_risk_percent"] = get_user_input(
-            "Risk percent per trade (e.g., 0.01 for 1%)",
-            current_settings.get("app_risk_percent", defaults["app_risk_percent"]),
-            float
-        )
-        # Re-validate after input if get_user_input doesn't do it sufficiently
-        while not (0 < current_settings["app_risk_percent"] <= 1.0):
-            print("Invalid input: Risk percent must be between 0.0 (exclusive) and 1.0 (inclusive).")
-            current_settings["app_risk_percent"] = get_user_input(
-                "Risk percent per trade (e.g., 0.01 for 1%)",
-                defaults["app_risk_percent"], # Offer default again
-                float
-            )
-
-    # Leverage
-    app_leverage_valid = False
-    if "app_leverage" in loaded_json_settings:
-        try:
-            lev_val = int(loaded_json_settings["app_leverage"])
-            if 1 <= lev_val <= 125: # Validation
-                current_settings["app_leverage"] = lev_val
-                app_leverage_valid = True
-        except ValueError:
-            pass # Invalid int, will prompt
-    if not app_leverage_valid:
-        print("app.py: 'app_leverage' missing or invalid in settings file. Prompting user.")
-        current_settings["app_leverage"] = get_user_input(
-            "Leverage (e.g., 20)",
-            current_settings.get("app_leverage", defaults["app_leverage"]),
-            int
-        )
-        # Re-validate after input
-        while not (1 <= current_settings["app_leverage"] <= 125):
-            print("Invalid input: Leverage must be between 1 and 125.")
-            current_settings["app_leverage"] = get_user_input(
-                "Leverage (e.g., 20)",
-                defaults["app_leverage"], # Offer default again
-                int
-            )
-
-    # Force retrain on startup
-    app_force_retrain_valid = False
-    if "app_force_retrain_on_startup" in loaded_json_settings:
-        retrain_val = loaded_json_settings["app_force_retrain_on_startup"]
-        if isinstance(retrain_val, bool):
-            current_settings["app_force_retrain_on_startup"] = retrain_val
-            app_force_retrain_valid = True
-    if not app_force_retrain_valid:
-        print("app.py: 'app_force_retrain_on_startup' missing or invalid in settings file. Prompting user.")
-        current_settings["app_force_retrain_on_startup"] = get_user_input(
-            "Force retrain models on startup (true/false)?",
-            current_settings.get("app_force_retrain_on_startup", defaults["app_force_retrain_on_startup"]),
-            bool
-        )
-
-    # Dynamic/Fixed Threshold Mode
-    app_use_dynamic_thresh_valid = False
-    if "app_use_dynamic_threshold" in loaded_json_settings:
-        use_dyn_val = loaded_json_settings["app_use_dynamic_threshold"]
-        if isinstance(use_dyn_val, bool):
-            current_settings["app_use_dynamic_threshold"] = use_dyn_val
-            app_use_dynamic_thresh_valid = True
-    if not app_use_dynamic_thresh_valid:
-        print("app.py: 'app_use_dynamic_threshold' missing or invalid. Prompting.")
-        current_settings["app_use_dynamic_threshold"] = get_user_input(
-            "Use dynamic pivot threshold (true/false)?",
-            current_settings.get("app_use_dynamic_threshold", defaults["app_use_dynamic_threshold"]),
-            bool
-        )
-
-    # Fixed Pivot Threshold Value
-    app_fixed_thresh_valid = False
-    if "app_fixed_pivot_threshold" in loaded_json_settings:
-        try:
-            fixed_thresh_val = float(loaded_json_settings["app_fixed_pivot_threshold"])
-            if 0.0 < fixed_thresh_val < 1.0: # Threshold should be a probability
-                current_settings["app_fixed_pivot_threshold"] = fixed_thresh_val
-                app_fixed_thresh_valid = True
-        except ValueError:
-            pass # Invalid float, will prompt
-    if not app_fixed_thresh_valid:
-        print("app.py: 'app_fixed_pivot_threshold' missing or invalid. Prompting.")
-        current_settings["app_fixed_pivot_threshold"] = get_user_input(
-            "Fixed pivot threshold value (e.g., 0.7)",
-            current_settings.get("app_fixed_pivot_threshold", defaults["app_fixed_pivot_threshold"]),
-            float
-        )
-        while not (0.0 < current_settings["app_fixed_pivot_threshold"] < 1.0):
-            print("Invalid input: Fixed pivot threshold must be between 0.0 and 1.0 (exclusive).")
-            current_settings["app_fixed_pivot_threshold"] = get_user_input(
-                "Fixed pivot threshold value (e.g., 0.7)",
-                defaults["app_fixed_pivot_threshold"],
-                float
-            )
-        
-    # Operational mode (this is often set interactively later in start_app_main_flow)
-    # If missing or invalid in JSON, it will use the default. No interactive prompt here
-    # as it's typically selected from a menu later if needed.
-    if "app_operational_mode" not in loaded_json_settings or \
-       loaded_json_settings.get("app_operational_mode") not in ['live', 'signal', 'train_only']:
-        # Use default if missing or invalid from JSON
-        current_settings["app_operational_mode"] = defaults["app_operational_mode"]
-        if "app_operational_mode" not in loaded_json_settings:
-             print(f"app.py: 'app_operational_mode' missing from settings file. Using default: {defaults['app_operational_mode']}")
-        else: # Was present but invalid
-             print(f"app.py: 'app_operational_mode' ('{loaded_json_settings.get('app_operational_mode')}') was invalid. Using default: {defaults['app_operational_mode']}")
-    else: # Valid and present in JSON
-        current_settings["app_operational_mode"] = loaded_json_settings["app_operational_mode"]
-
-
-    # Populate global app_settings with the processed current_settings
-    # This ensures app_settings reflects the file-loaded or prompted values.
+    # Populate global app_settings
     app_settings.update(current_settings)
 
     # Load API keys and Telegram details from keys.py
-    # These are NOT saved in app_settings.json but are part of the runtime app_settings dict.
-    # Use the now-set app_settings["app_trading_environment"]
     app_env_for_keys = app_settings.get("app_trading_environment", defaults["app_trading_environment"])
     api_k, api_s, tele_token, tele_chat_id = load_app_api_keys(env=app_env_for_keys)
 
-    app_settings["api_key"] = api_k # Runtime only
-    app_settings["api_secret"] = api_s # Runtime only
+    app_settings["api_key"] = api_k
+    app_settings["api_secret"] = api_s
 
-    # Update current_settings with Telegram details from keys.py ONLY if not already set by app_settings.json
-    # This ensures that if Telegram details are in app_settings.json, they take precedence.
-    # If they are missing from JSON (i.e., current_settings still has them as None from defaults),
-    # then values from keys.py are used for both runtime (app_settings) and for saving (current_settings).
-    if current_settings.get("app_telegram_bot_token") is None and tele_token:
-        current_settings["app_telegram_bot_token"] = tele_token
-        app_settings["app_telegram_bot_token"] = tele_token # Ensure runtime also gets it
-    if current_settings.get("app_telegram_chat_id") is None and tele_chat_id:
-        current_settings["app_telegram_chat_id"] = tele_chat_id
-        app_settings["app_telegram_chat_id"] = tele_chat_id # Ensure runtime also gets it
-    
-    # At this point, current_settings should contain the full desired state to be saved (if changed).
-    # And app_settings contains the full runtime state including API keys.
-
-    # Ensure all default keys are present in current_settings before saving.
-    # This handles cases where a new default is added but not yet in an old JSON file.
-    for key, default_value in defaults.items():
-        if key not in current_settings:
-            current_settings[key] = default_value # Add missing keys with their defaults
+    if app_settings.get("app_telegram_bot_token") is None and tele_token:
+        app_settings["app_telegram_bot_token"] = tele_token
+    if app_settings.get("app_telegram_chat_id") is None and tele_chat_id:
+        app_settings["app_telegram_chat_id"] = tele_chat_id
 
     print("app.py: Final application settings applied (API keys hidden from print):",
           {k: v for k, v in app_settings.items() if k not in ['api_key', 'api_secret']})
 
-    # Save the final state of current_settings (which includes prompted values,
-    # validated JSON values, and defaults for anything missing) back to the file.
-    save_app_settings(filepath, settings_dict_to_save=current_settings)
+    # Save the final state back to the file to ensure it's up-to-date
+    save_app_settings(filepath, settings_dict_to_save=app_settings)
 
 def load_app_trading_configs():
     """
@@ -754,43 +603,21 @@ def load_app_trading_configs():
 
 def save_app_settings(filepath=APP_CONFIG_FILE, settings_dict_to_save=None):
     """
-    Saves the provided settings dictionary to a JSON file, excluding sensitive keys.
+    Saves the provided settings dictionary to a CSV file, excluding sensitive keys.
     If settings_dict_to_save is None, it defaults to global app_settings.
     """
-    global app_settings # Still needed if settings_dict_to_save is None
+    global app_settings
     
-    source_settings_for_saving = {}
-    if settings_dict_to_save is not None:
-        source_settings_for_saving = settings_dict_to_save.copy()
-    else:
-        source_settings_for_saving = app_settings.copy() # Fallback to global if no dict provided
+    source_settings = settings_dict_to_save if settings_dict_to_save is not None else app_settings.copy()
 
-    # Define keys that should definitely not be written to the JSON file
-    keys_to_exclude_from_file = ['api_key', 'api_secret'] 
+    # Define keys that should not be written to the CSV file
+    keys_to_exclude = ['api_key', 'api_secret']
     
-    # Create a clean dictionary for JSON output, including only non-sensitive keys
-    # and ensuring all default keys are considered for completeness.
-    # The 'defaults' dict should be accessible here or passed if this function is more generic.
-    # For now, assuming 'defaults' is the global one defined in load_app_settings.
-    # However, it's better if load_app_settings passes a complete current_settings.
-    
-    final_json_output_dict = {}
-    # Populate with keys from the source_settings_for_saving, excluding sensitive ones
-    for key, value in source_settings_for_saving.items():
-        if key not in keys_to_exclude_from_file:
-            final_json_output_dict[key] = value
-            
-    # Optional: Ensure all defined default keys are in the output,
-    # even if they were not in source_settings_for_saving (e.g., if a minimal dict was passed).
-    # This part might be redundant if settings_dict_to_save from load_app_settings is comprehensive.
-    # global defaults # Assuming 'defaults' from load_app_settings scope is available if needed.
-    # for default_key, default_value in defaults.items():
-    #    if default_key not in final_json_output_dict and default_key not in keys_to_exclude_from_file:
-    #        final_json_output_dict[default_key] = default_value
-            
+    settings_to_save = {k: v for k, v in source_settings.items() if k not in keys_to_exclude}
+
     try:
-        with open(filepath, 'w') as f:
-            json.dump(final_json_output_dict, f, indent=4)
+        df = pd.DataFrame(list(settings_to_save.items()), columns=['name', 'value'])
+        df.to_csv(filepath, index=False)
         print(f"app.py: Settings saved to '{filepath}'.")
     except Exception as e:
         print(f"app.py: Error saving settings to '{filepath}': {e}")
@@ -3715,8 +3542,7 @@ def start_app_main_flow():
     global app_settings, universal_pivot_model, universal_entry_model, best_hyperparams # Ensure best_hyperparams is global if modified
 
     # 1. Load settings from app_settings.json
-    with open('app_settings.json', 'r') as f:
-        app_settings = json.load(f)
+    load_app_settings()
     
     load_app_trading_configs() # Ensure trading configs are populated from app_settings
 
